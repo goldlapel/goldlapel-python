@@ -65,18 +65,27 @@ def _find_binary():
     )
 
 
-def _replace_port(upstream, port):
-    # Use regex instead of urlparse to avoid decoding percent-encoded characters
+def _make_proxy_url(upstream, port):
+    # Build a proxy URL: replace host with localhost and set the proxy port.
+    # Uses regex instead of urlparse to avoid decoding percent-encoded characters
     # in passwords (e.g. %40 for @), which would corrupt the URL on reconstruction.
-    # Match: scheme://[userinfo@]host:PORT[/path][?query]
-    m = re.match(r'^(postgres(?:ql)?://(?:[^@]*@)?[^:/?#]+):(\d+)(.*)$', upstream)
+
+    # pg URL with explicit port: scheme://[userinfo@]host:PORT[/path][?query]
+    m = re.match(r'^(postgres(?:ql)?://(?:[^@]*@)?)([^:/?#]+):(\d+)(.*)$', upstream)
     if m:
-        return f"{m.group(1)}:{port}{m.group(3)}"
-    # bare host:port
-    if ":" in upstream:
-        host = upstream.rsplit(":", 1)[0]
-        return f"{host}:{port}"
-    return f"{upstream}:{port}"
+        return f"{m.group(1)}localhost:{port}{m.group(4)}"
+
+    # pg URL without port: scheme://[userinfo@]host[/path][?query]
+    m = re.match(r'^(postgres(?:ql)?://(?:[^@]*@)?)([^:/?#]+)(.*)$', upstream)
+    if m:
+        return f"{m.group(1)}localhost:{port}{m.group(3)}"
+
+    # bare host:port (only if not a URL — guard against splitting on scheme colons)
+    if "://" not in upstream and ":" in upstream:
+        return f"localhost:{port}"
+
+    # bare host
+    return f"localhost:{port}"
 
 
 def _wait_for_port(host, port, timeout):
@@ -124,7 +133,8 @@ class GoldLapel:
                 f"within {_STARTUP_TIMEOUT}s.\nstderr: {stderr}"
             )
 
-        self._proxy_url = _replace_port(self._upstream, self._port)
+        self._process.stderr.close()
+        self._proxy_url = _make_proxy_url(self._upstream, self._port)
         return self._proxy_url
 
     def stop(self):

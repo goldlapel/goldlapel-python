@@ -7,7 +7,7 @@ import pytest
 
 from goldlapel.proxy import (
     _find_binary,
-    _replace_port,
+    _make_proxy_url,
     _wait_for_port,
     GoldLapel,
     start,
@@ -74,32 +74,48 @@ class TestFindBinary:
                         _find_binary()
 
 
-class TestReplacePort:
+class TestMakeProxyUrl:
     def test_postgresql_url(self):
-        url = "postgresql://user:pass@localhost:5432/mydb"
-        assert _replace_port(url, 7932) == "postgresql://user:pass@localhost:7932/mydb"
+        url = "postgresql://user:pass@dbhost:5432/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932/mydb"
 
     def test_postgres_url(self):
-        url = "postgres://user:pass@dbhost:5432/mydb"
-        assert _replace_port(url, 7932) == "postgres://user:pass@dbhost:7932/mydb"
+        url = "postgres://user:pass@remote.aws.com:5432/mydb"
+        assert _make_proxy_url(url, 7932) == "postgres://user:pass@localhost:7932/mydb"
+
+    def test_pg_url_without_port(self):
+        url = "postgresql://user:pass@host.aws.com/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932/mydb"
+
+    def test_pg_url_without_port_or_path(self):
+        url = "postgresql://user:pass@host.aws.com"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932"
 
     def test_bare_host_port(self):
-        assert _replace_port("localhost:5432", 7932) == "localhost:7932"
+        assert _make_proxy_url("dbhost:5432", 7932) == "localhost:7932"
 
     def test_host_only(self):
-        assert _replace_port("localhost", 7932) == "localhost:7932"
+        assert _make_proxy_url("dbhost", 7932) == "localhost:7932"
 
     def test_preserves_params(self):
-        url = "postgresql://user:pass@localhost:5432/mydb?sslmode=require"
-        assert _replace_port(url, 7932) == "postgresql://user:pass@localhost:7932/mydb?sslmode=require"
+        url = "postgresql://user:pass@remote:5432/mydb?sslmode=require"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932/mydb?sslmode=require"
 
     def test_preserves_percent_encoded_password(self):
-        url = "postgresql://user:p%40ss@localhost:5432/mydb"
-        assert _replace_port(url, 7932) == "postgresql://user:p%40ss@localhost:7932/mydb"
+        url = "postgresql://user:p%40ss@remote:5432/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:p%40ss@localhost:7932/mydb"
 
     def test_no_userinfo(self):
-        url = "postgresql://localhost:5432/mydb"
-        assert _replace_port(url, 7932) == "postgresql://localhost:7932/mydb"
+        url = "postgresql://dbhost:5432/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://localhost:7932/mydb"
+
+    def test_no_userinfo_no_port(self):
+        url = "postgresql://dbhost/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://localhost:7932/mydb"
+
+    def test_localhost_stays_localhost(self):
+        url = "postgresql://user:pass@localhost:5432/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932/mydb"
 
 
 class TestWaitForPort:
