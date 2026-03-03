@@ -8,6 +8,8 @@ Gold Lapel sits between your app and Postgres, watches query patterns, and autom
 
 ```bash
 pip install goldlapel
+# or
+uv pip install goldlapel
 ```
 
 ## Quick Start
