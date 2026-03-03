@@ -1,13 +1,11 @@
 import atexit
 import os
 import platform
-import signal
+import re
 import socket
 import subprocess
-import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 
 _DEFAULT_PORT = 7932
@@ -15,6 +13,7 @@ _STARTUP_TIMEOUT = 10.0
 _STARTUP_POLL_INTERVAL = 0.05
 
 _instance = None
+_cleanup_registered = False
 
 
 def _find_binary():
@@ -67,16 +66,12 @@ def _find_binary():
 
 
 def _replace_port(upstream, port):
-    parsed = urlparse(upstream)
-    if parsed.scheme in ("postgresql", "postgres"):
-        userinfo = ""
-        if parsed.username:
-            userinfo = parsed.username
-            if parsed.password:
-                userinfo += f":{parsed.password}"
-            userinfo += "@"
-        replaced = parsed._replace(netloc=f"{userinfo}{parsed.hostname}:{port}")
-        return urlunparse(replaced)
+    # Use regex instead of urlparse to avoid decoding percent-encoded characters
+    # in passwords (e.g. %40 for @), which would corrupt the URL on reconstruction.
+    # Match: scheme://[userinfo@]host:PORT[/path][?query]
+    m = re.match(r'^(postgres(?:ql)?://(?:[^@]*@)?[^:/?#]+):(\d+)(.*)$', upstream)
+    if m:
+        return f"{m.group(1)}:{port}{m.group(3)}"
     # bare host:port
     if ":" in upstream:
         host = upstream.rsplit(":", 1)[0]
@@ -99,7 +94,7 @@ def _wait_for_port(host, port, timeout):
 class GoldLapel:
     def __init__(self, upstream, port=None, extra_args=None):
         self._upstream = upstream
-        self._port = port or _DEFAULT_PORT
+        self._port = port if port is not None else _DEFAULT_PORT
         self._extra_args = extra_args or []
         self._process = None
         self._proxy_url = None
@@ -117,7 +112,7 @@ class GoldLapel:
 
         self._process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
 
@@ -153,11 +148,13 @@ class GoldLapel:
 
 
 def start(upstream, port=None, extra_args=None):
-    global _instance
+    global _instance, _cleanup_registered
     if _instance and _instance.running:
         return _instance.url
     _instance = GoldLapel(upstream, port=port, extra_args=extra_args)
-    atexit.register(_cleanup)
+    if not _cleanup_registered:
+        atexit.register(_cleanup)
+        _cleanup_registered = True
     return _instance.start()
 
 

@@ -23,7 +23,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://goldlapel.com"
-Repository = "https://github.com/goldlapel/goldlapel"
+Repository = "https://github.com/goldlapel/goldlapel-python"
 
 [tool.setuptools.packages.find]
 where = ["src"]
