@@ -54,11 +54,6 @@ def _find_binary():
     if on_path:
         return on_path
 
-    # 4. Local dev: check the Rust project's build output
-    dev_binary = Path.home() / "dev" / "goldlapel" / "target" / "release" / "goldlapel"
-    if dev_binary.is_file():
-        return str(dev_binary)
-
     raise FileNotFoundError(
         "Gold Lapel binary not found. Set GOLDLAPEL_BINARY env var, "
         "install the platform-specific package, or ensure 'goldlapel' is on PATH."

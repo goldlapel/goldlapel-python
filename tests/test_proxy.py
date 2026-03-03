@@ -55,8 +55,7 @@ class TestFindBinary:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GOLDLAPEL_BINARY", None)
             with patch("goldlapel.proxy.__file__", fake_module), \
-                 patch("goldlapel.proxy.shutil.which", return_value=None), \
-                 patch("goldlapel.proxy.Path.home", return_value=Path("/nonexistent")):
+                 patch("goldlapel.proxy.shutil.which", return_value=None):
                 with pytest.raises(FileNotFoundError, match="Gold Lapel binary not found"):
                     _find_binary()
 
