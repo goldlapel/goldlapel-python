@@ -50,18 +50,15 @@ class TestFindBinary:
             with patch("goldlapel.proxy.__file__", fake_module):
                 assert _find_binary() == str(binary)
 
-    def test_not_found_raises(self):
+    def test_not_found_raises(self, tmp_path):
+        fake_module = str(tmp_path / "proxy.py")
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GOLDLAPEL_BINARY", None)
-            with patch("goldlapel.proxy.shutil.which", return_value=None):
-                with patch("goldlapel.proxy.Path") as mock_path:
-                    # Make Path(__file__).parent / "bin" / name → not a file
-                    mock_parent = Path("/nonexistent")
-                    mock_path.return_value.parent = mock_parent
-                    # Make Path.home() / "dev" / ... → not a file
-                    mock_path.home.return_value = Path("/nonexistent-home")
-                    with pytest.raises(FileNotFoundError, match="Gold Lapel binary not found"):
-                        _find_binary()
+            with patch("goldlapel.proxy.__file__", fake_module), \
+                 patch("goldlapel.proxy.shutil.which", return_value=None), \
+                 patch("goldlapel.proxy.Path.home", return_value=Path("/nonexistent")):
+                with pytest.raises(FileNotFoundError, match="Gold Lapel binary not found"):
+                    _find_binary()
 
 
 class TestMakeProxyUrl:
