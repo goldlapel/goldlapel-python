@@ -71,12 +71,12 @@ def _make_proxy_url(upstream, port):
     # in passwords (e.g. %40 for @), which would corrupt the URL on reconstruction.
 
     # pg URL with explicit port: scheme://[userinfo@]host:PORT[/path][?query]
-    m = re.match(r'^(postgres(?:ql)?://(?:[^@]*@)?)([^:/?#]+):(\d+)(.*)$', upstream)
+    m = re.match(r'^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+):(\d+)(.*)$', upstream)
     if m:
         return f"{m.group(1)}localhost:{port}{m.group(4)}"
 
     # pg URL without port: scheme://[userinfo@]host[/path][?query]
-    m = re.match(r'^(postgres(?:ql)?://(?:[^@]*@)?)([^:/?#]+)(.*)$', upstream)
+    m = re.match(r'^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+)(.*)$', upstream)
     if m:
         return f"{m.group(1)}localhost:{port}{m.group(3)}"
 
@@ -128,6 +128,7 @@ class GoldLapel:
         if not _wait_for_port("127.0.0.1", self._port, _STARTUP_TIMEOUT):
             self._process.kill()
             stderr = self._process.stderr.read().decode(errors="replace")
+            self._process.stderr.close()
             raise RuntimeError(
                 f"Gold Lapel failed to start on port {self._port} "
                 f"within {_STARTUP_TIMEOUT}s.\nstderr: {stderr}"

@@ -44,21 +44,11 @@ class TestFindBinary:
         binary = bin_dir / binary_name
         binary.touch()
 
+        fake_module = str(tmp_path / "proxy.py")
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GOLDLAPEL_BINARY", None)
-            with patch("goldlapel.proxy.Path") as mock_path:
-                mock_path.return_value = mock_path
-                mock_path.__file__ = tmp_path / "proxy.py"
-                # Make Path(__file__).parent return tmp_path
-                mock_path.parent = tmp_path
-                mock_path.__truediv__ = lambda self, other: tmp_path / other
-                (tmp_path / "bin").mkdir(exist_ok=True)
-                result = tmp_path / "bin" / binary_name
-                result.touch()
-                mock_path.is_file = lambda: True
-                # Verify the binary naming convention
-                assert binary_name.startswith(f"goldlapel-{system}-")
-                assert arch in binary_name
+            with patch("goldlapel.proxy.__file__", fake_module):
+                assert _find_binary() == str(binary)
 
     def test_not_found_raises(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -116,6 +106,18 @@ class TestMakeProxyUrl:
     def test_localhost_stays_localhost(self):
         url = "postgresql://user:pass@localhost:5432/mydb"
         assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932/mydb"
+
+    def test_at_sign_in_password_with_port(self):
+        url = "postgresql://user:p@ss@host:5432/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:p@ss@localhost:7932/mydb"
+
+    def test_at_sign_in_password_without_port(self):
+        url = "postgresql://user:p@ss@host/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:p@ss@localhost:7932/mydb"
+
+    def test_at_sign_in_password_with_query_params(self):
+        url = "postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue"
 
 
 class TestWaitForPort:
