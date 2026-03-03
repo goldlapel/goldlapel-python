@@ -2,6 +2,7 @@ import atexit
 import os
 import platform
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -49,7 +50,6 @@ def _find_binary():
         return str(bundled)
 
     # 3. On PATH
-    import shutil
     on_path = shutil.which("goldlapel")
     if on_path:
         return on_path

@@ -1,9 +1,7 @@
 import os
 import platform
-import signal
-import subprocess
-import time
-from unittest.mock import patch, MagicMock
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -46,24 +44,34 @@ class TestFindBinary:
         binary = bin_dir / binary_name
         binary.touch()
 
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GOLDLAPEL_BINARY", None)
             with patch("goldlapel.proxy.Path") as mock_path:
-                mock_path.__file__ = str(tmp_path / "__init__.py")
-                # This test verifies the naming convention, not the full path resolution
-                assert binary_name.startswith("goldlapel-")
+                mock_path.return_value = mock_path
+                mock_path.__file__ = tmp_path / "proxy.py"
+                # Make Path(__file__).parent return tmp_path
+                mock_path.parent = tmp_path
+                mock_path.__truediv__ = lambda self, other: tmp_path / other
+                (tmp_path / "bin").mkdir(exist_ok=True)
+                result = tmp_path / "bin" / binary_name
+                result.touch()
+                mock_path.is_file = lambda: True
+                # Verify the binary naming convention
+                assert binary_name.startswith(f"goldlapel-{system}-")
+                assert arch in binary_name
 
     def test_not_found_raises(self):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GOLDLAPEL_BINARY", None)
-            with patch("shutil.which", return_value=None):
+            with patch("goldlapel.proxy.shutil.which", return_value=None):
                 with patch("goldlapel.proxy.Path") as mock_path:
-                    mock_file = MagicMock()
-                    mock_file.parent = MagicMock()
-                    mock_file.parent.__truediv__ = MagicMock(return_value=MagicMock(is_file=MagicMock(return_value=False)))
-                    mock_path.return_value = mock_file
-                    # The function should eventually raise FileNotFoundError
-                    # when no binary is found through any path
+                    # Make Path(__file__).parent / "bin" / name → not a file
+                    mock_parent = Path("/nonexistent")
+                    mock_path.return_value.parent = mock_parent
+                    # Make Path.home() / "dev" / ... → not a file
+                    mock_path.home.return_value = Path("/nonexistent-home")
+                    with pytest.raises(FileNotFoundError, match="Gold Lapel binary not found"):
+                        _find_binary()
 
 
 class TestReplacePort:
@@ -83,9 +91,15 @@ class TestReplacePort:
 
     def test_preserves_params(self):
         url = "postgresql://user:pass@localhost:5432/mydb?sslmode=require"
-        result = _replace_port(url, 7932)
-        assert "7932" in result
-        assert "sslmode=require" in result
+        assert _replace_port(url, 7932) == "postgresql://user:pass@localhost:7932/mydb?sslmode=require"
+
+    def test_preserves_percent_encoded_password(self):
+        url = "postgresql://user:p%40ss@localhost:5432/mydb"
+        assert _replace_port(url, 7932) == "postgresql://user:p%40ss@localhost:7932/mydb"
+
+    def test_no_userinfo(self):
+        url = "postgresql://localhost:5432/mydb"
+        assert _replace_port(url, 7932) == "postgresql://localhost:7932/mydb"
 
 
 class TestWaitForPort:
@@ -112,6 +126,10 @@ class TestGoldLapelClass:
     def test_custom_port(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb", port=9000)
         assert gl._port == 9000
+
+    def test_port_zero(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", port=0)
+        assert gl._port == 0
 
     def test_not_running_initially(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb")
