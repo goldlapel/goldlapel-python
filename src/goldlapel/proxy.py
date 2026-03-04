@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 
-_DEFAULT_PORT = 7932
+DEFAULT_PORT = 7932
 _STARTUP_TIMEOUT = 10.0
 _STARTUP_POLL_INTERVAL = 0.05
 
@@ -98,7 +98,7 @@ def _wait_for_port(host, port, timeout):
 class GoldLapel:
     def __init__(self, upstream, port=None, extra_args=None):
         self._upstream = upstream
-        self._port = port if port is not None else _DEFAULT_PORT
+        self._port = port if port is not None else DEFAULT_PORT
         self._extra_args = extra_args or []
         self._process = None
         self._proxy_url = None
