@@ -156,6 +156,11 @@ class GoldLapel:
 def start(upstream, port=None, extra_args=None):
     global _instance, _cleanup_registered
     if _instance and _instance.running:
+        if _instance._upstream != upstream:
+            raise RuntimeError(
+                "Gold Lapel is already running for a different upstream. "
+                "Call goldlapel.stop() before starting with a new upstream."
+            )
         return _instance.url
     _instance = GoldLapel(upstream, port=port, extra_args=extra_args)
     if not _cleanup_registered:
