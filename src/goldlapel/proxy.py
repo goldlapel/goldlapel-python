@@ -42,6 +42,8 @@ def _find_binary():
         binary_name = f"goldlapel-linux-{arch}"
     elif system == "darwin":
         binary_name = f"goldlapel-darwin-{arch}"
+    elif system == "windows":
+        binary_name = f"goldlapel-windows-{arch}.exe"
     else:
         binary_name = f"goldlapel-{system}-{arch}"
 
