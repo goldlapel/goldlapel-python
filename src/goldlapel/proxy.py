@@ -13,8 +13,65 @@ DEFAULT_PORT = 7932
 _STARTUP_TIMEOUT = 10.0
 _STARTUP_POLL_INTERVAL = 0.05
 
+_VALID_CONFIG_KEYS = frozenset({
+    "mode", "min_pattern_count", "refresh_interval_secs", "pattern_ttl_secs",
+    "max_tables_per_view", "max_columns_per_view", "deep_pagination_threshold",
+    "report_interval_secs", "result_cache_size", "batch_cache_size",
+    "batch_cache_ttl_secs", "redis_url", "pool_size", "pool_timeout_secs",
+    "pool_mode", "mgmt_idle_timeout", "fallback", "read_after_write_secs",
+    "n1_threshold", "n1_window_ms", "n1_cross_threshold",
+    "tls_cert", "tls_key", "tls_client_ca", "config", "dashboard_port",
+    "disable_matviews", "disable_consolidation", "disable_btree_indexes",
+    "disable_trigram_indexes", "disable_expression_indexes",
+    "disable_partial_indexes", "disable_rewrite", "disable_prepared_cache",
+    "disable_result_cache", "disable_redis_cache", "disable_pool",
+    "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
+    "enable_coalescing", "replica", "exclude_tables",
+})
+
+_BOOLEAN_KEYS = frozenset({
+    "disable_matviews", "disable_consolidation", "disable_btree_indexes",
+    "disable_trigram_indexes", "disable_expression_indexes",
+    "disable_partial_indexes", "disable_rewrite", "disable_prepared_cache",
+    "disable_result_cache", "disable_redis_cache", "disable_pool",
+    "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
+    "enable_coalescing",
+})
+
+_LIST_KEYS = frozenset({
+    "replica", "exclude_tables",
+})
+
 _instance = None
 _cleanup_registered = False
+
+
+def _config_to_args(config):
+    if not config:
+        return []
+
+    unknown = set(config.keys()) - _VALID_CONFIG_KEYS
+    if unknown:
+        raise ValueError(f"Unknown config keys: {', '.join(sorted(unknown))}")
+
+    args = []
+    for key, value in config.items():
+        flag = "--" + key.replace("_", "-")
+
+        if key in _BOOLEAN_KEYS:
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"Config key '{key}' expects a bool, got {type(value).__name__}"
+                )
+            if value:
+                args.append(flag)
+        elif key in _LIST_KEYS:
+            for item in value:
+                args.extend([flag, str(item)])
+        else:
+            args.extend([flag, str(value)])
+
+    return args
 
 
 def _find_binary():
@@ -98,9 +155,10 @@ def _wait_for_port(host, port, timeout):
 
 
 class GoldLapel:
-    def __init__(self, upstream, port=None, extra_args=None):
+    def __init__(self, upstream, port=None, config=None, extra_args=None):
         self._upstream = upstream
         self._port = port if port is not None else DEFAULT_PORT
+        self._config = config
         self._extra_args = extra_args or []
         self._process = None
         self._proxy_url = None
@@ -114,7 +172,7 @@ class GoldLapel:
             binary,
             "--upstream", self._upstream,
             "--port", str(self._port),
-        ] + self._extra_args
+        ] + _config_to_args(self._config) + self._extra_args
 
         self._process = subprocess.Popen(
             cmd,
@@ -155,7 +213,7 @@ class GoldLapel:
         return self._process is not None and self._process.poll() is None
 
 
-def start(upstream, port=None, extra_args=None):
+def start(upstream, port=None, config=None, extra_args=None):
     global _instance, _cleanup_registered
     if _instance and _instance.running:
         if _instance._upstream != upstream:
@@ -164,7 +222,7 @@ def start(upstream, port=None, extra_args=None):
                 "Call goldlapel.stop() before starting with a new upstream."
             )
         return _instance.url
-    _instance = GoldLapel(upstream, port=port, extra_args=extra_args)
+    _instance = GoldLapel(upstream, port=port, config=config, extra_args=extra_args)
     if not _cleanup_registered:
         atexit.register(_cleanup)
         _cleanup_registered = True

@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from goldlapel.proxy import (
+    _config_to_args,
     _find_binary,
     _make_proxy_url,
     _wait_for_port,
@@ -149,6 +150,54 @@ class TestGoldLapelClass:
         gl = GoldLapel("postgresql://localhost:5432/mydb")
         assert gl.running is False
         assert gl.url is None
+
+
+class TestConfigToArgs:
+    def test_string_value(self):
+        assert _config_to_args({"mode": "butler"}) == ["--mode", "butler"]
+
+    def test_numeric_value(self):
+        assert _config_to_args({"pool_size": 50}) == ["--pool-size", "50"]
+
+    def test_boolean_true(self):
+        assert _config_to_args({"disable_matviews": True}) == ["--disable-matviews"]
+
+    def test_boolean_false(self):
+        assert _config_to_args({"disable_matviews": False}) == []
+
+    def test_list_value(self):
+        result = _config_to_args({"replica": ["url1", "url2"]})
+        assert result == ["--replica", "url1", "--replica", "url2"]
+
+    def test_exclude_tables_list(self):
+        result = _config_to_args({"exclude_tables": ["users", "sessions"]})
+        assert result == ["--exclude-tables", "users", "--exclude-tables", "sessions"]
+
+    def test_unknown_key_raises(self):
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"bogus": 1})
+
+    def test_multiple_keys(self):
+        result = _config_to_args({"mode": "butler", "pool_size": 10, "disable_pool": True})
+        assert "--mode" in result
+        assert "butler" in result
+        assert "--pool-size" in result
+        assert "10" in result
+        assert "--disable-pool" in result
+
+    def test_empty_config(self):
+        assert _config_to_args({}) == []
+
+    def test_none_config(self):
+        assert _config_to_args(None) == []
+
+    def test_boolean_non_bool_raises(self):
+        with pytest.raises(TypeError, match="expects a bool"):
+            _config_to_args({"disable_pool": "yes"})
+
+    def test_config_with_constructor(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"mode": "butler"})
+        assert gl._config == {"mode": "butler"}
 
 
 class TestModuleFunctions:
