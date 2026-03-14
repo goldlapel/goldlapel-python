@@ -11,6 +11,7 @@ from goldlapel.proxy import (
     _make_proxy_url,
     _wait_for_port,
     GoldLapel,
+    config_keys,
     start,
     stop,
     proxy_url,
@@ -198,6 +199,15 @@ class TestConfigToArgs:
     def test_config_with_constructor(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb", config={"mode": "butler"})
         assert gl._config == {"mode": "butler"}
+
+
+class TestConfigKeys:
+    def test_config_keys_returns_all_keys(self):
+        keys = config_keys()
+        assert isinstance(keys, set)
+        assert "mode" in keys
+        assert "pool_size" in keys
+        assert len(keys) == 43
 
 
 class TestModuleFunctions:

@@ -155,7 +155,7 @@ def _wait_for_port(host, port, timeout):
 
 
 class GoldLapel:
-    def __init__(self, upstream, port=None, config=None, extra_args=None):
+    def __init__(self, upstream, config=None, port=None, extra_args=None):
         self._upstream = upstream
         self._port = port if port is not None else DEFAULT_PORT
         self._config = config
@@ -213,7 +213,7 @@ class GoldLapel:
         return self._process is not None and self._process.poll() is None
 
 
-def start(upstream, port=None, config=None, extra_args=None):
+def start(upstream, config=None, port=None, extra_args=None):
     global _instance, _cleanup_registered
     if _instance and _instance.running:
         if _instance._upstream != upstream:
@@ -240,6 +240,10 @@ def proxy_url():
     if _instance:
         return _instance.url
     return None
+
+
+def config_keys():
+    return set(_VALID_CONFIG_KEYS)
 
 
 def _cleanup():

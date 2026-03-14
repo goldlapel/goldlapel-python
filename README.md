@@ -31,11 +31,12 @@ Gold Lapel is driver-agnostic. `start()` returns a connection string (`postgresq
 
 ## API
 
-### `goldlapel.start(upstream, port=None, extra_args=None)`
+### `goldlapel.start(upstream, config=None, port=None, extra_args=None)`
 
 Starts the Gold Lapel proxy and returns the proxy connection string.
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
+- `config` — dict of configuration options (see [Configuration](#configuration))
 - `port` — proxy port (default: 7932)
 - `extra_args` — additional CLI flags passed to the binary (e.g. `["--threshold-impact", "5000"]`)
 
@@ -47,7 +48,11 @@ Stops the proxy. Also called automatically on process exit.
 
 Returns the current proxy URL, or `None` if not running.
 
-### `goldlapel.GoldLapel(upstream, port=None, extra_args=None)`
+### `goldlapel.config_keys()`
+
+Returns the set of all valid config key names.
+
+### `goldlapel.GoldLapel(upstream, config=None, port=None, extra_args=None)`
 
 Class interface for managing multiple instances:
 
@@ -60,16 +65,31 @@ proxy.stop()
 
 ## Configuration
 
-The proxy binary accepts all standard Gold Lapel flags. Pass them via `extra_args`:
+Pass a config dict as the second argument to `start()` to configure the proxy:
 
 ```python
-url = goldlapel.start(
-    "postgresql://user:pass@localhost:5432/mydb",
-    extra_args=["--threshold-duration-ms", "200", "--refresh-interval-secs", "30"]
-)
+import goldlapel
+
+url = goldlapel.start("postgresql://user:pass@localhost/mydb", {
+    "mode": "butler",
+    "pool_size": 50,
+    "disable_matviews": True,
+    "replica": ["postgresql://user:pass@replica1/mydb"],
+})
 ```
 
-Or set environment variables (`GOLDLAPEL_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
+Keys use `snake_case` and map directly to CLI flags (`pool_size` → `--pool-size`). Boolean keys like `disable_matviews` are flags — `True` enables them, `False` (or omitting) leaves them off. List keys like `replica` accept arrays and produce repeated flags.
+
+Unknown keys raise `ValueError` immediately. To see all valid keys:
+
+```python
+import goldlapel
+print(goldlapel.config_keys())
+```
+
+For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
+
+You can also set environment variables (`GOLDLAPEL_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
 
 ## How It Works
 
