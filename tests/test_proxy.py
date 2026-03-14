@@ -12,6 +12,7 @@ from goldlapel.proxy import (
     _wait_for_port,
     GoldLapel,
     config_keys,
+    dashboard_url,
     start,
     stop,
     proxy_url,
@@ -153,6 +154,29 @@ class TestGoldLapelClass:
         assert gl.url is None
 
 
+class TestDashboardUrl:
+    def test_dashboard_url_default(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert gl._dashboard_port == 7933
+
+    def test_dashboard_url_custom_port(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"dashboard_port": 8080})
+        assert gl._dashboard_port == 8080
+
+    def test_dashboard_url_disabled(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"dashboard_port": 0})
+        assert gl._dashboard_port == 0
+        assert gl.dashboard_url is None
+
+    def test_dashboard_url_not_running(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert gl.dashboard_url is None
+
+    def test_dashboard_port_from_config(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"dashboard_port": "9090"})
+        assert gl._dashboard_port == 9090
+
+
 class TestConfigToArgs:
     def test_string_value(self):
         assert _config_to_args({"mode": "butler"}) == ["--mode", "butler"]
@@ -214,3 +238,7 @@ class TestModuleFunctions:
     def test_proxy_url_none_when_not_started(self):
         stop()
         assert proxy_url() is None
+
+    def test_dashboard_url_none_when_not_started(self):
+        stop()
+        assert dashboard_url() is None

@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 DEFAULT_PORT = 7932
+DEFAULT_DASHBOARD_PORT = 7933
 _STARTUP_TIMEOUT = 10.0
 _STARTUP_POLL_INTERVAL = 0.05
 
@@ -158,6 +159,7 @@ class GoldLapel:
     def __init__(self, upstream, config=None, port=None, extra_args=None):
         self._upstream = upstream
         self._port = port if port is not None else DEFAULT_PORT
+        self._dashboard_port = int(config.get("dashboard_port", DEFAULT_DASHBOARD_PORT)) if config else DEFAULT_DASHBOARD_PORT
         self._config = config
         self._extra_args = extra_args or []
         self._process = None
@@ -191,6 +193,12 @@ class GoldLapel:
 
         self._process.stderr.close()
         self._proxy_url = _make_proxy_url(self._upstream, self._port)
+
+        if self._dashboard_port:
+            print(f"goldlapel → :{self._port} (proxy) | http://127.0.0.1:{self._dashboard_port} (dashboard)")
+        else:
+            print(f"goldlapel → :{self._port} (proxy)")
+
         return self._proxy_url
 
     def stop(self):
@@ -207,6 +215,12 @@ class GoldLapel:
     @property
     def url(self):
         return self._proxy_url
+
+    @property
+    def dashboard_url(self):
+        if self._dashboard_port and self._process and self._process.poll() is None:
+            return f"http://127.0.0.1:{self._dashboard_port}"
+        return None
 
     @property
     def running(self):
@@ -239,6 +253,12 @@ def stop():
 def proxy_url():
     if _instance:
         return _instance.url
+    return None
+
+
+def dashboard_url():
+    if _instance:
+        return _instance.dashboard_url
     return None
 
 

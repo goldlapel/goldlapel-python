@@ -29,6 +29,12 @@ conn = await asyncpg.connect(url)
 
 Gold Lapel is driver-agnostic. `start()` returns a connection string (`postgresql://...@localhost:7932/...`) that works with any Postgres driver or ORM.
 
+Gold Lapel prints the proxy and dashboard URLs on startup. Access the dashboard programmatically:
+
+```python
+goldlapel.dashboard_url()  # http://127.0.0.1:7933
+```
+
 ## API
 
 ### `goldlapel.start(upstream, config=None, port=None, extra_args=None)`
@@ -47,6 +53,10 @@ Stops the proxy. Also called automatically on process exit.
 ### `goldlapel.proxy_url()`
 
 Returns the current proxy URL, or `None` if not running.
+
+### `goldlapel.dashboard_url()`
+
+Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `None` if the proxy is not running or the dashboard is disabled.
 
 ### `goldlapel.config_keys()`
 
