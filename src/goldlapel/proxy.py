@@ -188,8 +188,11 @@ class GoldLapel:
             "--port", str(self._port),
         ] + _config_to_args(self._config) + self._extra_args
 
+        env = os.environ.copy()
+        env.setdefault("GOLDLAPEL_CLIENT", "python")
         self._process = subprocess.Popen(
             cmd,
+            env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
