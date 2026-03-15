@@ -25,6 +25,9 @@ classifiers = [
 Homepage = "https://goldlapel.com"
 Repository = "https://github.com/goldlapel/goldlapel-python"
 
+[project.scripts]
+goldlapel = "goldlapel.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
