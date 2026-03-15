@@ -5,6 +5,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -43,8 +44,10 @@ _LIST_KEYS = frozenset({
     "replica", "exclude_tables",
 })
 
-_instance = None
+_instances = {}
 _cleanup_registered = False
+_lock = threading.Lock()
+_next_port = DEFAULT_PORT
 
 
 def _config_to_args(config):
@@ -237,38 +240,76 @@ class GoldLapel:
 
 
 def start(upstream, config=None, port=None, extra_args=None):
-    global _instance, _cleanup_registered
-    if _instance and _instance.running:
-        if _instance._upstream != upstream:
-            raise RuntimeError(
-                "Gold Lapel is already running for a different upstream. "
-                "Call goldlapel.stop() before starting with a new upstream."
-            )
-        return _instance.url
-    _instance = GoldLapel(upstream, port=port, config=config, extra_args=extra_args)
-    if not _cleanup_registered:
-        atexit.register(_cleanup)
-        _cleanup_registered = True
-    return _instance.start()
+    global _cleanup_registered, _next_port
+    with _lock:
+        if upstream in _instances:
+            inst = _instances[upstream]
+            if inst.running:
+                return inst.url
+            # Dead instance -- remove and recreate below
+            del _instances[upstream]
+
+        if port is None:
+            port = _next_port
+        # Always advance _next_port past the port being used
+        if port >= _next_port:
+            _next_port = port + 1
+
+        inst = GoldLapel(upstream, port=port, config=config, extra_args=extra_args)
+        _instances[upstream] = inst
+        if not _cleanup_registered:
+            atexit.register(_cleanup)
+            _cleanup_registered = True
+    try:
+        return inst.start()
+    except Exception:
+        with _lock:
+            _instances.pop(upstream, None)
+        raise
 
 
-def stop():
-    global _instance
-    if _instance:
-        _instance.stop()
-        _instance = None
+def stop(upstream=None):
+    with _lock:
+        if upstream is not None:
+            inst = _instances.pop(upstream, None)
+            if inst:
+                inst.stop()
+        else:
+            for inst in _instances.values():
+                inst.stop()
+            _instances.clear()
 
 
-def proxy_url():
-    if _instance:
-        return _instance.url
-    return None
+def proxy_url(upstream=None):
+    with _lock:
+        if upstream is not None:
+            inst = _instances.get(upstream)
+            return inst.url if inst else None
+        # Single-database convenience: return the only instance's URL
+        if len(_instances) == 1:
+            return next(iter(_instances.values())).url
+        if not _instances:
+            return None
+        # Multiple instances -- caller must specify upstream
+        raise RuntimeError(
+            "Multiple Gold Lapel instances are running. "
+            "Pass the upstream URL to proxy_url() to identify which one."
+        )
 
 
-def dashboard_url():
-    if _instance:
-        return _instance.dashboard_url
-    return None
+def dashboard_url(upstream=None):
+    with _lock:
+        if upstream is not None:
+            inst = _instances.get(upstream)
+            return inst.dashboard_url if inst else None
+        if len(_instances) == 1:
+            return next(iter(_instances.values())).dashboard_url
+        if not _instances:
+            return None
+        raise RuntimeError(
+            "Multiple Gold Lapel instances are running. "
+            "Pass the upstream URL to dashboard_url() to identify which one."
+        )
 
 
 def config_keys():
@@ -276,7 +317,7 @@ def config_keys():
 
 
 def _cleanup():
-    global _instance
-    if _instance:
-        _instance.stop()
-        _instance = None
+    with _lock:
+        for inst in _instances.values():
+            inst.stop()
+        _instances.clear()

@@ -1,15 +1,17 @@
 import os
 import platform
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+import goldlapel.proxy as proxy_mod
 from goldlapel.proxy import (
     _config_to_args,
     _find_binary,
     _make_proxy_url,
     _wait_for_port,
+    DEFAULT_PORT,
     GoldLapel,
     config_keys,
     dashboard_url,
@@ -274,3 +276,209 @@ class TestModuleFunctions:
     def test_dashboard_url_none_when_not_started(self):
         stop()
         assert dashboard_url() is None
+
+
+def _reset_module_state():
+    proxy_mod._instances.clear()
+    proxy_mod._next_port = DEFAULT_PORT
+
+
+def _mock_popen():
+    proc = MagicMock()
+    proc.poll.return_value = None  # process is "running"
+    proc.stderr = MagicMock()
+    return proc
+
+
+class TestMultiInstance:
+    def setup_method(self):
+        _reset_module_state()
+
+    def teardown_method(self):
+        _reset_module_state()
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_two_upstreams_get_different_ports(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url_a = "postgresql://host-a:5432/db_a"
+        url_b = "postgresql://host-b:5432/db_b"
+
+        proxy_a = start(url_a)
+        proxy_b = start(url_b)
+
+        assert proxy_a != proxy_b
+        assert "7932" in proxy_a
+        assert "7933" in proxy_b
+        assert len(proxy_mod._instances) == 2
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_same_upstream_returns_existing(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url = "postgresql://host:5432/mydb"
+        proxy_1 = start(url)
+        proxy_2 = start(url)
+
+        assert proxy_1 == proxy_2
+        assert len(proxy_mod._instances) == 1
+        assert mock_popen.call_count == 1  # Only spawned once
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_stop_specific_upstream(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url_a = "postgresql://host-a:5432/db_a"
+        url_b = "postgresql://host-b:5432/db_b"
+
+        start(url_a)
+        start(url_b)
+
+        stop(url_a)
+        assert len(proxy_mod._instances) == 1
+        assert url_a not in proxy_mod._instances
+        assert url_b in proxy_mod._instances
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_stop_all(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host-a:5432/db_a")
+        start("postgresql://host-b:5432/db_b")
+
+        stop()
+        assert len(proxy_mod._instances) == 0
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_proxy_url_single_instance(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url = "postgresql://host:5432/mydb"
+        expected = start(url)
+        assert proxy_url() == expected
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_proxy_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url_a = "postgresql://host-a:5432/db_a"
+        url_b = "postgresql://host-b:5432/db_b"
+        proxy_a = start(url_a)
+        proxy_b = start(url_b)
+
+        # Without upstream arg, should raise
+        with pytest.raises(RuntimeError, match="Multiple Gold Lapel instances"):
+            proxy_url()
+
+        # With upstream arg, should return the correct URL
+        assert proxy_url(url_a) == proxy_a
+        assert proxy_url(url_b) == proxy_b
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_dashboard_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url_a = "postgresql://host-a:5432/db_a"
+        url_b = "postgresql://host-b:5432/db_b"
+        start(url_a)
+        start(url_b)
+
+        with pytest.raises(RuntimeError, match="Multiple Gold Lapel instances"):
+            dashboard_url()
+
+        # With upstream arg, should return the dashboard URL
+        assert dashboard_url(url_a) is not None
+        assert dashboard_url(url_b) is not None
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_explicit_port_advances_next_port(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url_a = "postgresql://host-a:5432/db_a"
+        url_b = "postgresql://host-b:5432/db_b"
+
+        start(url_a, port=8000)
+        proxy_b = start(url_b)  # Should auto-assign 8001, not 7932
+
+        assert "8001" in proxy_b
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_proxy_url_unknown_upstream(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb")
+        assert proxy_url("postgresql://unknown:5432/nope") is None
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_dead_instance_gets_recreated(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url = "postgresql://host:5432/mydb"
+        start(url)
+
+        # Simulate process dying
+        inst = proxy_mod._instances[url]
+        inst._process.poll.return_value = 1  # non-None = exited
+
+        # Starting again should recreate
+        proxy_2 = start(url)
+        assert proxy_2 is not None
+        assert mock_popen.call_count == 2
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_cleanup_stops_all(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host-a:5432/db_a")
+        start("postgresql://host-b:5432/db_b")
+
+        from goldlapel.proxy import _cleanup
+        _cleanup()
+
+        assert len(proxy_mod._instances) == 0
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=False)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_failed_start_cleans_up_instance(self, mock_find, mock_popen, mock_wait):
+        proc = _mock_popen()
+        proc.stderr.read.return_value = b"bind error"
+        mock_popen.return_value = proc
+
+        url = "postgresql://host:5432/mydb"
+        with pytest.raises(RuntimeError, match="failed to start"):
+            start(url)
+
+        assert url not in proxy_mod._instances
+
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_stop_nonexistent_upstream_is_noop(self, mock_find, mock_popen, mock_wait):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb")
+        stop("postgresql://nonexistent:5432/nope")  # Should not raise
+        assert len(proxy_mod._instances) == 1
