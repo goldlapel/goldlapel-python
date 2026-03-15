@@ -118,6 +118,26 @@ class TestMakeProxyUrl:
         url = "postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue"
         assert _make_proxy_url(url, 7932) == "postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue"
 
+    def test_password_starting_with_digit_with_port(self):
+        url = "postgresql://user:9password@host:5432/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:9password@localhost:7932/mydb"
+
+    def test_password_starting_with_digit_without_port(self):
+        url = "postgresql://user:9password@host/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:9password@localhost:7932/mydb"
+
+    def test_password_all_digits_without_port(self):
+        url = "postgresql://user:123456@host/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:123456@localhost:7932/mydb"
+
+    def test_password_all_digits_with_port(self):
+        url = "postgresql://user:123456@host:5432/mydb"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:123456@localhost:7932/mydb"
+
+    def test_password_starting_with_digit_no_path(self):
+        url = "postgresql://user:9secret@host"
+        assert _make_proxy_url(url, 7932) == "postgresql://user:9secret@localhost:7932"
+
 
 class TestWaitForPort:
     def test_open_port(self):
@@ -219,6 +239,18 @@ class TestConfigToArgs:
     def test_boolean_non_bool_raises(self):
         with pytest.raises(TypeError, match="expects a bool"):
             _config_to_args({"disable_pool": "yes"})
+
+    def test_list_key_given_string_wraps_to_list(self):
+        result = _config_to_args({"replica": "postgresql://replica:5432/mydb"})
+        assert result == ["--replica", "postgresql://replica:5432/mydb"]
+
+    def test_exclude_tables_given_string_wraps_to_list(self):
+        result = _config_to_args({"exclude_tables": "users"})
+        assert result == ["--exclude-tables", "users"]
+
+    def test_list_key_given_non_list_non_string_raises(self):
+        with pytest.raises(TypeError, match="expects a list"):
+            _config_to_args({"replica": 42})
 
     def test_config_with_constructor(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb", config={"mode": "butler"})

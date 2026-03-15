@@ -67,6 +67,12 @@ def _config_to_args(config):
             if value:
                 args.append(flag)
         elif key in _LIST_KEYS:
+            if isinstance(value, str):
+                value = [value]
+            elif not isinstance(value, (list, tuple)):
+                raise TypeError(
+                    f"Config key '{key}' expects a list, got {type(value).__name__}"
+                )
             for item in value:
                 args.extend([flag, str(item)])
         else:
@@ -126,9 +132,12 @@ def _make_proxy_url(upstream, port):
     # in passwords (e.g. %40 for @), which would corrupt the URL on reconstruction.
 
     # pg URL with explicit port: scheme://[userinfo@]host:PORT[/path][?query]
-    m = re.match(r'^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+):(\d+)(.*)$', upstream)
+    # The port must be followed by /, ?, #, or end-of-string — not alphanumeric chars.
+    # Without this anchor, passwords starting with digits (e.g. user:9password@host)
+    # cause the regex to skip the userinfo group and misparse "user:9..." as host:port.
+    m = re.match(r'^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+):(\d+)([/?#].*)?$', upstream)
     if m:
-        return f"{m.group(1)}localhost:{port}{m.group(4)}"
+        return f"{m.group(1)}localhost:{port}{m.group(4) or ''}"
 
     # pg URL without port: scheme://[userinfo@]host[/path][?query]
     m = re.match(r'^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+)(.*)$', upstream)
