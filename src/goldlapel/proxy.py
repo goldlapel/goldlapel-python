@@ -3,8 +3,10 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -167,6 +169,43 @@ def _wait_for_port(host, port, timeout):
     return False
 
 
+def _port_in_use(port):
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+        sock.close()
+        return True
+    except OSError:
+        return False
+
+
+def _kill_orphan_on_port(port):
+    if not _port_in_use(port):
+        return
+    if shutil.which("lsof"):
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-ti", f":{port}"], stderr=subprocess.DEVNULL, text=True
+            )
+            for pid_str in out.strip().split():
+                pid = int(pid_str)
+                if pid != os.getpid():
+                    os.kill(pid, signal.SIGTERM)
+            time.sleep(0.5)
+        except (subprocess.CalledProcessError, ValueError, OSError):
+            pass
+
+
+def _set_pdeathsig():
+    if sys.platform == "linux":
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            PR_SET_PDEATHSIG = 1
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        except OSError:
+            pass
+
+
 class GoldLapel:
     def __init__(self, upstream, config=None, port=None, extra_args=None):
         self._upstream = upstream
@@ -188,14 +227,18 @@ class GoldLapel:
             "--port", str(self._port),
         ] + _config_to_args(self._config) + self._extra_args
 
+        _kill_orphan_on_port(self._port)
+
         env = os.environ.copy()
         env.setdefault("GOLDLAPEL_CLIENT", "python")
-        self._process = subprocess.Popen(
-            cmd,
+        popen_kwargs = dict(
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        if sys.platform == "linux":
+            popen_kwargs["preexec_fn"] = _set_pdeathsig
+        self._process = subprocess.Popen(cmd, **popen_kwargs)
 
         if not _wait_for_port("127.0.0.1", self._port, _STARTUP_TIMEOUT):
             self._process.kill()
