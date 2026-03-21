@@ -184,7 +184,8 @@ def _kill_orphan_on_port(port):
     if shutil.which("lsof"):
         try:
             out = subprocess.check_output(
-                ["lsof", "-ti", f":{port}"], stderr=subprocess.DEVNULL, text=True
+                ["lsof", "-ti", f":{port}", "-c", "goldlapel"],
+                stderr=subprocess.DEVNULL, text=True,
             )
             for pid_str in out.strip().split():
                 pid = int(pid_str)
@@ -202,7 +203,7 @@ def _set_pdeathsig():
             libc = ctypes.CDLL("libc.so.6", use_errno=True)
             PR_SET_PDEATHSIG = 1
             libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
-        except OSError:
+        except Exception:
             pass
 
 
