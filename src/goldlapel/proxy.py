@@ -347,19 +347,17 @@ def start(upstream, config=None, port=None, extra_args=None):
     inst = _ensure_running(upstream, config=config, port=port, extra_args=extra_args)
     driver_name, driver = _detect_sync_driver()
     if driver is None:
-        raise ImportError(
-            "No supported sync Postgres driver found. "
-            "Install one: pip install psycopg (recommended) or pip install psycopg2-binary"
-        )
-    proxy_dsn = f"host=localhost port={inst._port} user=postgres dbname={_extract_dbname(upstream)}"
-    if driver_name == "psycopg3":
-        conn = driver.connect(inst.url, autocommit=True)
-    else:
-        conn = driver.connect(inst.url)
-
-    from goldlapel.wrap import wrap
-    inv_port = int((config or {}).get("invalidation_port", inst._port + 2))
-    return wrap(conn, invalidation_port=inv_port)
+        return inst.url
+    try:
+        if driver_name == "psycopg3":
+            conn = driver.connect(inst.url, autocommit=True)
+        else:
+            conn = driver.connect(inst.url)
+        from goldlapel.wrap import wrap
+        inv_port = int((config or {}).get("invalidation_port", inst._port + 2))
+        return wrap(conn, invalidation_port=inv_port)
+    except Exception:
+        return inst.url
 
 
 async def start_async(upstream, config=None, port=None, extra_args=None):
