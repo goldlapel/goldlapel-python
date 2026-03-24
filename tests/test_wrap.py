@@ -49,12 +49,17 @@ class TestWrap:
             wrapped = wrap(conn, invalidation_port=9999)
         assert isinstance(wrapped, CachedConnection)
 
-    def test_asyncpg_raises_type_error(self):
+    def test_asyncpg_returns_async_wrapper(self):
+        from goldlapel.wrap import AsyncCachedConnection
         conn = MagicMock()
         conn.fetch = MagicMock()
         conn.fetchrow = MagicMock()
-        with pytest.raises(TypeError, match="asyncpg"):
-            wrap(conn)
+        with patch("goldlapel.wrap.NativeCache") as MockCache:
+            instance = MagicMock()
+            instance._invalidation_thread = None
+            MockCache.return_value = instance
+            wrapped = wrap(conn, invalidation_port=9999)
+        assert isinstance(wrapped, AsyncCachedConnection)
 
 
 # --- CachedConnection ---

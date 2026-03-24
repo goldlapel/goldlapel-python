@@ -287,19 +287,17 @@ class GoldLapel:
         return self._process is not None and self._process.poll() is None
 
 
-def start(upstream, config=None, port=None, extra_args=None):
+def _ensure_running(upstream, config=None, port=None, extra_args=None):
     global _cleanup_registered, _next_port
     with _lock:
         if upstream in _instances:
             inst = _instances[upstream]
             if inst.running:
-                return inst.url
-            # Dead instance -- remove and recreate below
+                return inst
             del _instances[upstream]
 
         if port is None:
             port = _next_port
-        # Always advance _next_port past the port being used
         if port >= _next_port:
             _next_port = port + 1
 
@@ -309,11 +307,88 @@ def start(upstream, config=None, port=None, extra_args=None):
             atexit.register(_cleanup)
             _cleanup_registered = True
     try:
-        return inst.start()
+        inst.start()
+        return inst
     except Exception:
         with _lock:
             _instances.pop(upstream, None)
         raise
+
+
+def _detect_sync_driver():
+    try:
+        import psycopg
+        return "psycopg3", psycopg
+    except ImportError:
+        pass
+    try:
+        import psycopg2
+        return "psycopg2", psycopg2
+    except ImportError:
+        pass
+    return None, None
+
+
+def _detect_async_driver():
+    try:
+        import asyncpg
+        return "asyncpg", asyncpg
+    except ImportError:
+        pass
+    try:
+        import psycopg
+        return "psycopg3", psycopg
+    except ImportError:
+        pass
+    return None, None
+
+
+def start(upstream, config=None, port=None, extra_args=None):
+    inst = _ensure_running(upstream, config=config, port=port, extra_args=extra_args)
+    driver_name, driver = _detect_sync_driver()
+    if driver is None:
+        raise ImportError(
+            "No supported sync Postgres driver found. "
+            "Install one: pip install psycopg (recommended) or pip install psycopg2-binary"
+        )
+    proxy_dsn = f"host=localhost port={inst._port} user=postgres dbname={_extract_dbname(upstream)}"
+    if driver_name == "psycopg3":
+        conn = driver.connect(inst.url, autocommit=True)
+    else:
+        conn = driver.connect(inst.url)
+
+    from goldlapel.wrap import wrap
+    inv_port = int((config or {}).get("invalidation_port", inst._port + 2))
+    return wrap(conn, invalidation_port=inv_port)
+
+
+async def start_async(upstream, config=None, port=None, extra_args=None):
+    inst = _ensure_running(upstream, config=config, port=port, extra_args=extra_args)
+    driver_name, driver = _detect_async_driver()
+    if driver is None:
+        raise ImportError(
+            "No supported async Postgres driver found. "
+            "Install one: pip install asyncpg (recommended) or pip install psycopg"
+        )
+    from goldlapel.wrap import wrap
+    inv_port = int((config or {}).get("invalidation_port", inst._port + 2))
+    if driver_name == "asyncpg":
+        conn = await driver.connect(inst.url)
+        return wrap(conn, invalidation_port=inv_port)
+    else:
+        # psycopg3 async
+        conn = await driver.AsyncConnection.connect(inst.url, autocommit=True)
+        return wrap(conn, invalidation_port=inv_port)
+
+
+def _extract_dbname(upstream):
+    if "://" in upstream:
+        path = upstream.split("://", 1)[1]
+        if "/" in path:
+            db = path.split("/", 1)[1].split("?")[0]
+            if db:
+                return db
+    return "postgres"
 
 
 def stop(upstream=None):

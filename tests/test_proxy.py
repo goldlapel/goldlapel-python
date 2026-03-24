@@ -290,6 +290,13 @@ def _mock_popen():
     return proc
 
 
+def _mock_driver():
+    mock_mod = MagicMock()
+    mock_conn = MagicMock()
+    mock_mod.connect.return_value = mock_conn
+    return "psycopg3", mock_mod
+
+
 class TestMultiInstance:
     def setup_method(self):
         _reset_module_state()
@@ -297,41 +304,46 @@ class TestMultiInstance:
     def teardown_method(self):
         _reset_module_state()
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_two_upstreams_get_different_ports(self, mock_find, mock_popen, mock_wait):
+    def test_two_upstreams_get_different_ports(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
         url_b = "postgresql://host-b:5432/db_b"
 
-        proxy_a = start(url_a)
-        proxy_b = start(url_b)
+        start(url_a)
+        start(url_b)
 
-        assert proxy_a != proxy_b
-        assert "7932" in proxy_a
-        assert "7933" in proxy_b
         assert len(proxy_mod._instances) == 2
+        ports = [inst._port for inst in proxy_mod._instances.values()]
+        assert 7932 in ports
+        assert 7933 in ports
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_same_upstream_returns_existing(self, mock_find, mock_popen, mock_wait):
+    def test_same_upstream_returns_existing(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url = "postgresql://host:5432/mydb"
-        proxy_1 = start(url)
-        proxy_2 = start(url)
+        start(url)
+        start(url)
 
-        assert proxy_1 == proxy_2
         assert len(proxy_mod._instances) == 1
         assert mock_popen.call_count == 1  # Only spawned once
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_stop_specific_upstream(self, mock_find, mock_popen, mock_wait):
+    def test_stop_specific_upstream(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
@@ -345,10 +357,12 @@ class TestMultiInstance:
         assert url_a not in proxy_mod._instances
         assert url_b in proxy_mod._instances
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_stop_all(self, mock_find, mock_popen, mock_wait):
+    def test_stop_all(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         start("postgresql://host-a:5432/db_a")
@@ -357,39 +371,47 @@ class TestMultiInstance:
         stop()
         assert len(proxy_mod._instances) == 0
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_proxy_url_single_instance(self, mock_find, mock_popen, mock_wait):
+    def test_proxy_url_single_instance(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url = "postgresql://host:5432/mydb"
-        expected = start(url)
-        assert proxy_url() == expected
+        start(url)
+        purl = proxy_url()
+        assert purl is not None
+        assert "7932" in purl
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_proxy_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait):
+    def test_proxy_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
         url_b = "postgresql://host-b:5432/db_b"
-        proxy_a = start(url_a)
-        proxy_b = start(url_b)
+        start(url_a)
+        start(url_b)
 
         # Without upstream arg, should raise
         with pytest.raises(RuntimeError, match="Multiple Gold Lapel instances"):
             proxy_url()
 
         # With upstream arg, should return the correct URL
-        assert proxy_url(url_a) == proxy_a
-        assert proxy_url(url_b) == proxy_b
+        assert proxy_url(url_a) is not None
+        assert proxy_url(url_b) is not None
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_dashboard_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait):
+    def test_dashboard_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
@@ -404,33 +426,40 @@ class TestMultiInstance:
         assert dashboard_url(url_a) is not None
         assert dashboard_url(url_b) is not None
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_explicit_port_advances_next_port(self, mock_find, mock_popen, mock_wait):
+    def test_explicit_port_advances_next_port(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
         url_b = "postgresql://host-b:5432/db_b"
 
         start(url_a, port=8000)
-        proxy_b = start(url_b)  # Should auto-assign 8001, not 7932
+        start(url_b)  # Should auto-assign 8001, not 7932
 
-        assert "8001" in proxy_b
+        inst_b = proxy_mod._instances[url_b]
+        assert inst_b._port == 8001
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_proxy_url_unknown_upstream(self, mock_find, mock_popen, mock_wait):
+    def test_proxy_url_unknown_upstream(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         start("postgresql://host:5432/mydb")
         assert proxy_url("postgresql://unknown:5432/nope") is None
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_dead_instance_gets_recreated(self, mock_find, mock_popen, mock_wait):
+    def test_dead_instance_gets_recreated(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url = "postgresql://host:5432/mydb"
@@ -445,10 +474,12 @@ class TestMultiInstance:
         assert proxy_2 is not None
         assert mock_popen.call_count == 2
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_cleanup_stops_all(self, mock_find, mock_popen, mock_wait):
+    def test_cleanup_stops_all(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         start("postgresql://host-a:5432/db_a")
@@ -459,10 +490,12 @@ class TestMultiInstance:
 
         assert len(proxy_mod._instances) == 0
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=False)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_failed_start_cleans_up_instance(self, mock_find, mock_popen, mock_wait):
+    def test_failed_start_cleans_up_instance(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         proc = _mock_popen()
         proc.stderr.read.return_value = b"bind error"
         mock_popen.return_value = proc
@@ -473,10 +506,12 @@ class TestMultiInstance:
 
         assert url not in proxy_mod._instances
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_stop_nonexistent_upstream_is_noop(self, mock_find, mock_popen, mock_wait):
+    def test_stop_nonexistent_upstream_is_noop(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         start("postgresql://host:5432/mydb")

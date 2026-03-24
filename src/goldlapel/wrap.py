@@ -17,13 +17,6 @@ def _detect_invalidation_port():
 
 
 def wrap(conn, invalidation_port=None):
-    if hasattr(conn, "fetch") and hasattr(conn, "fetchrow"):
-        raise TypeError(
-            "goldlapel.wrap() does not yet support asyncpg connections. "
-            "asyncpg support is planned for a future release. "
-            "For now, asyncpg queries go through the GL proxy (L2 cache)."
-        )
-
     global _cache
     if _cache is None:
         _cache = NativeCache()
@@ -31,6 +24,10 @@ def wrap(conn, invalidation_port=None):
         invalidation_port = _detect_invalidation_port()
     if not _cache._invalidation_thread or not _cache._invalidation_thread.is_alive():
         _cache.connect_invalidation(invalidation_port)
+
+    if hasattr(conn, "fetch") and hasattr(conn, "fetchrow"):
+        return AsyncCachedConnection(conn, _cache)
+
     return CachedConnection(conn, _cache)
 
 
@@ -209,3 +206,114 @@ class CachedCursor:
 
     def __setattr__(self, name, value):
         setattr(self._real, name, value)
+
+
+class AsyncCachedConnection:
+    def __init__(self, real_conn, cache):
+        object.__setattr__(self, "_real", real_conn)
+        object.__setattr__(self, "_cache", cache)
+        object.__setattr__(self, "_in_transaction", False)
+
+    async def fetch(self, sql, *args):
+        write_table = _detect_write(sql)
+        if write_table:
+            if write_table == _DDL_SENTINEL:
+                self._cache.invalidate_all()
+            else:
+                self._cache.invalidate_table(write_table)
+            return await self._real.fetch(sql, *args)
+
+        if self._in_transaction:
+            return await self._real.fetch(sql, *args)
+
+        params = args if args else None
+        entry = self._cache.get(sql, params)
+        if entry is not None:
+            return entry.rows
+
+        rows = await self._real.fetch(sql, *args)
+        self._cache.put(sql, params, list(rows), None)
+        return rows
+
+    async def fetchrow(self, sql, *args):
+        write_table = _detect_write(sql)
+        if write_table:
+            if write_table == _DDL_SENTINEL:
+                self._cache.invalidate_all()
+            else:
+                self._cache.invalidate_table(write_table)
+            return await self._real.fetchrow(sql, *args)
+
+        if self._in_transaction:
+            return await self._real.fetchrow(sql, *args)
+
+        params = args if args else None
+        entry = self._cache.get(sql, params)
+        if entry is not None:
+            return entry.rows[0] if entry.rows else None
+
+        row = await self._real.fetchrow(sql, *args)
+        if row is not None:
+            self._cache.put(sql, params, [row], None)
+        return row
+
+    async def fetchval(self, sql, *args, column=0):
+        write_table = _detect_write(sql)
+        if write_table:
+            if write_table == _DDL_SENTINEL:
+                self._cache.invalidate_all()
+            else:
+                self._cache.invalidate_table(write_table)
+            return await self._real.fetchval(sql, *args, column=column)
+
+        if self._in_transaction:
+            return await self._real.fetchval(sql, *args, column=column)
+
+        params = args if args else None
+        entry = self._cache.get(sql, params)
+        if entry is not None:
+            if entry.rows:
+                row = entry.rows[0]
+                if hasattr(row, "__getitem__"):
+                    return row[column]
+                return row
+            return None
+
+        val = await self._real.fetchval(sql, *args, column=column)
+        return val
+
+    async def execute(self, sql, *args):
+        write_table = _detect_write(sql)
+        if write_table:
+            if write_table == _DDL_SENTINEL:
+                self._cache.invalidate_all()
+            else:
+                self._cache.invalidate_table(write_table)
+        return await self._real.execute(sql, *args)
+
+    def transaction(self, **kwargs):
+        return _AsyncTransactionWrapper(self, self._real.transaction(**kwargs))
+
+    async def close(self):
+        return await self._real.close()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._real, name, value)
+
+
+class _AsyncTransactionWrapper:
+    def __init__(self, cached_conn, real_txn):
+        self._cached_conn = cached_conn
+        self._real_txn = real_txn
+
+    async def __aenter__(self):
+        object.__setattr__(self._cached_conn, "_in_transaction", True)
+        return await self._real_txn.__aenter__()
+
+    async def __aexit__(self, *args):
+        result = await self._real_txn.__aexit__(*args)
+        object.__setattr__(self._cached_conn, "_in_transaction", False)
+        return result
