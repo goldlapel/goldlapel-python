@@ -1,0 +1,211 @@
+from goldlapel.cache import NativeCache, _detect_write, _DDL_SENTINEL, _TX_START, _TX_END
+
+_cache = None
+
+
+def _detect_invalidation_port():
+    try:
+        from goldlapel.proxy import _instances, _lock, DEFAULT_PORT
+        with _lock:
+            if _instances:
+                inst = next(iter(_instances.values()))
+                config = inst._config or {}
+                return int(config.get("invalidation_port", inst._port + 2))
+        return DEFAULT_PORT + 2
+    except Exception:
+        return 7934
+
+
+def wrap(conn, invalidation_port=None):
+    if hasattr(conn, "fetch") and hasattr(conn, "fetchrow"):
+        raise TypeError(
+            "goldlapel.wrap() does not yet support asyncpg connections. "
+            "asyncpg support is planned for a future release. "
+            "For now, asyncpg queries go through the GL proxy (L2 cache)."
+        )
+
+    global _cache
+    if _cache is None:
+        _cache = NativeCache()
+    if invalidation_port is None:
+        invalidation_port = _detect_invalidation_port()
+    if not _cache._invalidation_thread or not _cache._invalidation_thread.is_alive():
+        _cache.connect_invalidation(invalidation_port)
+    return CachedConnection(conn, _cache)
+
+
+class CachedConnection:
+    def __init__(self, real_conn, cache):
+        object.__setattr__(self, "_real", real_conn)
+        object.__setattr__(self, "_cache", cache)
+
+    def cursor(self, *args, **kwargs):
+        real_cursor = self._real.cursor(*args, **kwargs)
+        return CachedCursor(real_cursor, self._cache)
+
+    def close(self):
+        return self._real.close()
+
+    @property
+    def closed(self):
+        return self._real.closed
+
+    def commit(self):
+        return self._real.commit()
+
+    def rollback(self):
+        return self._real.rollback()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return self._real.__exit__(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._real, name, value)
+
+
+class CachedCursor:
+    def __init__(self, real_cursor, cache):
+        object.__setattr__(self, "_real", real_cursor)
+        object.__setattr__(self, "_cache", cache)
+        object.__setattr__(self, "_cached_rows", None)
+        object.__setattr__(self, "_cached_description", None)
+        object.__setattr__(self, "_fetch_index", 0)
+        object.__setattr__(self, "_in_transaction", False)
+
+    def execute(self, sql, params=None):
+        object.__setattr__(self, "_cached_rows", None)
+        object.__setattr__(self, "_cached_description", None)
+        object.__setattr__(self, "_fetch_index", 0)
+
+        # Transaction tracking
+        if _TX_START.match(sql):
+            object.__setattr__(self, "_in_transaction", True)
+            return self._real.execute(sql, params)
+        if _TX_END.match(sql):
+            object.__setattr__(self, "_in_transaction", False)
+            return self._real.execute(sql, params)
+
+        # Write detection + self-invalidation (always, even in transactions)
+        write_table = _detect_write(sql)
+        if write_table:
+            if write_table == _DDL_SENTINEL:
+                self._cache.invalidate_all()
+            else:
+                self._cache.invalidate_table(write_table)
+            return self._real.execute(sql, params)
+
+        # Inside transaction: bypass cache for reads
+        if self._in_transaction:
+            return self._real.execute(sql, params)
+
+        # Bypass cache for server-side/named cursors
+        if getattr(self._real, "name", None):
+            return self._real.execute(sql, params)
+
+        # Read path: check L1 cache
+        entry = self._cache.get(sql, params)
+        if entry is not None:
+            object.__setattr__(self, "_cached_rows", entry.rows)
+            object.__setattr__(self, "_cached_description", entry.description)
+            object.__setattr__(self, "_fetch_index", 0)
+            return None
+
+        # Cache miss: execute for real
+        result = self._real.execute(sql, params)
+
+        # Cache the result if the query returns rows
+        if self._real.description is not None:
+            try:
+                rows = self._real.fetchall()
+                desc = self._real.description
+                self._cache.put(sql, params, rows, desc)
+                object.__setattr__(self, "_cached_rows", rows)
+                object.__setattr__(self, "_cached_description", desc)
+                object.__setattr__(self, "_fetch_index", 0)
+            except Exception:
+                pass
+
+        return result
+
+    def fetchone(self):
+        if self._cached_rows is not None:
+            idx = self._fetch_index
+            if idx < len(self._cached_rows):
+                object.__setattr__(self, "_fetch_index", idx + 1)
+                return self._cached_rows[idx]
+            return None
+        return self._real.fetchone()
+
+    def fetchall(self):
+        if self._cached_rows is not None:
+            remaining = self._cached_rows[self._fetch_index:]
+            object.__setattr__(self, "_fetch_index", len(self._cached_rows))
+            return remaining
+        return self._real.fetchall()
+
+    def fetchmany(self, size=None):
+        if self._cached_rows is not None:
+            if size is None:
+                size = getattr(self._real, "arraysize", 1)
+            end = min(self._fetch_index + size, len(self._cached_rows))
+            rows = self._cached_rows[self._fetch_index:end]
+            object.__setattr__(self, "_fetch_index", end)
+            return rows
+        return self._real.fetchmany(size) if size is not None else self._real.fetchmany()
+
+    @property
+    def description(self):
+        if self._cached_description is not None:
+            return self._cached_description
+        return self._real.description
+
+    @property
+    def rowcount(self):
+        if self._cached_rows is not None:
+            return len(self._cached_rows)
+        return self._real.rowcount
+
+    def executemany(self, sql, params_list):
+        write_table = _detect_write(sql)
+        if write_table:
+            if write_table == _DDL_SENTINEL:
+                self._cache.invalidate_all()
+            else:
+                self._cache.invalidate_table(write_table)
+        return self._real.executemany(sql, params_list)
+
+    def callproc(self, procname, params=None):
+        self._cache.invalidate_all()
+        return self._real.callproc(procname, params)
+
+    def close(self):
+        return self._real.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return self._real.__exit__(*args)
+
+    def __iter__(self):
+        if self._cached_rows is not None:
+            return iter(self._cached_rows[self._fetch_index:])
+        return iter(self._real)
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._real, name, value)

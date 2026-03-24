@@ -265,7 +265,7 @@ class TestConfigKeys:
         assert isinstance(keys, set)
         assert "mode" in keys
         assert "pool_size" in keys
-        assert len(keys) == 41
+        assert len(keys) == 42
 
 
 class TestModuleFunctions:

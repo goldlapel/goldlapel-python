@@ -31,6 +31,7 @@ _VALID_CONFIG_KEYS = frozenset({
     "disable_result_cache", "disable_pool",
     "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
     "enable_coalescing", "replica", "exclude_tables",
+    "invalidation_port",
 })
 
 _BOOLEAN_KEYS = frozenset({
