@@ -35,10 +35,11 @@ class CachedConnection:
     def __init__(self, real_conn, cache):
         object.__setattr__(self, "_real", real_conn)
         object.__setattr__(self, "_cache", cache)
+        object.__setattr__(self, "_in_transaction", False)
 
     def cursor(self, *args, **kwargs):
         real_cursor = self._real.cursor(*args, **kwargs)
-        return CachedCursor(real_cursor, self._cache)
+        return CachedCursor(real_cursor, self._cache, self)
 
     def close(self):
         return self._real.close()
@@ -67,25 +68,27 @@ class CachedConnection:
 
 
 class CachedCursor:
-    def __init__(self, real_cursor, cache):
+    def __init__(self, real_cursor, cache, conn=None):
         object.__setattr__(self, "_real", real_cursor)
         object.__setattr__(self, "_cache", cache)
+        object.__setattr__(self, "_conn", conn)
         object.__setattr__(self, "_cached_rows", None)
         object.__setattr__(self, "_cached_description", None)
         object.__setattr__(self, "_fetch_index", 0)
-        object.__setattr__(self, "_in_transaction", False)
 
     def execute(self, sql, params=None):
         object.__setattr__(self, "_cached_rows", None)
         object.__setattr__(self, "_cached_description", None)
         object.__setattr__(self, "_fetch_index", 0)
 
-        # Transaction tracking
+        # Transaction tracking (state on connection, not cursor)
         if _TX_START.match(sql):
-            object.__setattr__(self, "_in_transaction", True)
+            if self._conn is not None:
+                object.__setattr__(self._conn, "_in_transaction", True)
             return self._real.execute(sql, params)
         if _TX_END.match(sql):
-            object.__setattr__(self, "_in_transaction", False)
+            if self._conn is not None:
+                object.__setattr__(self._conn, "_in_transaction", False)
             return self._real.execute(sql, params)
 
         # Write detection + self-invalidation (always, even in transactions)
@@ -98,7 +101,7 @@ class CachedCursor:
             return self._real.execute(sql, params)
 
         # Inside transaction: bypass cache for reads
-        if self._in_transaction:
+        if self._conn is not None and self._conn._in_transaction:
             return self._real.execute(sql, params)
 
         # Bypass cache for server-side/named cursors

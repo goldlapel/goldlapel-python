@@ -247,12 +247,17 @@ class TestWrites:
 
 # --- CachedCursor: transactions ---
 
+class MockCachedConn:
+    _in_transaction = False
+
+
 class TestTransactions:
     def test_begin_disables_cache(self):
         conn, cursor = mock_conn()
         cache = make_connected_cache()
         cache.put("SELECT * FROM orders", None, [(1,)], None)
-        cc = CachedCursor(cursor, cache)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
         cc.execute("BEGIN")
         cc.execute("SELECT * FROM orders")
         # Inside txn, should call real cursor even though cached
@@ -262,7 +267,8 @@ class TestTransactions:
         conn, cursor = mock_conn()
         cache = make_connected_cache()
         cache.put("SELECT * FROM orders", None, [(1,)], None)
-        cc = CachedCursor(cursor, cache)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
         cc.execute("BEGIN")
         cc.execute("COMMIT")
         cursor.reset_mock()
@@ -273,7 +279,8 @@ class TestTransactions:
         conn, cursor = mock_conn()
         cache = make_connected_cache()
         cache.put("SELECT * FROM orders", None, [(1,)], None)
-        cc = CachedCursor(cursor, cache)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
         cc.execute("BEGIN")
         cc.execute("ROLLBACK")
         cursor.reset_mock()
@@ -284,10 +291,23 @@ class TestTransactions:
         conn, cursor = mock_conn()
         cache = make_connected_cache()
         cache.put("SELECT * FROM orders", None, [(1,)], None)
-        cc = CachedCursor(cursor, cache)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
         cc.execute("BEGIN")
         cc.execute("INSERT INTO orders VALUES (2)")
         assert cache.get("SELECT * FROM orders", None) is None
+
+    def test_cross_cursor_transaction_tracking(self):
+        """BEGIN on cursor1, read on cursor2 should bypass cache."""
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        mock_cc = MockCachedConn()
+        cc1 = CachedCursor(cursor, cache, mock_cc)
+        cc2 = CachedCursor(cursor, cache, mock_cc)
+        cc1.execute("BEGIN")
+        cc2.execute("SELECT * FROM orders")
+        cursor.execute.assert_any_call("SELECT * FROM orders", None)
 
 
 # --- Named cursor bypass ---
