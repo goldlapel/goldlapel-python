@@ -61,8 +61,30 @@ def _detect_write(sql):
                 return None
             return _bare_table(tokens[2])
         return _bare_table(tokens[1])
-    elif first in ("CREATE", "ALTER", "DROP"):
+    elif first in ("CREATE", "ALTER", "DROP", "REFRESH", "DO", "CALL"):
         return _DDL_SENTINEL
+    elif first == "MERGE":
+        if len(tokens) < 3 or tokens[1].upper() != "INTO":
+            return None
+        return _bare_table(tokens[2])
+    elif first == "SELECT":
+        saw_into = False
+        into_target = None
+        for tok in tokens[1:]:
+            upper = tok.upper()
+            if upper == "INTO" and not saw_into:
+                saw_into = True
+                continue
+            if saw_into and into_target is None:
+                if upper in ("TEMPORARY", "TEMP", "UNLOGGED"):
+                    continue
+                into_target = tok
+                continue
+            if saw_into and into_target is not None and upper == "FROM":
+                return _DDL_SENTINEL
+            if upper == "FROM":
+                return None
+        return None
     elif first == "COPY":
         if len(tokens) < 2:
             return None
