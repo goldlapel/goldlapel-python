@@ -381,6 +381,29 @@ async def start_async(upstream, config=None, port=None, extra_args=None):
 
 
 
+def connect(upstream=None):
+    with _lock:
+        if upstream is not None:
+            inst = _instances.get(upstream)
+        elif len(_instances) == 1:
+            inst = next(iter(_instances.values()))
+        else:
+            inst = None
+    if inst is None or not inst.running:
+        raise RuntimeError("Gold Lapel is not running. Call start() first.")
+    driver_name, driver = _detect_sync_driver()
+    if driver is None:
+        raise ImportError("No supported sync Postgres driver found.")
+    if driver_name == "psycopg3":
+        conn = driver.connect(inst.url, autocommit=True)
+    else:
+        conn = driver.connect(inst.url)
+    from goldlapel.wrap import wrap
+    config = inst._config or {}
+    inv_port = int(config.get("invalidation_port", inst._port + 2))
+    return wrap(conn, invalidation_port=inv_port)
+
+
 def stop(upstream=None):
     with _lock:
         if upstream is not None:
