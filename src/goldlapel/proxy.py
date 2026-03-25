@@ -379,14 +379,6 @@ async def start_async(upstream, config=None, port=None, extra_args=None):
         return wrap(conn, invalidation_port=inv_port)
 
 
-def _extract_dbname(upstream):
-    if "://" in upstream:
-        path = upstream.split("://", 1)[1]
-        if "/" in path:
-            db = path.split("/", 1)[1].split("?")[0]
-            if db:
-                return db
-    return "postgres"
 
 
 def stop(upstream=None):
