@@ -249,6 +249,17 @@ class TestLRU:
         assert cache.get("SELECT 1", None) is not None
         assert cache.get("SELECT 2", None) is None
 
+    def test_re_put_refreshes_lru(self):
+        cache = make_cache(max_entries=3)
+        cache.put("SELECT 1", None, [(1,)], None)
+        cache.put("SELECT 2", None, [(2,)], None)
+        cache.put("SELECT 3", None, [(3,)], None)
+        cache.put("SELECT 1", None, [(10,)], None)  # re-put refreshes SELECT 1
+        cache.put("SELECT 4", None, [(4,)], None)  # evicts SELECT 2 (oldest)
+        assert cache.get("SELECT 1", None) is not None
+        assert cache.get("SELECT 1", None).rows == [(10,)]
+        assert cache.get("SELECT 2", None) is None
+
     def test_eviction_cleans_table_index(self):
         cache = make_cache(max_entries=2)
         cache.put("SELECT * FROM orders", None, [(1,)], None)

@@ -3,7 +3,7 @@ import re
 import socket
 import sys
 import threading
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 
 _DDL_SENTINEL = "__ddl__"
 
@@ -139,10 +139,8 @@ class NativeCache:
     def __init__(self):
         if self._initialized:
             return
-        self._cache = {}
+        self._cache = OrderedDict()
         self._table_index = {}
-        self._access_order = {}
-        self._counter = 0
         self._max_entries = int(os.environ.get("GOLDLAPEL_NATIVE_CACHE_SIZE", "32768"))
         self._enabled = os.environ.get("GOLDLAPEL_NATIVE_CACHE", "true").lower() != "false"
         self._lock = threading.Lock()
@@ -167,8 +165,7 @@ class NativeCache:
         with self._lock:
             entry = self._cache.get(key)
             if entry is not None:
-                self._counter += 1
-                self._access_order[key] = self._counter
+                self._cache.move_to_end(key)
                 self.stats_hits += 1
                 return entry
             self.stats_misses += 1
@@ -184,11 +181,11 @@ class NativeCache:
             return
         tables = _extract_tables(sql)
         with self._lock:
-            if key not in self._cache and len(self._cache) >= self._max_entries:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            elif len(self._cache) >= self._max_entries:
                 self._evict_one()
             self._cache[key] = CacheEntry(rows, description, tables)
-            self._counter += 1
-            self._access_order[key] = self._counter
             for table in tables:
                 if table not in self._table_index:
                     self._table_index[table] = set()
@@ -200,7 +197,6 @@ class NativeCache:
             keys = self._table_index.pop(table, set())
             for key in keys:
                 entry = self._cache.pop(key, None)
-                self._access_order.pop(key, None)
                 if entry:
                     for other_table in entry.tables:
                         if other_table != table and other_table in self._table_index:
@@ -212,7 +208,6 @@ class NativeCache:
             count = len(self._cache)
             self._cache.clear()
             self._table_index.clear()
-            self._access_order.clear()
             self.stats_invalidations += count
 
     def connect_invalidation(self, port):
@@ -292,11 +287,9 @@ class NativeCache:
                 self.invalidate_table(table)
 
     def _evict_one(self):
-        if not self._access_order:
+        if not self._cache:
             return
-        lru_key = min(self._access_order, key=self._access_order.get)
-        entry = self._cache.pop(lru_key, None)
-        self._access_order.pop(lru_key, None)
+        lru_key, entry = self._cache.popitem(last=False)
         if entry:
             for table in entry.tables:
                 if table in self._table_index:
