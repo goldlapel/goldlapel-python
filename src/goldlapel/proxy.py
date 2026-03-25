@@ -356,7 +356,9 @@ def start(upstream, config=None, port=None, extra_args=None):
         from goldlapel.wrap import wrap
         inv_port = int((config or {}).get("invalidation_port", inst._port + 2))
         return wrap(conn, invalidation_port=inv_port)
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger("goldlapel").warning("L1 cache unavailable: %s — returning proxy URL", e)
         return inst.url
 
 

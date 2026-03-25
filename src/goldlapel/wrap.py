@@ -124,12 +124,17 @@ class CachedCursor:
             try:
                 rows = self._real.fetchall()
                 desc = self._real.description
+            except Exception:
+                return result  # fetchall failed, cursor state is gone, nothing we can do
+            # Cache the result (best effort)
+            try:
                 self._cache.put(sql, params, rows, desc)
-                object.__setattr__(self, "_cached_rows", rows)
-                object.__setattr__(self, "_cached_description", desc)
-                object.__setattr__(self, "_fetch_index", 0)
             except Exception:
                 pass
+            # Always serve from our copy since we consumed the cursor
+            object.__setattr__(self, "_cached_rows", rows)
+            object.__setattr__(self, "_cached_description", desc)
+            object.__setattr__(self, "_fetch_index", 0)
 
         return result
 
