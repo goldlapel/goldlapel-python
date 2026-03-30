@@ -456,10 +456,11 @@ class TestMultiInstance:
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._kill_orphan_on_port")
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_dead_instance_gets_recreated(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_dead_instance_gets_recreated(self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url = "postgresql://host:5432/mydb"
@@ -517,3 +518,13 @@ class TestMultiInstance:
         start("postgresql://host:5432/mydb")
         stop("postgresql://nonexistent:5432/nope")  # Should not raise
         assert len(proxy_mod._instances) == 1
+
+    @patch("goldlapel.proxy._detect_sync_driver", return_value=(None, None))
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_start_raises_when_no_driver(self, mock_find, mock_popen, mock_wait, mock_detect):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        with pytest.raises(ImportError, match="No supported database driver found"):
+            start("postgresql://host:5432/mydb")

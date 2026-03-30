@@ -347,19 +347,18 @@ def start(upstream, config=None, port=None, extra_args=None):
     inst = _ensure_running(upstream, config=config, port=port, extra_args=extra_args)
     driver_name, driver = _detect_sync_driver()
     if driver is None:
-        return inst.url
-    try:
-        if driver_name == "psycopg3":
-            conn = driver.connect(inst.url, autocommit=True)
-        else:
-            conn = driver.connect(inst.url)
-        from goldlapel.wrap import wrap
-        inv_port = int((config or {}).get("invalidation_port", inst._port + 2))
-        return wrap(conn, invalidation_port=inv_port)
-    except Exception as e:
-        import logging
-        logging.getLogger("goldlapel").warning("L1 cache unavailable: %s — returning proxy URL", e)
-        return inst.url
+        raise ImportError(
+            "No supported database driver found. "
+            "Install one (e.g. pip install psycopg or pip install psycopg2) "
+            "or use proxy_url() if you only need the connection string."
+        )
+    if driver_name == "psycopg3":
+        conn = driver.connect(inst.url, autocommit=True)
+    else:
+        conn = driver.connect(inst.url)
+    from goldlapel.wrap import wrap
+    inv_port = int((config or {}).get("invalidation_port", inst._port + 2))
+    return wrap(conn, invalidation_port=inv_port)
 
 
 async def start_async(upstream, config=None, port=None, extra_args=None):
