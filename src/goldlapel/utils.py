@@ -147,6 +147,121 @@ def get_counter(conn, table, key):
     return row[0] if row else 0
 
 
+def zadd(conn, table, member, score):
+    """Add a member with a score to a sorted set. Like redis.zadd().
+
+    Creates the sorted set table if it doesn't exist.
+    If the member already exists, updates the score.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            member TEXT PRIMARY KEY,
+            score DOUBLE PRECISION NOT NULL
+        )
+    """)
+    cur.execute(f"""
+        INSERT INTO {table} (member, score) VALUES (%s, %s)
+        ON CONFLICT (member) DO UPDATE SET score = EXCLUDED.score
+    """, (str(member), float(score)))
+    raw.commit()
+    cur.close()
+
+
+def zincrby(conn, table, member, amount=1):
+    """Increment a member's score. Like redis.zincrby().
+
+    Creates the member with the given amount if it doesn't exist.
+    Returns the new score.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            member TEXT PRIMARY KEY,
+            score DOUBLE PRECISION NOT NULL
+        )
+    """)
+    cur.execute(f"""
+        INSERT INTO {table} (member, score) VALUES (%s, %s)
+        ON CONFLICT (member) DO UPDATE SET score = {table}.score + %s
+        RETURNING score
+    """, (str(member), float(amount), float(amount)))
+    result = cur.fetchone()[0]
+    raw.commit()
+    cur.close()
+    return result
+
+
+def zrange(conn, table, start=0, stop=10, desc=True):
+    """Get members by score rank. Like redis.zrange().
+
+    Returns a list of (member, score) tuples.
+    desc=True returns highest scores first (leaderboard order).
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    order = "DESC" if desc else "ASC"
+    limit = stop - start
+    cur.execute(f"""
+        SELECT member, score FROM {table}
+        ORDER BY score {order}
+        LIMIT %s OFFSET %s
+    """, (limit, start))
+    results = [(row[0], row[1]) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def zrank(conn, table, member, desc=True):
+    """Get the rank of a member. Like redis.zrank().
+
+    Returns 0-based rank, or None if member doesn't exist.
+    desc=True ranks by highest score first.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    order = "DESC" if desc else "ASC"
+    cur.execute(f"""
+        SELECT rank FROM (
+            SELECT member, ROW_NUMBER() OVER (ORDER BY score {order}) - 1 AS rank
+            FROM {table}
+        ) ranked
+        WHERE member = %s
+    """, (str(member),))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else None
+
+
+def zscore(conn, table, member):
+    """Get the score of a member. Like redis.zscore().
+
+    Returns the score, or None if member doesn't exist.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"SELECT score FROM {table} WHERE member = %s", (str(member),))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else None
+
+
+def zrem(conn, table, member):
+    """Remove a member from a sorted set. Like redis.zrem().
+
+    Returns True if the member was removed, False if it didn't exist.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"DELETE FROM {table} WHERE member = %s", (str(member),))
+    removed = cur.rowcount > 0
+    raw.commit()
+    cur.close()
+    return removed
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):
