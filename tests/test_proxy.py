@@ -325,10 +325,11 @@ class TestMultiInstance:
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._kill_orphan_on_port")
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_same_upstream_returns_existing(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_same_upstream_returns_existing(self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect, mock_wrap):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url = "postgresql://host:5432/mydb"
