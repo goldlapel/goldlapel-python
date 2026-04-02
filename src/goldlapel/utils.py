@@ -147,6 +147,77 @@ def get_counter(conn, table, key):
     return row[0] if row else 0
 
 
+def hset(conn, table, key, field, value):
+    """Set a field in a hash. Like redis.hset().
+
+    Creates the hash table if it doesn't exist. Uses JSONB for storage.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            key TEXT PRIMARY KEY,
+            data JSONB NOT NULL DEFAULT '{{}}'::jsonb
+        )
+    """)
+    cur.execute(f"""
+        INSERT INTO {table} (key, data) VALUES (%s, jsonb_build_object(%s, %s::jsonb))
+        ON CONFLICT (key) DO UPDATE SET data = {table}.data || jsonb_build_object(%s, %s::jsonb)
+    """, (key, field, json.dumps(value), field, json.dumps(value)))
+    raw.commit()
+    cur.close()
+
+
+def hget(conn, table, key, field):
+    """Get a field from a hash. Like redis.hget().
+
+    Returns the value, or None if key or field doesn't exist.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"SELECT data->>%s FROM {table} WHERE key = %s", (field, key))
+    row = cur.fetchone()
+    cur.close()
+    if row and row[0] is not None:
+        try:
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return row[0]
+    return None
+
+
+def hgetall(conn, table, key):
+    """Get all fields from a hash. Like redis.hgetall().
+
+    Returns a dict, or empty dict if key doesn't exist.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"SELECT data FROM {table} WHERE key = %s", (key,))
+    row = cur.fetchone()
+    cur.close()
+    if row and row[0]:
+        return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    return {}
+
+
+def hdel(conn, table, key, field):
+    """Remove a field from a hash. Like redis.hdel().
+
+    Returns True if the field existed, False otherwise.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"SELECT data ? %s FROM {table} WHERE key = %s", (field, key))
+    row = cur.fetchone()
+    existed = row and row[0]
+    if existed:
+        cur.execute(f"UPDATE {table} SET data = data - %s WHERE key = %s", (field, key))
+        raw.commit()
+    cur.close()
+    return bool(existed)
+
+
 def zadd(conn, table, member, score):
     """Add a member with a score to a sorted set. Like redis.zadd().
 
