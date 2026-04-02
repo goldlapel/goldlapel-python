@@ -262,6 +262,74 @@ def zrem(conn, table, member):
     return removed
 
 
+def georadius(conn, table, geom_column, lon, lat, radius_meters, limit=50):
+    """Find rows within a radius of a point. Like redis.georadius().
+
+    Requires PostGIS extension. Uses ST_DWithin with geography type
+    for accurate distance on the Earth's surface.
+
+    Returns a list of dicts with all columns plus a 'distance_m' field.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        SELECT *, ST_Distance(
+            {geom_column}::geography,
+            ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography
+        ) AS distance_m
+        FROM {table}
+        WHERE ST_DWithin(
+            {geom_column}::geography,
+            ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+            %s
+        )
+        ORDER BY distance_m
+        LIMIT %s
+    """, (lon, lat, lon, lat, radius_meters, limit))
+    columns = [desc[0] for desc in cur.description]
+    results = [dict(zip(columns, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def geoadd(conn, table, name_column, geom_column, name, lon, lat):
+    """Add a location to a geo table. Like redis.geoadd().
+
+    Creates the table with PostGIS geometry column if it doesn't exist.
+    Requires PostGIS extension.
+    """
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            {name_column} TEXT NOT NULL,
+            {geom_column} GEOMETRY(Point, 4326) NOT NULL
+        )
+    """)
+    cur.execute(f"""
+        INSERT INTO {table} ({name_column}, {geom_column})
+        VALUES (%s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+    """, (name, lon, lat))
+    raw.commit()
+    cur.close()
+
+
+def geodist(conn, table, geom_column, name_column, name_a, name_b):
+    """Get distance between two members in meters. Like redis.geodist()."""
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        SELECT ST_Distance(a.{geom_column}::geography, b.{geom_column}::geography)
+        FROM {table} a, {table} b
+        WHERE a.{name_column} = %s AND b.{name_column} = %s
+    """, (name_a, name_b))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else None
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):
