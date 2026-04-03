@@ -401,6 +401,30 @@ def geodist(conn, table, geom_column, name_column, name_a, name_b):
     return row[0] if row else None
 
 
+def script(conn, lua_code, *args):
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS pllua")
+    raw.commit()
+    func_name = "_gl_lua_" + format(abs(hash(lua_code)), 'x')[:8]
+    n = len(args)
+    params = ", ".join([f"p{i+1} text" for i in range(n)])
+    cur.execute(f"""
+        CREATE OR REPLACE FUNCTION pg_temp.{func_name}({params})
+        RETURNS text LANGUAGE pllua AS $pllua$
+        {lua_code}
+        $pllua$
+    """)
+    if n > 0:
+        placeholders = ", ".join(["%s"] * n)
+        cur.execute(f"SELECT pg_temp.{func_name}({placeholders})", args)
+    else:
+        cur.execute(f"SELECT pg_temp.{func_name}()")
+    result = cur.fetchone()
+    cur.close()
+    return result[0] if result else None
+
+
 def count_distinct(conn, table, column):
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
