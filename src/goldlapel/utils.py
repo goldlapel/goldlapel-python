@@ -401,6 +401,15 @@ def geodist(conn, table, geom_column, name_column, name_a, name_b):
     return row[0] if row else None
 
 
+def count_distinct(conn, table, column):
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"SELECT COUNT(DISTINCT {column}) FROM {table}")
+    result = cur.fetchone()[0]
+    cur.close()
+    return result
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):
