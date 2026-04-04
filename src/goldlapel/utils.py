@@ -20,13 +20,21 @@ Usage:
     goldlapel.incr(conn, "page_views", "home")
 """
 
+import hashlib
 import json
+import re
 import select
 import threading
 
 
+def _validate_identifier(name):
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+        raise ValueError(f"Invalid identifier: {name}")
+
+
 def publish(conn, channel, message):
     """Publish a message to a channel. Like redis.publish()."""
+    _validate_identifier(channel)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute("SELECT pg_notify(%s, %s)", (channel, str(message)))
@@ -40,6 +48,7 @@ def subscribe(conn, channel, callback, blocking=True):
     If blocking=False, runs in a background thread and returns the thread.
     Like redis.subscribe().
     """
+    _validate_identifier(channel)
     raw = _get_raw_connection(conn)
 
     def _listen():
@@ -69,6 +78,7 @@ def enqueue(conn, queue_table, payload):
     Creates the queue table if it doesn't exist.
     Payload is stored as JSONB.
     """
+    _validate_identifier(queue_table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -92,6 +102,7 @@ def dequeue(conn, queue_table):
     Uses FOR UPDATE SKIP LOCKED for safe concurrent access.
     Returns the payload dict, or None if the queue is empty.
     """
+    _validate_identifier(queue_table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -118,6 +129,7 @@ def incr(conn, table, key, amount=1):
     Creates the counter table if it doesn't exist.
     Returns the new value.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -139,6 +151,7 @@ def incr(conn, table, key, amount=1):
 
 def get_counter(conn, table, key):
     """Get a counter value. Like redis.get() for a counter."""
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"SELECT value FROM {table} WHERE key = %s", (key,))
@@ -152,6 +165,7 @@ def hset(conn, table, key, field, value):
 
     Creates the hash table if it doesn't exist. Uses JSONB for storage.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -173,6 +187,7 @@ def hget(conn, table, key, field):
 
     Returns the value, or None if key or field doesn't exist.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"SELECT data->>%s FROM {table} WHERE key = %s", (field, key))
@@ -191,6 +206,7 @@ def hgetall(conn, table, key):
 
     Returns a dict, or empty dict if key doesn't exist.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"SELECT data FROM {table} WHERE key = %s", (key,))
@@ -206,6 +222,7 @@ def hdel(conn, table, key, field):
 
     Returns True if the field existed, False otherwise.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"SELECT data ? %s FROM {table} WHERE key = %s", (field, key))
@@ -224,6 +241,7 @@ def zadd(conn, table, member, score):
     Creates the sorted set table if it doesn't exist.
     If the member already exists, updates the score.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -246,6 +264,7 @@ def zincrby(conn, table, member, amount=1):
     Creates the member with the given amount if it doesn't exist.
     Returns the new score.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -271,6 +290,7 @@ def zrange(conn, table, start=0, stop=10, desc=True):
     Returns a list of (member, score) tuples.
     desc=True returns highest scores first (leaderboard order).
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     order = "DESC" if desc else "ASC"
@@ -291,6 +311,7 @@ def zrank(conn, table, member, desc=True):
     Returns 0-based rank, or None if member doesn't exist.
     desc=True ranks by highest score first.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     order = "DESC" if desc else "ASC"
@@ -311,6 +332,7 @@ def zscore(conn, table, member):
 
     Returns the score, or None if member doesn't exist.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"SELECT score FROM {table} WHERE member = %s", (str(member),))
@@ -324,6 +346,7 @@ def zrem(conn, table, member):
 
     Returns True if the member was removed, False if it didn't exist.
     """
+    _validate_identifier(table)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"DELETE FROM {table} WHERE member = %s", (str(member),))
@@ -341,6 +364,8 @@ def georadius(conn, table, geom_column, lon, lat, radius_meters, limit=50):
 
     Returns a list of dicts with all columns plus a 'distance_m' field.
     """
+    _validate_identifier(table)
+    _validate_identifier(geom_column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -369,6 +394,9 @@ def geoadd(conn, table, name_column, geom_column, name, lon, lat):
     Creates the table with PostGIS geometry column if it doesn't exist.
     Requires PostGIS extension.
     """
+    _validate_identifier(table)
+    _validate_identifier(name_column)
+    _validate_identifier(geom_column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
@@ -389,6 +417,9 @@ def geoadd(conn, table, name_column, geom_column, name, lon, lat):
 
 def geodist(conn, table, geom_column, name_column, name_a, name_b):
     """Get distance between two members in meters. Like redis.geodist()."""
+    _validate_identifier(table)
+    _validate_identifier(geom_column)
+    _validate_identifier(name_column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -407,13 +438,14 @@ def script(conn, lua_code, *args):
     cur.execute("CREATE EXTENSION IF NOT EXISTS pllua")
     raw.commit()
     func_name = "_gl_lua_" + format(abs(hash(lua_code)), 'x')[:8]
+    tag = f"$_gl_{hashlib.md5(lua_code.encode()).hexdigest()[:8]}$"
     n = len(args)
     params = ", ".join([f"p{i+1} text" for i in range(n)])
     cur.execute(f"""
         CREATE OR REPLACE FUNCTION pg_temp.{func_name}({params})
-        RETURNS text LANGUAGE pllua AS $pllua$
+        RETURNS text LANGUAGE pllua AS {tag}
         {lua_code}
-        $pllua$
+        {tag}
     """)
     if n > 0:
         placeholders = ", ".join(["%s"] * n)
@@ -426,6 +458,8 @@ def script(conn, lua_code, *args):
 
 
 def count_distinct(conn, table, column):
+    _validate_identifier(table)
+    _validate_identifier(column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"SELECT COUNT(DISTINCT {column}) FROM {table}")
@@ -435,6 +469,7 @@ def count_distinct(conn, table, column):
 
 
 def stream_add(conn, stream, payload):
+    _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -455,6 +490,7 @@ def stream_add(conn, stream, payload):
 
 
 def stream_create_group(conn, stream, group):
+    _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
@@ -482,6 +518,7 @@ def stream_create_group(conn, stream, group):
 
 
 def stream_read(conn, stream, group, consumer, count=1):
+    _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(
@@ -523,6 +560,7 @@ def stream_read(conn, stream, group, consumer, count=1):
 
 
 def stream_ack(conn, stream, group, message_id):
+    _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(
@@ -536,12 +574,13 @@ def stream_ack(conn, stream, group, message_id):
 
 
 def stream_claim(conn, stream, group, consumer, min_idle_ms=60000):
+    _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(f"""
         UPDATE {stream}_pending
         SET consumer = %s, claimed_at = NOW(), delivery_count = delivery_count + 1
-        WHERE group_name = %s AND claimed_at < NOW() - INTERVAL '%s milliseconds'
+        WHERE group_name = %s AND claimed_at < NOW() - INTERVAL '1 millisecond' * %s
         RETURNING message_id
     """, (consumer, group, min_idle_ms))
     claimed_ids = [r[0] for r in cur.fetchall()]
