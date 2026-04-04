@@ -434,6 +434,135 @@ def count_distinct(conn, table, column):
     return result
 
 
+def stream_add(conn, stream, payload):
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {stream} (
+            id BIGSERIAL PRIMARY KEY,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    cur.execute(
+        f"INSERT INTO {stream} (payload) VALUES (%s) RETURNING id",
+        (json.dumps(payload),),
+    )
+    msg_id = cur.fetchone()[0]
+    raw.commit()
+    cur.close()
+    return msg_id
+
+
+def stream_create_group(conn, stream, group):
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {stream}_groups (
+            group_name TEXT PRIMARY KEY,
+            last_delivered_id BIGINT NOT NULL DEFAULT 0
+        )
+    """)
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {stream}_pending (
+            message_id BIGINT NOT NULL,
+            group_name TEXT NOT NULL,
+            consumer TEXT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            delivery_count INT NOT NULL DEFAULT 1,
+            PRIMARY KEY (group_name, message_id)
+        )
+    """)
+    cur.execute(
+        f"INSERT INTO {stream}_groups (group_name) VALUES (%s) ON CONFLICT DO NOTHING",
+        (group,),
+    )
+    raw.commit()
+    cur.close()
+
+
+def stream_read(conn, stream, group, consumer, count=1):
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        f"SELECT last_delivered_id FROM {stream}_groups WHERE group_name = %s FOR UPDATE",
+        (group,),
+    )
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        return []
+    last_id = row[0]
+    cur.execute(
+        f"SELECT id, payload, created_at FROM {stream} WHERE id > %s ORDER BY id LIMIT %s",
+        (last_id, count),
+    )
+    messages = []
+    for r in cur.fetchall():
+        msg_id, payload, created_at = r
+        messages.append({
+            "id": msg_id,
+            "payload": payload if isinstance(payload, dict) else json.loads(payload),
+            "created_at": str(created_at),
+        })
+    if messages:
+        new_last = messages[-1]["id"]
+        cur.execute(
+            f"UPDATE {stream}_groups SET last_delivered_id = %s WHERE group_name = %s",
+            (new_last, group),
+        )
+        for msg in messages:
+            cur.execute(
+                f"""INSERT INTO {stream}_pending (message_id, group_name, consumer)
+                    VALUES (%s, %s, %s) ON CONFLICT (group_name, message_id) DO NOTHING""",
+                (msg["id"], group, consumer),
+            )
+    raw.commit()
+    cur.close()
+    return messages
+
+
+def stream_ack(conn, stream, group, message_id):
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        f"DELETE FROM {stream}_pending WHERE group_name = %s AND message_id = %s",
+        (group, message_id),
+    )
+    removed = cur.rowcount > 0
+    raw.commit()
+    cur.close()
+    return removed
+
+
+def stream_claim(conn, stream, group, consumer, min_idle_ms=60000):
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        UPDATE {stream}_pending
+        SET consumer = %s, claimed_at = NOW(), delivery_count = delivery_count + 1
+        WHERE group_name = %s AND claimed_at < NOW() - INTERVAL '%s milliseconds'
+        RETURNING message_id
+    """, (consumer, group, min_idle_ms))
+    claimed_ids = [r[0] for r in cur.fetchall()]
+    messages = []
+    for msg_id in claimed_ids:
+        cur.execute(
+            f"SELECT id, payload, created_at FROM {stream} WHERE id = %s",
+            (msg_id,),
+        )
+        r = cur.fetchone()
+        if r:
+            messages.append({
+                "id": r[0],
+                "payload": r[1] if isinstance(r[1], dict) else json.loads(r[1]),
+                "created_at": str(r[2]),
+            })
+    raw.commit()
+    cur.close()
+    return messages
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):
