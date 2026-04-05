@@ -613,7 +613,7 @@ def search(conn, table, column, query, limit=50, lang='english', highlight=False
         _validate_identifier(col)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    tsvec = " || ' ' || ".join(col for col in columns)
+    tsvec = " || ' ' || ".join(f"coalesce({col}, '')" for col in columns)
     if highlight:
         hl_col = columns[0]
         cur.execute(f"""
@@ -734,7 +734,7 @@ def facets(conn, table, column, limit=50, query=None, query_column=None, lang='e
             query_columns = list(query_column)
         for qc in query_columns:
             _validate_identifier(qc)
-        tsvec = " || ' ' || ".join(qc for qc in query_columns)
+        tsvec = " || ' ' || ".join(f"coalesce({qc}, '')" for qc in query_columns)
         cur.execute(f"""
             SELECT {column} AS value, COUNT(*) AS count
             FROM {table}
