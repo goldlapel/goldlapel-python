@@ -721,6 +721,85 @@ def suggest(conn, table, column, prefix, limit=10):
     return results
 
 
+def facets(conn, table, column, limit=50, query=None, query_column=None, lang='english'):
+    """Get value counts for a column. Like Elasticsearch terms aggregation."""
+    _validate_identifier(table)
+    _validate_identifier(column)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    if query and query_column:
+        if isinstance(query_column, str):
+            query_columns = [query_column]
+        else:
+            query_columns = list(query_column)
+        for qc in query_columns:
+            _validate_identifier(qc)
+        tsvec = " || ' ' || ".join(qc for qc in query_columns)
+        cur.execute(f"""
+            SELECT {column} AS value, COUNT(*) AS count
+            FROM {table}
+            WHERE to_tsvector(%s, {tsvec}) @@ plainto_tsquery(%s, %s)
+            GROUP BY {column}
+            ORDER BY count DESC, {column} LIMIT %s
+        """, (lang, lang, query, limit))
+    else:
+        cur.execute(f"""
+            SELECT {column} AS value, COUNT(*) AS count
+            FROM {table}
+            GROUP BY {column}
+            ORDER BY count DESC, {column} LIMIT %s
+        """, (limit,))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def aggregate(conn, table, column, func, group_by=None, limit=50):
+    """Compute an aggregate over a column. Like Elasticsearch metric aggregations."""
+    _validate_identifier(table)
+    _validate_identifier(column)
+    allowed = {'count', 'sum', 'avg', 'min', 'max'}
+    if func not in allowed:
+        raise ValueError(f"func must be one of {allowed}")
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    agg_expr = "COUNT(*)" if func == 'count' else f"{func.upper()}({column})"
+    if group_by:
+        _validate_identifier(group_by)
+        cur.execute(f"""
+            SELECT {group_by}, {agg_expr} AS value
+            FROM {table}
+            GROUP BY {group_by}
+            ORDER BY value DESC LIMIT %s
+        """, (limit,))
+    else:
+        cur.execute(f"""
+            SELECT {agg_expr} AS value
+            FROM {table}
+        """)
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def create_search_config(conn, name, copy_from='english'):
+    """Create a custom text search configuration. Like Elasticsearch custom analyzer.
+
+    Pass the config name as the lang parameter to search().
+    """
+    _validate_identifier(name)
+    _validate_identifier(copy_from)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute("SELECT 1 FROM pg_ts_config WHERE cfgname = %s", (name,))
+    if not cur.fetchone():
+        cur.execute(f"CREATE TEXT SEARCH CONFIGURATION {name} (COPY = {copy_from})")
+        raw.commit()
+    cur.close()
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):
