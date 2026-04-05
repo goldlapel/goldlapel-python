@@ -860,6 +860,44 @@ def percolate_delete(conn, name, query_id):
     return deleted
 
 
+def analyze(conn, text, lang='english'):
+    """Show how text is tokenized. Like Elasticsearch _analyze API."""
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute("SELECT alias, description, token, dictionaries, dictionary, lexemes FROM ts_debug(%s, %s)", (lang, text))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def explain_score(conn, table, column, query, id_column, id_value, lang='english'):
+    """Explain why a document scored what it did. Like Elasticsearch _explain API."""
+    _validate_identifier(table)
+    _validate_identifier(column)
+    _validate_identifier(id_column)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        SELECT
+            {column} AS document_text,
+            to_tsvector(%s, {column})::text AS document_tokens,
+            plainto_tsquery(%s, %s)::text AS query_tokens,
+            to_tsvector(%s, {column}) @@ plainto_tsquery(%s, %s) AS matches,
+            ts_rank(to_tsvector(%s, {column}), plainto_tsquery(%s, %s)) AS score,
+            ts_headline(%s, {column}, plainto_tsquery(%s, %s),
+                'StartSel=**, StopSel=**, MaxWords=50, MinWords=20') AS headline
+        FROM {table}
+        WHERE {id_column} = %s
+    """, (lang, lang, query, lang, lang, query, lang, lang, query, lang, lang, query, id_value))
+    cols = [desc[0] for desc in cur.description]
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
+        return None
+    return dict(zip(cols, row))
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):
