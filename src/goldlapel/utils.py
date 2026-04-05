@@ -602,6 +602,125 @@ def stream_claim(conn, stream, group, consumer, min_idle_ms=60000):
     return messages
 
 
+def search(conn, table, column, query, limit=50, lang='english', highlight=False):
+    """Full-text search with ranking. Like Elasticsearch match query."""
+    _validate_identifier(table)
+    if isinstance(column, str):
+        columns = [column]
+    else:
+        columns = list(column)
+    for col in columns:
+        _validate_identifier(col)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    tsvec = " || ' ' || ".join(col for col in columns)
+    if highlight:
+        hl_col = columns[0]
+        cur.execute(f"""
+            SELECT *,
+                ts_rank(to_tsvector(%s, {tsvec}), plainto_tsquery(%s, %s)) AS _score,
+                ts_headline(%s, {hl_col}, plainto_tsquery(%s, %s),
+                    'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15') AS _highlight
+            FROM {table}
+            WHERE to_tsvector(%s, {tsvec}) @@ plainto_tsquery(%s, %s)
+            ORDER BY _score DESC LIMIT %s
+        """, (lang, lang, query, lang, lang, query, lang, lang, query, limit))
+    else:
+        cur.execute(f"""
+            SELECT *,
+                ts_rank(to_tsvector(%s, {tsvec}), plainto_tsquery(%s, %s)) AS _score
+            FROM {table}
+            WHERE to_tsvector(%s, {tsvec}) @@ plainto_tsquery(%s, %s)
+            ORDER BY _score DESC LIMIT %s
+        """, (lang, lang, query, lang, lang, query, limit))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def search_fuzzy(conn, table, column, query, limit=50, threshold=0.3):
+    """Typo-tolerant search. Like Elasticsearch fuzzy query."""
+    _validate_identifier(table)
+    _validate_identifier(column)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    raw.commit()
+    cur.execute(f"""
+        SELECT *, similarity({column}, %s) AS _score
+        FROM {table}
+        WHERE similarity({column}, %s) > %s
+        ORDER BY _score DESC LIMIT %s
+    """, (query, query, float(threshold), limit))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def search_phonetic(conn, table, column, query, limit=50):
+    """Sound-alike search. Like Elasticsearch phonetic plugin."""
+    _validate_identifier(table)
+    _validate_identifier(column)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
+    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    raw.commit()
+    cur.execute(f"""
+        SELECT *, similarity({column}, %s) AS _score
+        FROM {table}
+        WHERE soundex({column}) = soundex(%s)
+        ORDER BY _score DESC, {column} LIMIT %s
+    """, (query, query, limit))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def similar(conn, table, column, vector, limit=10):
+    """Vector similarity search. Like Elasticsearch kNN."""
+    _validate_identifier(table)
+    _validate_identifier(column)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    raw.commit()
+    vec_literal = "[" + ",".join(str(float(v)) for v in vector) + "]"
+    cur.execute(f"""
+        SELECT *, ({column} <=> %s::vector) AS _score
+        FROM {table}
+        ORDER BY _score LIMIT %s
+    """, (vec_literal, limit))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def suggest(conn, table, column, prefix, limit=10):
+    """Autocomplete/typeahead. Like Elasticsearch completion suggester."""
+    _validate_identifier(table)
+    _validate_identifier(column)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    raw.commit()
+    pattern = prefix + "%"
+    cur.execute(f"""
+        SELECT *, similarity({column}, %s) AS _score
+        FROM {table}
+        WHERE {column} ILIKE %s
+        ORDER BY _score DESC, {column} LIMIT %s
+    """, (prefix, pattern, limit))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):
