@@ -800,6 +800,66 @@ def create_search_config(conn, name, copy_from='english'):
     cur.close()
 
 
+def percolate_add(conn, name, query_id, query, lang='english', metadata=None):
+    """Register a named query for reverse matching. Like Elasticsearch percolator."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {name} (
+            query_id TEXT PRIMARY KEY,
+            query_text TEXT NOT NULL,
+            tsquery TSQUERY NOT NULL,
+            lang TEXT NOT NULL DEFAULT 'english',
+            metadata JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    cur.execute(f"CREATE INDEX IF NOT EXISTS {name}_tsq_idx ON {name} USING GIN (tsquery)")
+    metadata_json = json.dumps(metadata) if metadata is not None else None
+    cur.execute(f"""
+        INSERT INTO {name} (query_id, query_text, tsquery, lang, metadata)
+        VALUES (%s, %s, plainto_tsquery(%s, %s), %s, %s)
+        ON CONFLICT (query_id) DO UPDATE SET
+            query_text = EXCLUDED.query_text,
+            tsquery = EXCLUDED.tsquery,
+            lang = EXCLUDED.lang,
+            metadata = EXCLUDED.metadata
+    """, (query_id, query, lang, query, lang, metadata_json))
+    raw.commit()
+    cur.close()
+
+
+def percolate(conn, name, text, lang='english', limit=50):
+    """Match a document against stored queries. Like Elasticsearch percolate API."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"""
+        SELECT query_id, query_text, metadata,
+            ts_rank(to_tsvector(%s, %s), tsquery) AS _score
+        FROM {name}
+        WHERE to_tsvector(%s, %s) @@ tsquery
+        ORDER BY _score DESC LIMIT %s
+    """, (lang, text, lang, text, limit))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def percolate_delete(conn, name, query_id):
+    """Remove a stored query from a percolator index."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"DELETE FROM {name} WHERE query_id = %s RETURNING query_id", (query_id,))
+    deleted = cur.fetchone() is not None
+    raw.commit()
+    cur.close()
+    return deleted
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):
