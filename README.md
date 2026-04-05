@@ -108,7 +108,7 @@ print(goldlapel.config_keys())
 
 For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
 
-You can also set environment variables (`GOLDLAPEL_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
+You can also set environment variables (`GOLDLAPEL_PROXY_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
 
 ## How It Works
 

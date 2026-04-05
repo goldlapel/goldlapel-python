@@ -226,7 +226,7 @@ class GoldLapel:
         cmd = [
             binary,
             "--upstream", self._upstream,
-            "--port", str(self._port),
+            "--proxy-port", str(self._port),
         ] + _config_to_args(self._config) + self._extra_args
 
         _kill_orphan_on_port(self._port)
