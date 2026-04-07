@@ -90,7 +90,7 @@ Pass a config dict as the second argument to `start()` to configure the proxy:
 import goldlapel
 
 conn = goldlapel.start("postgresql://user:pass@localhost/mydb", {
-    "mode": "butler",
+    "mode": "waiter",
     "pool_size": 50,
     "disable_matviews": True,
     "replica": ["postgresql://user:pass@replica1/mydb"],

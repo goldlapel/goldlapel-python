@@ -201,7 +201,7 @@ class TestDashboardUrl:
 
 class TestConfigToArgs:
     def test_string_value(self):
-        assert _config_to_args({"mode": "butler"}) == ["--mode", "butler"]
+        assert _config_to_args({"mode": "waiter"}) == ["--mode", "waiter"]
 
     def test_numeric_value(self):
         assert _config_to_args({"pool_size": 50}) == ["--pool-size", "50"]
@@ -225,9 +225,9 @@ class TestConfigToArgs:
             _config_to_args({"bogus": 1})
 
     def test_multiple_keys(self):
-        result = _config_to_args({"mode": "butler", "pool_size": 10, "disable_pool": True})
+        result = _config_to_args({"mode": "waiter", "pool_size": 10, "disable_pool": True})
         assert "--mode" in result
-        assert "butler" in result
+        assert "waiter" in result
         assert "--pool-size" in result
         assert "10" in result
         assert "--disable-pool" in result
@@ -255,8 +255,8 @@ class TestConfigToArgs:
             _config_to_args({"replica": 42})
 
     def test_config_with_constructor(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"mode": "butler"})
-        assert gl._config == {"mode": "butler"}
+        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"mode": "waiter"})
+        assert gl._config == {"mode": "waiter"}
 
 
 class TestConfigKeys:
