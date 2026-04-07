@@ -815,7 +815,7 @@ def percolate_add(conn, name, query_id, query, lang='english', metadata=None):
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
-    cur.execute(f"CREATE INDEX IF NOT EXISTS {name}_tsq_idx ON {name} USING GIN (tsquery)")
+    cur.execute(f"CREATE INDEX IF NOT EXISTS {name}_tsq_idx ON {name} USING GIST (tsquery)")
     metadata_json = json.dumps(metadata) if metadata is not None else None
     cur.execute(f"""
         INSERT INTO {name} (query_id, query_text, tsquery, lang, metadata)
