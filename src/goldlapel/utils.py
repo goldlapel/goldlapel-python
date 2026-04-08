@@ -904,7 +904,7 @@ _COMPARISON_OPS = {
     "$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<=",
     "$eq": "=", "$ne": "!=",
 }
-_SUPPORTED_FILTER_OPS = set(_COMPARISON_OPS) | {"$in", "$nin", "$exists", "$regex"}
+_SUPPORTED_FILTER_OPS = set(_COMPARISON_OPS) | {"$in", "$nin", "$exists", "$regex", "$elemMatch", "$text"}
 _LOGICAL_OPS = {"$or", "$and", "$not"}
 _UPDATE_OPS = {"$set", "$unset", "$inc", "$mul", "$rename", "$push", "$pull", "$addToSet"}
 
@@ -1066,7 +1066,13 @@ def _build_filter(filter_dict):
     clauses = []
     params = []
     for key, value in filter_dict.items():
-        if key in _LOGICAL_OPS:
+        if key == "$text":
+            if not isinstance(value, dict) or "$search" not in value:
+                raise ValueError("$text requires {$search: 'query'}")
+            lang = value.get("$language", "english")
+            clauses.append("to_tsvector(%s, data::text) @@ plainto_tsquery(%s, %s)")
+            params.extend([lang, lang, value["$search"]])
+        elif key in _LOGICAL_OPS:
             if key == "$not":
                 if not isinstance(value, dict):
                     raise ValueError("$not value must be a filter object")
@@ -1116,6 +1122,36 @@ def _build_filter(filter_dict):
                 elif op == "$regex":
                     clauses.append(f"{field_expr} ~ %s")
                     params.append(operand)
+                elif op == "$elemMatch":
+                    if not isinstance(operand, dict):
+                        raise ValueError("$elemMatch value must be an object")
+                    field_json = _field_path_json(key)
+                    elem_clauses = []
+                    for sub_op, sub_val in operand.items():
+                        if sub_op in _COMPARISON_OPS:
+                            sql_op = _COMPARISON_OPS[sub_op]
+                            if isinstance(sub_val, (int, float)):
+                                elem_clauses.append(f"(elem#>>'{{}}')::numeric {sql_op} %s")
+                                params.append(sub_val)
+                            else:
+                                elem_clauses.append(f"elem#>>'{{}}' {sql_op} %s")
+                                params.append(str(sub_val))
+                        elif sub_op == "$regex":
+                            elem_clauses.append(f"elem#>>'{{}}' ~ %s")
+                            params.append(sub_val)
+                        else:
+                            raise ValueError(f"Unsupported $elemMatch operator: {sub_op}")
+                    if elem_clauses:
+                        clauses.append(
+                            f"EXISTS (SELECT 1 FROM jsonb_array_elements({field_json}) AS elem "
+                            f"WHERE {' AND '.join(elem_clauses)})"
+                        )
+                elif op == "$text":
+                    if not isinstance(operand, dict) or "$search" not in operand:
+                        raise ValueError("$text requires {$search: 'query'}")
+                    lang = operand.get("$language", "english")
+                    clauses.append(f"to_tsvector(%s, {field_expr}) @@ plainto_tsquery(%s, %s)")
+                    params.extend([lang, lang, operand["$search"]])
                 else:
                     raise ValueError(f"Unsupported filter operator: {op}")
         else:
@@ -1201,6 +1237,42 @@ def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None):
     results = [dict(zip(cols, row)) for row in cur.fetchall()]
     cur.close()
     return results
+
+
+def doc_find_cursor(conn, collection, filter=None, sort=None, limit=None, skip=None, batch_size=100):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor(name=f"gl_cursor_{id(raw)}")
+    sql = f"SELECT _id, data, created_at FROM {collection}"
+    params = []
+    where_clause, filter_params = _build_filter(filter)
+    if where_clause:
+        sql += " WHERE " + where_clause
+        params.extend(filter_params)
+    if sort:
+        order_parts = []
+        for key, direction in sort.items():
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
+                raise ValueError(f"Invalid sort key: {key}")
+            order_parts.append(f"data->>'{key}' {'ASC' if direction == 1 else 'DESC'}")
+        sql += " ORDER BY " + ", ".join(order_parts)
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+    if skip is not None:
+        sql += " OFFSET %s"
+        params.append(skip)
+    cur.execute(sql, tuple(params))
+    cols = [desc[0] for desc in cur.description]
+    try:
+        while True:
+            rows = cur.fetchmany(batch_size)
+            if not rows:
+                break
+            for row in rows:
+                yield dict(zip(cols, row))
+    finally:
+        cur.close()
 
 
 def doc_find_one(conn, collection, filter=None):

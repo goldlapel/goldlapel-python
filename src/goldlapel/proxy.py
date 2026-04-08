@@ -353,6 +353,9 @@ class GoldLapel:
     def doc_distinct(self, *args, **kwargs):
         return _utils().doc_distinct(self.conn, *args, **kwargs)
 
+    def doc_find_cursor(self, *args, **kwargs):
+        return _utils().doc_find_cursor(self.conn, *args, **kwargs)
+
     def doc_count(self, *args, **kwargs):
         return _utils().doc_count(self.conn, *args, **kwargs)
 

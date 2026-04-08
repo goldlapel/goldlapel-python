@@ -24,6 +24,7 @@ from goldlapel.utils import (
     doc_find_one_and_update,
     doc_find_one_and_delete,
     doc_distinct,
+    doc_find_cursor,
     _build_filter,
     _build_update,
     _build_project,
@@ -1496,3 +1497,161 @@ class TestHelperFunctions:
     def test_jsonb_path_invalid_raises(self):
         with pytest.raises(ValueError, match="Invalid field key"):
             _jsonb_path("bad;key")
+
+
+# ---------------------------------------------------------------------------
+# 25. $elemMatch
+# ---------------------------------------------------------------------------
+
+class TestElemMatch:
+    def test_numeric_range(self):
+        clause, params = _build_filter({"scores": {"$elemMatch": {"$gt": 80, "$lt": 90}}})
+        assert "EXISTS" in clause
+        assert "jsonb_array_elements" in clause
+        assert "elem#>>'{}'" in clause
+        assert "::numeric" in clause
+        assert 80 in params
+        assert 90 in params
+
+    def test_string_regex(self):
+        clause, params = _build_filter({"tags": {"$elemMatch": {"$regex": "^py"}}})
+        assert "EXISTS" in clause
+        assert "elem#>>'{}' ~ %s" in clause
+        assert params == ["^py"]
+
+    def test_single_condition(self):
+        clause, params = _build_filter({"scores": {"$elemMatch": {"$eq": 100}}})
+        assert "EXISTS" in clause
+        assert "elem#>>'{}'" in clause
+        assert params == [100]
+
+    def test_invalid_operand_raises(self):
+        with pytest.raises(ValueError, match="must be an object"):
+            _build_filter({"scores": {"$elemMatch": [1, 2]}})
+
+    def test_unsupported_sub_op_raises(self):
+        with pytest.raises(ValueError, match="Unsupported \\$elemMatch"):
+            _build_filter({"scores": {"$elemMatch": {"$foo": 1}}})
+
+    def test_in_doc_find(self):
+        conn, cur = capture_sql(fetchall_result=[])
+        doc_find(conn, "users", filter={"scores": {"$elemMatch": {"$gt": 80}}})
+        sql = cur.execute.call_args[0][0]
+        assert "EXISTS" in sql
+        assert "jsonb_array_elements" in sql
+
+
+# ---------------------------------------------------------------------------
+# 26. $text in filters
+# ---------------------------------------------------------------------------
+
+class TestTextFilter:
+    def test_top_level(self):
+        clause, params = _build_filter({"$text": {"$search": "hello world"}})
+        assert "to_tsvector" in clause
+        assert "plainto_tsquery" in clause
+        assert "data::text" in clause
+        assert params == ["english", "english", "hello world"]
+
+    def test_field_level(self):
+        clause, params = _build_filter({"content": {"$text": {"$search": "hello"}}})
+        assert "to_tsvector" in clause
+        assert "plainto_tsquery" in clause
+        assert "data->>'content'" in clause
+        assert params == ["english", "english", "hello"]
+
+    def test_custom_language(self):
+        clause, params = _build_filter({"$text": {"$search": "bonjour", "$language": "french"}})
+        assert "to_tsvector" in clause
+        assert params == ["french", "french", "bonjour"]
+
+    def test_missing_search_raises(self):
+        with pytest.raises(ValueError, match="\\$text requires"):
+            _build_filter({"$text": {"$language": "english"}})
+
+    def test_non_dict_raises(self):
+        with pytest.raises(ValueError, match="\\$text requires"):
+            _build_filter({"$text": "hello"})
+
+    def test_field_level_missing_search_raises(self):
+        with pytest.raises(ValueError, match="\\$text requires"):
+            _build_filter({"content": {"$text": {"$language": "english"}}})
+
+    def test_in_doc_find(self):
+        conn, cur = capture_sql(fetchall_result=[])
+        doc_find(conn, "users", filter={"$text": {"$search": "hello"}})
+        sql = cur.execute.call_args[0][0]
+        assert "to_tsvector" in sql
+        assert "@@" in sql
+
+    def test_in_doc_count(self):
+        conn, cur = capture_sql(fetchone_result=(3,))
+        doc_count(conn, "users", filter={"bio": {"$text": {"$search": "python"}}})
+        sql = cur.execute.call_args[0][0]
+        assert "to_tsvector" in sql
+
+
+# ---------------------------------------------------------------------------
+# 27. doc_find_cursor()
+# ---------------------------------------------------------------------------
+
+class TestDocFindCursor:
+    def test_returns_generator(self):
+        cursor = MagicMock()
+        cursor.description = [("_id",), ("data",), ("created_at",)]
+        cursor.fetchmany.side_effect = [
+            [("id1", {"a": 1}, "ts"), ("id2", {"b": 2}, "ts")],
+            [],
+        ]
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        gen = doc_find_cursor(conn, "users")
+        import types
+        assert isinstance(gen, types.GeneratorType)
+
+    def test_yields_dicts(self):
+        cursor = MagicMock()
+        cursor.description = [("_id",), ("data",), ("created_at",)]
+        cursor.fetchmany.side_effect = [
+            [("id1", {"a": 1}, "ts1")],
+            [],
+        ]
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        results = list(doc_find_cursor(conn, "users"))
+        assert len(results) == 1
+        assert results[0]["_id"] == "id1"
+        assert results[0]["data"] == {"a": 1}
+
+    def test_with_filter(self):
+        cursor = MagicMock()
+        cursor.description = [("_id",), ("data",), ("created_at",)]
+        cursor.fetchmany.return_value = []
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        list(doc_find_cursor(conn, "users", filter={"status": "active"}))
+        sql = cursor.execute.call_args[0][0]
+        assert "WHERE" in sql
+
+    def test_batch_size(self):
+        cursor = MagicMock()
+        cursor.description = [("_id",), ("data",), ("created_at",)]
+        cursor.fetchmany.return_value = []
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        list(doc_find_cursor(conn, "users", batch_size=50))
+        cursor.fetchmany.assert_called_with(50)
+
+    def test_invalid_collection_raises(self):
+        conn = MagicMock()
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            list(doc_find_cursor(conn, "bad; name"))
+
+    def test_closes_cursor(self):
+        cursor = MagicMock()
+        cursor.description = [("_id",), ("data",), ("created_at",)]
+        cursor.fetchmany.return_value = []
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        list(doc_find_cursor(conn, "users"))
+        cursor.close.assert_called_once()
