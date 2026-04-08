@@ -40,7 +40,7 @@ class FakeConn:
         self._cursor = cursor
         self.commit = MagicMock()
 
-    def cursor(self):
+    def cursor(self, name=None):
         return self._cursor
 
 
@@ -1596,62 +1596,52 @@ class TestTextFilter:
 # ---------------------------------------------------------------------------
 
 class TestDocFindCursor:
-    def test_returns_generator(self):
+    def _make_cursor_conn(self, fetchmany_side_effect=None):
         cursor = MagicMock()
         cursor.description = [("_id",), ("data",), ("created_at",)]
-        cursor.fetchmany.side_effect = [
+        if fetchmany_side_effect is not None:
+            cursor.fetchmany.side_effect = fetchmany_side_effect
+        else:
+            cursor.fetchmany.return_value = []
+        conn = FakeConn(cursor)
+        return conn, cursor
+
+    def test_returns_generator(self):
+        conn, cur = self._make_cursor_conn(fetchmany_side_effect=[
             [("id1", {"a": 1}, "ts"), ("id2", {"b": 2}, "ts")],
             [],
-        ]
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
+        ])
         gen = doc_find_cursor(conn, "users")
         import types
         assert isinstance(gen, types.GeneratorType)
 
     def test_yields_dicts(self):
-        cursor = MagicMock()
-        cursor.description = [("_id",), ("data",), ("created_at",)]
-        cursor.fetchmany.side_effect = [
+        conn, cur = self._make_cursor_conn(fetchmany_side_effect=[
             [("id1", {"a": 1}, "ts1")],
             [],
-        ]
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
+        ])
         results = list(doc_find_cursor(conn, "users"))
         assert len(results) == 1
         assert results[0]["_id"] == "id1"
         assert results[0]["data"] == {"a": 1}
 
     def test_with_filter(self):
-        cursor = MagicMock()
-        cursor.description = [("_id",), ("data",), ("created_at",)]
-        cursor.fetchmany.return_value = []
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
+        conn, cur = self._make_cursor_conn()
         list(doc_find_cursor(conn, "users", filter={"status": "active"}))
-        sql = cursor.execute.call_args[0][0]
+        sql = cur.execute.call_args[0][0]
         assert "WHERE" in sql
 
     def test_batch_size(self):
-        cursor = MagicMock()
-        cursor.description = [("_id",), ("data",), ("created_at",)]
-        cursor.fetchmany.return_value = []
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
+        conn, cur = self._make_cursor_conn()
         list(doc_find_cursor(conn, "users", batch_size=50))
-        cursor.fetchmany.assert_called_with(50)
+        cur.fetchmany.assert_called_with(50)
 
     def test_invalid_collection_raises(self):
-        conn = MagicMock()
+        conn, _ = self._make_cursor_conn()
         with pytest.raises(ValueError, match="Invalid identifier"):
             list(doc_find_cursor(conn, "bad; name"))
 
     def test_closes_cursor(self):
-        cursor = MagicMock()
-        cursor.description = [("_id",), ("data",), ("created_at",)]
-        cursor.fetchmany.return_value = []
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
+        conn, cur = self._make_cursor_conn()
         list(doc_find_cursor(conn, "users"))
-        cursor.close.assert_called_once()
+        cur.close.assert_called_once()
