@@ -898,6 +898,189 @@ def explain_score(conn, table, column, query, id_column, id_value, lang='english
     return dict(zip(cols, row))
 
 
+def _ensure_collection(cur, collection):
+    cur.execute(
+        f"CREATE TABLE IF NOT EXISTS {collection} ("
+        "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
+        "data JSONB NOT NULL, "
+        "created_at TIMESTAMPTZ DEFAULT NOW())"
+    )
+
+
+def doc_insert(conn, collection, document):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    _ensure_collection(cur, collection)
+    cur.execute(
+        f"INSERT INTO {collection} (data) VALUES (%s::jsonb) RETURNING _id, data, created_at",
+        (json.dumps(document),),
+    )
+    cols = [desc[0] for desc in cur.description]
+    row = cur.fetchone()
+    raw.commit()
+    cur.close()
+    return dict(zip(cols, row))
+
+
+def doc_insert_many(conn, collection, documents):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    _ensure_collection(cur, collection)
+    placeholders = ", ".join(["(%s::jsonb)"] * len(documents))
+    params = tuple(json.dumps(d) for d in documents)
+    cur.execute(
+        f"INSERT INTO {collection} (data) VALUES {placeholders} RETURNING _id, data, created_at",
+        params,
+    )
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    raw.commit()
+    cur.close()
+    return results
+
+
+def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    sql = f"SELECT _id, data, created_at FROM {collection}"
+    params = []
+    if filter:
+        sql += " WHERE data @> %s::jsonb"
+        params.append(json.dumps(filter))
+    if sort:
+        order_parts = []
+        for key, direction in sort.items():
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
+                raise ValueError(f"Invalid sort key: {key}")
+            order_parts.append(f"data->>'{key}' {'ASC' if direction == 1 else 'DESC'}")
+        sql += " ORDER BY " + ", ".join(order_parts)
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+    if skip is not None:
+        sql += " OFFSET %s"
+        params.append(skip)
+    cur.execute(sql, tuple(params))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def doc_find_one(conn, collection, filter=None):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    sql = f"SELECT _id, data, created_at FROM {collection}"
+    params = []
+    if filter:
+        sql += " WHERE data @> %s::jsonb"
+        params.append(json.dumps(filter))
+    sql += " LIMIT 1"
+    cur.execute(sql, tuple(params))
+    cols = [desc[0] for desc in cur.description]
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
+        return None
+    return dict(zip(cols, row))
+
+
+def doc_update(conn, collection, filter, update):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        f"UPDATE {collection} SET data = data || %s::jsonb WHERE data @> %s::jsonb",
+        (json.dumps(update), json.dumps(filter)),
+    )
+    rowcount = cur.rowcount
+    raw.commit()
+    cur.close()
+    return rowcount
+
+
+def doc_update_one(conn, collection, filter, update):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        f"WITH target AS (SELECT _id FROM {collection} WHERE data @> %s::jsonb LIMIT 1) "
+        f"UPDATE {collection} SET data = data || %s::jsonb FROM target WHERE {collection}._id = target._id",
+        (json.dumps(filter), json.dumps(update)),
+    )
+    rowcount = cur.rowcount
+    raw.commit()
+    cur.close()
+    return rowcount
+
+
+def doc_delete(conn, collection, filter):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        f"DELETE FROM {collection} WHERE data @> %s::jsonb",
+        (json.dumps(filter),),
+    )
+    rowcount = cur.rowcount
+    raw.commit()
+    cur.close()
+    return rowcount
+
+
+def doc_delete_one(conn, collection, filter):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        f"WITH target AS (SELECT _id FROM {collection} WHERE data @> %s::jsonb LIMIT 1) "
+        f"DELETE FROM {collection} USING target WHERE {collection}._id = target._id",
+        (json.dumps(filter),),
+    )
+    rowcount = cur.rowcount
+    raw.commit()
+    cur.close()
+    return rowcount
+
+
+def doc_count(conn, collection, filter=None):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    sql = f"SELECT COUNT(*) FROM {collection}"
+    params = []
+    if filter:
+        sql += " WHERE data @> %s::jsonb"
+        params.append(json.dumps(filter))
+    cur.execute(sql, tuple(params))
+    result = cur.fetchone()[0]
+    cur.close()
+    return result
+
+
+def doc_create_index(conn, collection, keys=None):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    if keys is None:
+        cur.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{collection}_gin ON {collection} USING GIN (data)"
+        )
+    else:
+        for key in keys:
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
+                raise ValueError(f"Invalid key: {key}")
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{collection}_{key} ON {collection} ((data->>'{key}'))"
+            )
+    raw.commit()
+    cur.close()
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):
