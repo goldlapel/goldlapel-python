@@ -344,6 +344,15 @@ class GoldLapel:
     def doc_delete_one(self, *args, **kwargs):
         return _utils().doc_delete_one(self.conn, *args, **kwargs)
 
+    def doc_find_one_and_update(self, *args, **kwargs):
+        return _utils().doc_find_one_and_update(self.conn, *args, **kwargs)
+
+    def doc_find_one_and_delete(self, *args, **kwargs):
+        return _utils().doc_find_one_and_delete(self.conn, *args, **kwargs)
+
+    def doc_distinct(self, *args, **kwargs):
+        return _utils().doc_distinct(self.conn, *args, **kwargs)
+
     def doc_count(self, *args, **kwargs):
         return _utils().doc_count(self.conn, *args, **kwargs)
 

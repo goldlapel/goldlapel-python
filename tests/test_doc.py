@@ -21,9 +21,15 @@ from goldlapel.utils import (
     doc_remove_ttl_index,
     doc_create_capped,
     doc_remove_cap,
+    doc_find_one_and_update,
+    doc_find_one_and_delete,
+    doc_distinct,
     _build_filter,
+    _build_update,
     _build_project,
     _field_path,
+    _field_path_json,
+    _jsonb_path,
     _expand_dot_keys,
 )
 
@@ -1133,3 +1139,360 @@ class TestOperationalIdentifierValidation:
             doc_create_capped(conn, "bad; name", 1000)
         with pytest.raises(ValueError, match="Invalid identifier"):
             doc_remove_cap(conn, "bad; name")
+
+
+# ---------------------------------------------------------------------------
+# 18. Logical operators ($or, $and, $not)
+# ---------------------------------------------------------------------------
+
+class TestLogicalOperators:
+    def test_or_simple(self):
+        clause, params = _build_filter({"$or": [{"status": "active"}, {"status": "inactive"}]})
+        assert "OR" in clause
+        assert clause.startswith("(")
+        assert params == [json.dumps({"status": "active"}), json.dumps({"status": "inactive"})]
+
+    def test_and_explicit(self):
+        clause, params = _build_filter({"$and": [{"age": {"$gt": 18}}, {"age": {"$lt": 65}}]})
+        assert "AND" in clause
+        assert clause.startswith("(")
+        assert params == [18, 65]
+
+    def test_not(self):
+        clause, params = _build_filter({"$not": {"status": "active"}})
+        assert clause.startswith("NOT (")
+        assert params == [json.dumps({"status": "active"})]
+
+    def test_or_with_operators(self):
+        clause, params = _build_filter({
+            "$or": [{"status": "active"}, {"age": {"$gt": 25}}]
+        })
+        assert "OR" in clause
+        assert len(params) == 2
+        assert params[0] == json.dumps({"status": "active"})
+        assert params[1] == 25
+
+    def test_nested_or_and(self):
+        clause, params = _build_filter({
+            "$or": [
+                {"$and": [{"a": 1}, {"b": 2}]},
+                {"$not": {"c": 3}},
+            ]
+        })
+        assert "OR" in clause
+        assert "AND" in clause
+        assert "NOT" in clause
+
+    def test_mixed_logical_and_field(self):
+        clause, params = _build_filter({
+            "name": "alice",
+            "$or": [{"status": "active"}, {"age": {"$gt": 25}}]
+        })
+        assert "AND" in clause
+        assert "OR" in clause
+        first_param = params[0]
+        assert "alice" in first_param
+
+    def test_or_empty_raises(self):
+        with pytest.raises(ValueError, match="non-empty array"):
+            _build_filter({"$or": []})
+
+    def test_or_non_list_raises(self):
+        with pytest.raises(ValueError, match="non-empty array"):
+            _build_filter({"$or": {"a": 1}})
+
+    def test_not_non_dict_raises(self):
+        with pytest.raises(ValueError, match="filter object"):
+            _build_filter({"$not": [{"a": 1}]})
+
+    def test_or_in_find(self):
+        conn, cur = capture_sql(fetchall_result=[])
+        doc_find(conn, "users", filter={"$or": [{"status": "active"}, {"status": "inactive"}]})
+        sql = cur.execute.call_args[0][0]
+        assert "OR" in sql
+
+    def test_not_in_count(self):
+        conn, cur = capture_sql(fetchone_result=(5,))
+        doc_count(conn, "users", filter={"$not": {"status": "suspended"}})
+        sql = cur.execute.call_args[0][0]
+        assert "NOT" in sql
+
+
+# ---------------------------------------------------------------------------
+# 19. Field update operators ($set, $inc, $unset, $mul, $rename)
+# ---------------------------------------------------------------------------
+
+class TestFieldUpdateOperators:
+    def test_plain_update_fallback(self):
+        expr, params = _build_update({"name": "new"})
+        assert expr == "data || %s::jsonb"
+        assert params == [json.dumps({"name": "new"})]
+
+    def test_set(self):
+        expr, params = _build_update({"$set": {"name": "new", "age": 30}})
+        assert "|| %s::jsonb" in expr
+        assert params == [json.dumps({"name": "new", "age": 30})]
+
+    def test_inc(self):
+        expr, params = _build_update({"$inc": {"count": 1}})
+        assert "jsonb_set" in expr
+        assert "COALESCE" in expr
+        assert "+ %s" in expr
+        assert params == ["{count}", 1]
+
+    def test_inc_nested(self):
+        expr, params = _build_update({"$inc": {"stats.views": 5}})
+        assert "{stats,views}" in str(params)
+        assert "data->'stats'->>'views'" in expr
+
+    def test_unset_top_level(self):
+        expr, params = _build_update({"$unset": {"old_field": ""}})
+        assert "- %s" in expr
+        assert params == ["old_field"]
+
+    def test_unset_nested(self):
+        expr, params = _build_update({"$unset": {"nested.field": ""}})
+        assert "#- %s::text[]" in expr
+        assert params == ["{nested,field}"]
+
+    def test_mul(self):
+        expr, params = _build_update({"$mul": {"price": 1.1}})
+        assert "jsonb_set" in expr
+        assert "* %s" in expr
+        assert params == ["{price}", 1.1]
+
+    def test_rename(self):
+        expr, params = _build_update({"$rename": {"old_name": "new_name"}})
+        assert "jsonb_set" in expr
+        assert "- %s" in expr
+        assert params == ["old_name", "{new_name}"]
+
+    def test_combined_set_inc_unset(self):
+        expr, params = _build_update({
+            "$set": {"name": "new"},
+            "$inc": {"count": 1},
+            "$unset": {"temp": ""},
+        })
+        assert "|| %s::jsonb" in expr
+        assert "- %s" in expr
+        assert "jsonb_set" in expr
+        assert params[0] == json.dumps({"name": "new"})
+        assert "temp" in params
+        assert 1 in params
+
+    def test_set_in_doc_update(self):
+        conn, cur = capture_sql(rowcount=1)
+        doc_update(conn, "users", {"status": "old"}, {"$set": {"status": "new"}})
+        sql = cur.execute.call_args[0][0]
+        assert "|| %s::jsonb" in sql
+        assert "UPDATE users SET data =" in sql
+
+    def test_inc_in_doc_update_one(self):
+        conn, cur = capture_sql(rowcount=1)
+        doc_update_one(conn, "users", {"name": "alice"}, {"$inc": {"score": 10}})
+        sql = cur.execute.call_args[0][0]
+        assert "jsonb_set" in sql
+        assert "COALESCE" in sql
+
+    def test_invalid_field_key_raises(self):
+        with pytest.raises(ValueError, match="Invalid field key"):
+            _build_update({"$inc": {"bad;field": 1}})
+
+
+# ---------------------------------------------------------------------------
+# 20. Array update operators ($push, $pull, $addToSet)
+# ---------------------------------------------------------------------------
+
+class TestArrayUpdateOperators:
+    def test_push_string(self):
+        expr, params = _build_update({"$push": {"tags": "new_tag"}})
+        assert "jsonb_set" in expr
+        assert "COALESCE" in expr
+        assert "to_jsonb(%s::text)" in expr
+        assert params == ["{tags}", "new_tag"]
+
+    def test_push_number(self):
+        expr, params = _build_update({"$push": {"scores": 99}})
+        assert "to_jsonb(%s::numeric)" in expr
+        assert params == ["{scores}", 99]
+
+    def test_pull(self):
+        expr, params = _build_update({"$pull": {"tags": "old_tag"}})
+        assert "jsonb_agg(elem)" in expr
+        assert "WHERE elem !=" in expr
+        assert params == ["{tags}", "old_tag"]
+
+    def test_addToSet(self):
+        expr, params = _build_update({"$addToSet": {"tags": "maybe"}})
+        assert "CASE WHEN" in expr
+        assert "@>" in expr
+        assert params == ["{tags}", "maybe", "maybe"]
+
+    def test_push_in_doc_update(self):
+        conn, cur = capture_sql(rowcount=1)
+        doc_update(conn, "users", {"name": "alice"}, {"$push": {"tags": "python"}})
+        sql = cur.execute.call_args[0][0]
+        assert "jsonb_set" in sql
+        assert "COALESCE" in sql
+
+    def test_combined_set_push(self):
+        expr, params = _build_update({
+            "$set": {"name": "new"},
+            "$push": {"tags": "added"},
+        })
+        assert "|| %s::jsonb" in expr
+        assert "jsonb_set" in expr
+
+
+# ---------------------------------------------------------------------------
+# 21. doc_find_one_and_update()
+# ---------------------------------------------------------------------------
+
+class TestDocFindOneAndUpdate:
+    def test_returns_document(self):
+        conn, cur = capture_sql(
+            fetchone_result=("uuid-1", {"name": "alice", "score": 10}, "2026-01-01"),
+        )
+        result = doc_find_one_and_update(
+            conn, "users", {"name": "alice"}, {"$inc": {"score": 5}}
+        )
+        sql = cur.execute.call_args[0][0]
+        assert "WITH target AS" in sql
+        assert "RETURNING" in sql
+        assert "jsonb_set" in sql
+        assert result is not None
+        assert result["_id"] == "uuid-1"
+
+    def test_returns_none_no_match(self):
+        conn, cur = capture_sql(fetchone_result=None)
+        result = doc_find_one_and_update(
+            conn, "users", {"name": "nobody"}, {"status": "new"}
+        )
+        assert result is None
+
+    def test_plain_update(self):
+        conn, cur = capture_sql(
+            fetchone_result=("uuid-1", {"name": "alice"}, "2026-01-01"),
+        )
+        doc_find_one_and_update(
+            conn, "users", {"name": "alice"}, {"status": "updated"}
+        )
+        sql = cur.execute.call_args[0][0]
+        assert "|| %s::jsonb" in sql
+        assert "RETURNING" in sql
+
+    def test_commits(self):
+        conn, cur = capture_sql(fetchone_result=("uuid-1", {}, "ts"))
+        doc_find_one_and_update(conn, "users", {}, {"a": 1})
+        conn.commit.assert_called_once()
+
+    def test_invalid_collection_raises(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_find_one_and_update(conn, "bad; name", {}, {"a": 1})
+
+
+# ---------------------------------------------------------------------------
+# 22. doc_find_one_and_delete()
+# ---------------------------------------------------------------------------
+
+class TestDocFindOneAndDelete:
+    def test_returns_document(self):
+        conn, cur = capture_sql(
+            fetchone_result=("uuid-1", {"name": "alice"}, "2026-01-01"),
+        )
+        result = doc_find_one_and_delete(conn, "users", {"name": "alice"})
+        sql = cur.execute.call_args[0][0]
+        assert "WITH target AS" in sql
+        assert "DELETE FROM" in sql
+        assert "RETURNING" in sql
+        assert result is not None
+        assert result["_id"] == "uuid-1"
+
+    def test_returns_none_no_match(self):
+        conn, cur = capture_sql(fetchone_result=None)
+        result = doc_find_one_and_delete(conn, "users", {"name": "nobody"})
+        assert result is None
+
+    def test_commits(self):
+        conn, cur = capture_sql(fetchone_result=("uuid-1", {}, "ts"))
+        doc_find_one_and_delete(conn, "users", {"name": "alice"})
+        conn.commit.assert_called_once()
+
+    def test_invalid_collection_raises(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_find_one_and_delete(conn, "bad; name", {})
+
+
+# ---------------------------------------------------------------------------
+# 23. doc_distinct()
+# ---------------------------------------------------------------------------
+
+class TestDocDistinct:
+    def test_basic_distinct(self):
+        conn, cur = capture_sql(fetchall_result=[("active",), ("inactive",)])
+        result = doc_distinct(conn, "users", "status")
+        sql = cur.execute.call_args[0][0]
+        assert "SELECT DISTINCT" in sql
+        assert "data->>'status'" in sql
+        assert "IS NOT NULL" in sql
+        assert result == ["active", "inactive"]
+
+    def test_dot_notation(self):
+        conn, cur = capture_sql(fetchall_result=[("NYC",), ("LA",)])
+        result = doc_distinct(conn, "users", "address.city")
+        sql = cur.execute.call_args[0][0]
+        assert "data->'address'->>'city'" in sql
+        assert result == ["NYC", "LA"]
+
+    def test_with_filter(self):
+        conn, cur = capture_sql(fetchall_result=[("active",)])
+        result = doc_distinct(conn, "users", "status", filter={"age": {"$gt": 25}})
+        sql = cur.execute.call_args[0][0]
+        assert "SELECT DISTINCT" in sql
+        assert "IS NOT NULL" in sql
+        assert "(data->>'age')::numeric > %s" in sql
+
+    def test_no_filter(self):
+        conn, cur = capture_sql(fetchall_result=[])
+        doc_distinct(conn, "users", "status")
+        sql = cur.execute.call_args[0][0]
+        assert "SELECT DISTINCT" in sql
+        assert "IS NOT NULL" in sql
+
+    def test_invalid_field_raises(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Invalid filter key"):
+            doc_distinct(conn, "users", "bad;field")
+
+    def test_invalid_collection_raises(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_distinct(conn, "bad; name", "status")
+
+
+# ---------------------------------------------------------------------------
+# 24. Helper function tests
+# ---------------------------------------------------------------------------
+
+class TestHelperFunctions:
+    def test_field_path_json_single(self):
+        assert _field_path_json("name") == "data->'name'"
+
+    def test_field_path_json_nested(self):
+        assert _field_path_json("addr.city") == "data->'addr'->'city'"
+
+    def test_field_path_json_invalid_raises(self):
+        with pytest.raises(ValueError, match="Invalid field key"):
+            _field_path_json("bad;key")
+
+    def test_jsonb_path_single(self):
+        assert _jsonb_path("name") == "{name}"
+
+    def test_jsonb_path_nested(self):
+        assert _jsonb_path("addr.city") == "{addr,city}"
+
+    def test_jsonb_path_invalid_raises(self):
+        with pytest.raises(ValueError, match="Invalid field key"):
+            _jsonb_path("bad;key")

@@ -905,6 +905,8 @@ _COMPARISON_OPS = {
     "$eq": "=", "$ne": "!=",
 }
 _SUPPORTED_FILTER_OPS = set(_COMPARISON_OPS) | {"$in", "$nin", "$exists", "$regex"}
+_LOGICAL_OPS = {"$or", "$and", "$not"}
+_UPDATE_OPS = {"$set", "$unset", "$inc", "$mul", "$rename", "$push", "$pull", "$addToSet"}
 
 
 def _field_path(key):
@@ -934,6 +936,129 @@ def _expand_dot_keys(d):
     return result
 
 
+def _field_path_json(key):
+    parts = key.split(".")
+    for part in parts:
+        if not _FIELD_PART_RE.match(part):
+            raise ValueError(f"Invalid field key: {key}")
+    chain = "data"
+    for part in parts:
+        chain += f"->'{part}'"
+    return chain
+
+
+def _jsonb_path(key):
+    parts = key.split(".")
+    for part in parts:
+        if not _FIELD_PART_RE.match(part):
+            raise ValueError(f"Invalid field key: {key}")
+    return "{" + ",".join(parts) + "}"
+
+
+def _to_jsonb_expr(value):
+    if isinstance(value, bool):
+        return "to_jsonb(%s::boolean)", value
+    elif isinstance(value, (int, float)):
+        return "to_jsonb(%s::numeric)", value
+    elif isinstance(value, str):
+        return "to_jsonb(%s::text)", value
+    else:
+        return "%s::jsonb", json.dumps(value)
+
+
+def _build_update(update):
+    if not any(k.startswith("$") for k in update):
+        return "data || %s::jsonb", [json.dumps(update)]
+
+    expr = "data"
+    params = []
+
+    if "$set" in update:
+        expr = f"({expr} || %s::jsonb)"
+        params.append(json.dumps(update["$set"]))
+
+    if "$unset" in update:
+        for field in update["$unset"]:
+            parts = field.split(".")
+            for part in parts:
+                if not _FIELD_PART_RE.match(part):
+                    raise ValueError(f"Invalid field key: {field}")
+            if len(parts) == 1:
+                expr = f"({expr} - %s)"
+                params.append(field)
+            else:
+                path = "{" + ",".join(parts) + "}"
+                expr = f"({expr} #- %s::text[])"
+                params.append(path)
+
+    if "$inc" in update:
+        for field, amount in update["$inc"].items():
+            jp = _jsonb_path(field)
+            fp = _field_path(field)
+            expr = f"jsonb_set({expr}, %s::text[], to_jsonb(COALESCE(({fp})::numeric, 0) + %s))"
+            params.extend([jp, amount])
+
+    if "$mul" in update:
+        for field, factor in update["$mul"].items():
+            jp = _jsonb_path(field)
+            fp = _field_path(field)
+            expr = f"jsonb_set({expr}, %s::text[], to_jsonb(COALESCE(({fp})::numeric, 0) * %s))"
+            params.extend([jp, factor])
+
+    if "$rename" in update:
+        for old_name, new_name in update["$rename"].items():
+            for part in old_name.split("."):
+                if not _FIELD_PART_RE.match(part):
+                    raise ValueError(f"Invalid field key: {old_name}")
+            for part in new_name.split("."):
+                if not _FIELD_PART_RE.match(part):
+                    raise ValueError(f"Invalid field key: {new_name}")
+            old_json = _field_path_json(old_name)
+            new_jp = _jsonb_path(new_name)
+            if "." in old_name:
+                old_path = "{" + ",".join(old_name.split(".")) + "}"
+                expr = f"jsonb_set(({expr} #- %s::text[]), %s::text[], {old_json})"
+                params.extend([old_path, new_jp])
+            else:
+                expr = f"jsonb_set(({expr} - %s), %s::text[], {old_json})"
+                params.extend([old_name, new_jp])
+
+    if "$push" in update:
+        for field, value in update["$push"].items():
+            jp = _jsonb_path(field)
+            fj = _field_path_json(field)
+            val_expr, val_param = _to_jsonb_expr(value)
+            expr = f"jsonb_set({expr}, %s::text[], COALESCE({fj}, '[]'::jsonb) || {val_expr})"
+            params.extend([jp, val_param])
+
+    if "$pull" in update:
+        for field, value in update["$pull"].items():
+            jp = _jsonb_path(field)
+            fj = _field_path_json(field)
+            val_expr, val_param = _to_jsonb_expr(value)
+            expr = (
+                f"jsonb_set({expr}, %s::text[], "
+                f"COALESCE((SELECT jsonb_agg(elem) FROM jsonb_array_elements({fj}) AS elem "
+                f"WHERE elem != {val_expr}), '[]'::jsonb))"
+            )
+            params.extend([jp, val_param])
+
+    if "$addToSet" in update:
+        for field, value in update["$addToSet"].items():
+            jp = _jsonb_path(field)
+            fj = _field_path_json(field)
+            val_expr, val_param = _to_jsonb_expr(value)
+            expr = (
+                f"jsonb_set({expr}, %s::text[], "
+                f"CASE WHEN COALESCE({fj}, '[]'::jsonb) @> {val_expr} "
+                f"THEN {fj} "
+                f"ELSE COALESCE({fj}, '[]'::jsonb) || {val_expr} END)"
+            )
+            params.extend([jp, val_param, val_param])
+
+    return expr, params
+
+
 def _build_filter(filter_dict):
     if not filter_dict:
         return "", []
@@ -941,7 +1066,27 @@ def _build_filter(filter_dict):
     clauses = []
     params = []
     for key, value in filter_dict.items():
-        if isinstance(value, dict) and any(k.startswith("$") for k in value):
+        if key in _LOGICAL_OPS:
+            if key == "$not":
+                if not isinstance(value, dict):
+                    raise ValueError("$not value must be a filter object")
+                sub_clause, sub_params = _build_filter(value)
+                if sub_clause:
+                    clauses.append(f"NOT ({sub_clause})")
+                    params.extend(sub_params)
+            else:
+                if not isinstance(value, list) or len(value) == 0:
+                    raise ValueError(f"{key} value must be a non-empty array")
+                joiner = " OR " if key == "$or" else " AND "
+                sub_clauses = []
+                for sub_filter in value:
+                    sc, sp = _build_filter(sub_filter)
+                    if sc:
+                        sub_clauses.append(sc)
+                        params.extend(sp)
+                if sub_clauses:
+                    clauses.append("(" + joiner.join(sub_clauses) + ")")
+        elif isinstance(value, dict) and any(k.startswith("$") for k in value):
             field_expr = _field_path(key)
             for op, operand in value.items():
                 if op in _COMPARISON_OPS:
@@ -1083,8 +1228,9 @@ def doc_update(conn, collection, filter, update):
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     where_clause, filter_params = _build_filter(filter)
-    sql = f"UPDATE {collection} SET data = data || %s::jsonb"
-    params = [json.dumps(update)]
+    update_expr, update_params = _build_update(update)
+    sql = f"UPDATE {collection} SET data = {update_expr}"
+    params = list(update_params)
     if where_clause:
         sql += " WHERE " + where_clause
         params.extend(filter_params)
@@ -1100,15 +1246,16 @@ def doc_update_one(conn, collection, filter, update):
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     where_clause, filter_params = _build_filter(filter)
+    update_expr, update_params = _build_update(update)
     if where_clause:
         cte_where = " WHERE " + where_clause
     else:
         cte_where = ""
     sql = (
         f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
-        f"UPDATE {collection} SET data = data || %s::jsonb FROM target WHERE {collection}._id = target._id"
+        f"UPDATE {collection} SET data = {update_expr} FROM target WHERE {collection}._id = target._id"
     )
-    params = list(filter_params) + [json.dumps(update)]
+    params = list(filter_params) + list(update_params)
     cur.execute(sql, tuple(params))
     rowcount = cur.rowcount
     raw.commit()
@@ -1163,6 +1310,77 @@ def doc_count(conn, collection, filter=None):
         params.extend(filter_params)
     cur.execute(sql, tuple(params))
     result = cur.fetchone()[0]
+    cur.close()
+    return result
+
+
+def doc_find_one_and_update(conn, collection, filter, update):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    where_clause, filter_params = _build_filter(filter)
+    update_expr, update_params = _build_update(update)
+    if where_clause:
+        cte_where = " WHERE " + where_clause
+    else:
+        cte_where = ""
+    sql = (
+        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
+        f"UPDATE {collection} SET data = {update_expr} FROM target "
+        f"WHERE {collection}._id = target._id "
+        f"RETURNING {collection}._id, {collection}.data, {collection}.created_at"
+    )
+    params = list(filter_params) + list(update_params)
+    cur.execute(sql, tuple(params))
+    cols = [desc[0] for desc in cur.description]
+    row = cur.fetchone()
+    raw.commit()
+    cur.close()
+    if row is None:
+        return None
+    return dict(zip(cols, row))
+
+
+def doc_find_one_and_delete(conn, collection, filter):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    where_clause, filter_params = _build_filter(filter)
+    if where_clause:
+        cte_where = " WHERE " + where_clause
+    else:
+        cte_where = ""
+    sql = (
+        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
+        f"DELETE FROM {collection} USING target "
+        f"WHERE {collection}._id = target._id "
+        f"RETURNING {collection}._id, {collection}.data, {collection}.created_at"
+    )
+    cur.execute(sql, tuple(filter_params))
+    cols = [desc[0] for desc in cur.description]
+    row = cur.fetchone()
+    raw.commit()
+    cur.close()
+    if row is None:
+        return None
+    return dict(zip(cols, row))
+
+
+def doc_distinct(conn, collection, field, filter=None):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    field_expr = _field_path(field)
+    sql = f"SELECT DISTINCT {field_expr} FROM {collection}"
+    params = []
+    where_parts = [f"{field_expr} IS NOT NULL"]
+    where_clause, filter_params = _build_filter(filter)
+    if where_clause:
+        where_parts.append(where_clause)
+        params.extend(filter_params)
+    sql += " WHERE " + " AND ".join(where_parts)
+    cur.execute(sql, tuple(params))
+    result = [row[0] for row in cur.fetchall()]
     cur.close()
     return result
 
