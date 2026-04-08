@@ -353,6 +353,24 @@ class GoldLapel:
     def doc_aggregate(self, *args, **kwargs):
         return _utils().doc_aggregate(self.conn, *args, **kwargs)
 
+    def doc_watch(self, *args, **kwargs):
+        return _utils().doc_watch(self.conn, *args, **kwargs)
+
+    def doc_unwatch(self, *args, **kwargs):
+        return _utils().doc_unwatch(self.conn, *args, **kwargs)
+
+    def doc_create_ttl_index(self, *args, **kwargs):
+        return _utils().doc_create_ttl_index(self.conn, *args, **kwargs)
+
+    def doc_remove_ttl_index(self, *args, **kwargs):
+        return _utils().doc_remove_ttl_index(self.conn, *args, **kwargs)
+
+    def doc_create_capped(self, *args, **kwargs):
+        return _utils().doc_create_capped(self.conn, *args, **kwargs)
+
+    def doc_remove_cap(self, *args, **kwargs):
+        return _utils().doc_remove_cap(self.conn, *args, **kwargs)
+
     # -- Search ----------------------------------------------------------------
 
     def search(self, *args, **kwargs):

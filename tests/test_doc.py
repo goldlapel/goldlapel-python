@@ -15,6 +15,12 @@ from goldlapel.utils import (
     doc_count,
     doc_create_index,
     doc_aggregate,
+    doc_watch,
+    doc_unwatch,
+    doc_create_ttl_index,
+    doc_remove_ttl_index,
+    doc_create_capped,
+    doc_remove_cap,
     _build_filter,
     _build_project,
     _field_path,
@@ -984,3 +990,146 @@ class TestDotNotationExpansion:
         params = cur.execute.call_args[0][1]
         assert "WHERE data @> %s::jsonb" in sql
         assert json.loads(params[0]) == {"addr": {"city": "NY"}}
+
+
+# ---------------------------------------------------------------------------
+# 14. Change streams (doc_watch / doc_unwatch)
+# ---------------------------------------------------------------------------
+
+class TestDocWatch:
+    def test_watch_creates_trigger(self):
+        conn, cur = capture_sql()
+        with pytest.raises(Exception):
+            # _make_listen_connection will fail on the mock, but trigger SQL is already executed
+            doc_watch(conn, "events", lambda e: None)
+        calls = [c[0][0] for c in cur.execute.call_args_list]
+        assert any("CREATE OR REPLACE FUNCTION _gl_watch_events()" in c for c in calls)
+        assert any("pg_notify" in c for c in calls)
+        assert any("CREATE TRIGGER _gl_watch_events_trigger" in c for c in calls)
+
+    @pytest.fixture
+    def mock_listen(self, monkeypatch):
+        import goldlapel.utils as utils_mod
+        mock_listen_conn = MagicMock()
+        mock_listen_conn.notifies = []
+        mock_listen_conn.poll = MagicMock()
+        mock_listen_cur = MagicMock()
+        mock_listen_conn.cursor.return_value = mock_listen_cur
+        mock_listen_conn.commit = MagicMock()
+        monkeypatch.setattr(utils_mod, "_make_listen_connection", lambda c: mock_listen_conn)
+        return mock_listen_conn, mock_listen_cur
+
+    def test_watch_listens(self, mock_listen):
+        mock_listen_conn, mock_listen_cur = mock_listen
+        conn, cur = capture_sql()
+        # select.select will raise StopIteration via side_effect to break the loop
+        import select as select_mod
+        original_select = select_mod.select
+
+        call_count = [0]
+        def fake_select(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] > 1:
+                raise KeyboardInterrupt()
+            return ([], [], [])
+
+        import goldlapel.utils as utils_mod
+        old_select = select_mod.select
+        select_mod.select = fake_select
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                doc_watch(conn, "events", lambda e: None, blocking=True)
+        finally:
+            select_mod.select = old_select
+        # Verify LISTEN was called on the listen connection
+        listen_calls = [c[0][0] for c in mock_listen_cur.execute.call_args_list]
+        assert any("LISTEN _gl_changes_events" in c for c in listen_calls)
+
+    def test_unwatch_drops(self):
+        conn, cur = capture_sql()
+        doc_unwatch(conn, "events")
+        calls = [c[0][0] for c in cur.execute.call_args_list]
+        assert any("DROP TRIGGER IF EXISTS _gl_watch_events_trigger ON events" in c for c in calls)
+        assert any("DROP FUNCTION IF EXISTS _gl_watch_events()" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# 15. TTL indexes (doc_create_ttl_index / doc_remove_ttl_index)
+# ---------------------------------------------------------------------------
+
+class TestDocTTL:
+    def test_ttl_creates_index_and_trigger(self):
+        conn, cur = capture_sql()
+        doc_create_ttl_index(conn, "sessions", 3600)
+        calls = [c[0][0] for c in cur.execute.call_args_list]
+        assert any("CREATE INDEX IF NOT EXISTS idx_sessions_ttl" in c for c in calls)
+        assert any("CREATE OR REPLACE FUNCTION _gl_ttl_sessions()" in c for c in calls)
+        assert any("INTERVAL '3600 seconds'" in c for c in calls)
+        assert any("CREATE TRIGGER _gl_ttl_sessions_trigger" in c for c in calls)
+
+    def test_ttl_validates_seconds(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="expire_after_seconds must be an integer"):
+            doc_create_ttl_index(conn, "sessions", "not_a_number")
+
+    def test_remove_ttl(self):
+        conn, cur = capture_sql()
+        doc_remove_ttl_index(conn, "sessions")
+        calls = [c[0][0] for c in cur.execute.call_args_list]
+        assert any("DROP TRIGGER IF EXISTS _gl_ttl_sessions_trigger ON sessions" in c for c in calls)
+        assert any("DROP FUNCTION IF EXISTS _gl_ttl_sessions()" in c for c in calls)
+        assert any("DROP INDEX IF EXISTS idx_sessions_ttl" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# 16. Capped collections (doc_create_capped / doc_remove_cap)
+# ---------------------------------------------------------------------------
+
+class TestDocCapped:
+    def test_capped_creates_trigger(self):
+        conn, cur = capture_sql()
+        doc_create_capped(conn, "logs", 1000)
+        calls = [c[0][0] for c in cur.execute.call_args_list]
+        assert any("CREATE OR REPLACE FUNCTION _gl_cap_logs()" in c for c in calls)
+        assert any("COUNT(*) - 1000" in c for c in calls)
+        assert any("DELETE" in c and "LIMIT excess" in c for c in calls)
+        assert any("CREATE TRIGGER _gl_cap_logs_trigger" in c for c in calls)
+
+    def test_capped_ensures_collection(self):
+        conn, cur = capture_sql()
+        doc_create_capped(conn, "logs", 500)
+        calls = [c[0][0] for c in cur.execute.call_args_list]
+        assert any("CREATE TABLE IF NOT EXISTS logs" in c for c in calls)
+
+    def test_capped_validates_max_documents(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="max_documents must be an integer"):
+            doc_create_capped(conn, "logs", "not_a_number")
+
+    def test_remove_cap(self):
+        conn, cur = capture_sql()
+        doc_remove_cap(conn, "logs")
+        calls = [c[0][0] for c in cur.execute.call_args_list]
+        assert any("DROP TRIGGER IF EXISTS _gl_cap_logs_trigger ON logs" in c for c in calls)
+        assert any("DROP FUNCTION IF EXISTS _gl_cap_logs()" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# 17. Identifier validation across new methods
+# ---------------------------------------------------------------------------
+
+class TestOperationalIdentifierValidation:
+    def test_invalid_collection_rejected(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_watch(conn, "bad; name", lambda e: None)
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_unwatch(conn, "bad; name")
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_create_ttl_index(conn, "bad; name", 3600)
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_remove_ttl_index(conn, "bad; name")
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_create_capped(conn, "bad; name", 1000)
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_remove_cap(conn, "bad; name")

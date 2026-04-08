@@ -1502,3 +1502,168 @@ def _make_listen_connection(conn):
     listen_conn = psycopg2.connect(dsn)
     listen_conn.set_isolation_level(0)  # autocommit
     return listen_conn
+
+
+def doc_watch(conn, collection, callback, blocking=True):
+    """Watch a collection for changes via triggers + pg_notify. Like MongoDB change streams."""
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+
+    cur.execute(f"""
+        CREATE OR REPLACE FUNCTION _gl_watch_{collection}() RETURNS TRIGGER AS $$
+        BEGIN
+            PERFORM pg_notify('_gl_changes_{collection}', json_build_object(
+                'operationType', lower(TG_OP),
+                '_id', COALESCE(NEW._id, OLD._id)::text,
+                'fullDocument', CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE NEW.data END
+            )::text);
+            RETURN COALESCE(NEW, OLD);
+        END;
+        $$ LANGUAGE plpgsql
+    """)
+
+    cur.execute(f"""
+        DO $$ BEGIN
+            CREATE TRIGGER _gl_watch_{collection}_trigger
+                AFTER INSERT OR UPDATE OR DELETE ON {collection}
+                FOR EACH ROW EXECUTE FUNCTION _gl_watch_{collection}();
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$
+    """)
+    raw.commit()
+    cur.close()
+
+    channel = f"_gl_changes_{collection}"
+
+    def _listen():
+        listen_conn = _make_listen_connection(raw)
+        lcur = listen_conn.cursor()
+        lcur.execute(f"LISTEN {channel}")
+        listen_conn.commit()
+        lcur.close()
+        while True:
+            if select.select([listen_conn], [], [], 5.0) != ([], [], []):
+                listen_conn.poll()
+                while listen_conn.notifies:
+                    notify = listen_conn.notifies.pop(0)
+                    event = json.loads(notify.payload)
+                    callback(event)
+
+    if blocking:
+        _listen()
+    else:
+        t = threading.Thread(target=_listen, daemon=True)
+        t.start()
+        return t
+
+
+def doc_unwatch(conn, collection):
+    """Remove change stream trigger from a collection."""
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"DROP TRIGGER IF EXISTS _gl_watch_{collection}_trigger ON {collection}")
+    cur.execute(f"DROP FUNCTION IF EXISTS _gl_watch_{collection}()")
+    raw.commit()
+    cur.close()
+
+
+def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_at"):
+    """Create a TTL index that deletes expired rows on each INSERT. Like MongoDB TTL indexes."""
+    _validate_identifier(collection)
+    _validate_identifier(field)
+    if not isinstance(expire_after_seconds, int):
+        raise ValueError("expire_after_seconds must be an integer")
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+
+    cur.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{collection}_ttl ON {collection} ({field})"
+    )
+
+    expire_int = int(expire_after_seconds)
+    cur.execute(f"""
+        CREATE OR REPLACE FUNCTION _gl_ttl_{collection}() RETURNS TRIGGER AS $$
+        BEGIN
+            DELETE FROM {collection} WHERE {field} < NOW() - INTERVAL '{expire_int} seconds';
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+    """)
+
+    cur.execute(f"""
+        DO $$ BEGIN
+            CREATE TRIGGER _gl_ttl_{collection}_trigger
+                BEFORE INSERT ON {collection}
+                FOR EACH STATEMENT EXECUTE FUNCTION _gl_ttl_{collection}();
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$
+    """)
+    raw.commit()
+    cur.close()
+
+
+def doc_remove_ttl_index(conn, collection):
+    """Remove TTL trigger, function, and index from a collection."""
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"DROP TRIGGER IF EXISTS _gl_ttl_{collection}_trigger ON {collection}")
+    cur.execute(f"DROP FUNCTION IF EXISTS _gl_ttl_{collection}()")
+    cur.execute(f"DROP INDEX IF EXISTS idx_{collection}_ttl")
+    raw.commit()
+    cur.close()
+
+
+def doc_create_capped(conn, collection, max_documents):
+    """Create a capped collection that auto-deletes oldest rows. Like MongoDB capped collections."""
+    _validate_identifier(collection)
+    if not isinstance(max_documents, int):
+        raise ValueError("max_documents must be an integer")
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+
+    _ensure_collection(cur, collection)
+
+    cur.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{collection}_created_at ON {collection} (created_at ASC)"
+    )
+
+    max_int = int(max_documents)
+    cur.execute(f"""
+        CREATE OR REPLACE FUNCTION _gl_cap_{collection}() RETURNS TRIGGER AS $$
+        DECLARE excess INTEGER;
+        BEGIN
+            SELECT COUNT(*) - {max_int} INTO excess FROM {collection};
+            IF excess > 0 THEN
+                DELETE FROM {collection} WHERE _id IN (
+                    SELECT _id FROM {collection} ORDER BY created_at ASC LIMIT excess
+                );
+            END IF;
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql
+    """)
+
+    cur.execute(f"""
+        DO $$ BEGIN
+            CREATE TRIGGER _gl_cap_{collection}_trigger
+                AFTER INSERT ON {collection}
+                FOR EACH STATEMENT EXECUTE FUNCTION _gl_cap_{collection}();
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$
+    """)
+    raw.commit()
+    cur.close()
+
+
+def doc_remove_cap(conn, collection):
+    """Remove capped collection trigger and function."""
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(f"DROP TRIGGER IF EXISTS _gl_cap_{collection}_trigger ON {collection}")
+    cur.execute(f"DROP FUNCTION IF EXISTS _gl_cap_{collection}()")
+    raw.commit()
+    cur.close()
