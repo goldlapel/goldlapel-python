@@ -1081,6 +1081,126 @@ def doc_create_index(conn, collection, keys=None):
     cur.close()
 
 
+def _build_group(group):
+    _CAST_ACCUMULATORS = {"$avg", "$min", "$max", "$sum"}
+    _SUPPORTED_ACCUMULATORS = _CAST_ACCUMULATORS | {"$count"}
+    select_parts = []
+    group_by = None
+    group_id = group.get("_id")
+    if isinstance(group_id, str) and group_id.startswith("$"):
+        field = group_id[1:]
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
+            raise ValueError(f"Invalid field name: {field}")
+        select_parts.append(f"data->>'{field}' AS _id")
+        group_by = f"data->>'{field}'"
+    elif group_id is None:
+        pass
+    for alias, expr in group.items():
+        if alias == "_id":
+            continue
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', alias):
+            raise ValueError(f"Invalid field name: {alias}")
+        if not isinstance(expr, dict) or len(expr) != 1:
+            raise ValueError(f"Invalid accumulator for {alias}")
+        op = next(iter(expr))
+        if op not in _SUPPORTED_ACCUMULATORS:
+            raise ValueError(f"Unsupported accumulator: {op}")
+        val = expr[op]
+        if op == "$count":
+            select_parts.append(f"COUNT(*) AS {alias}")
+        elif op == "$sum":
+            if val == 1:
+                select_parts.append(f"COUNT(*) AS {alias}")
+            elif isinstance(val, str) and val.startswith("$"):
+                field = val[1:]
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
+                    raise ValueError(f"Invalid field name: {field}")
+                select_parts.append(f"SUM((data->>'{field}')::numeric) AS {alias}")
+            elif isinstance(val, (int, float)):
+                select_parts.append(f"SUM({val}) AS {alias}")
+            else:
+                raise ValueError(f"Invalid $sum value: {val}")
+        elif op == "$avg":
+            if isinstance(val, str) and val.startswith("$"):
+                field = val[1:]
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
+                    raise ValueError(f"Invalid field name: {field}")
+                select_parts.append(f"AVG((data->>'{field}')::numeric) AS {alias}")
+        elif op == "$min":
+            if isinstance(val, str) and val.startswith("$"):
+                field = val[1:]
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
+                    raise ValueError(f"Invalid field name: {field}")
+                select_parts.append(f"MIN((data->>'{field}')::numeric) AS {alias}")
+        elif op == "$max":
+            if isinstance(val, str) and val.startswith("$"):
+                field = val[1:]
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
+                    raise ValueError(f"Invalid field name: {field}")
+                select_parts.append(f"MAX((data->>'{field}')::numeric) AS {alias}")
+    return select_parts, group_by
+
+
+def doc_aggregate(conn, collection, pipeline):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    _SUPPORTED_STAGES = {"$match", "$group", "$sort", "$limit", "$skip"}
+    match_filter = None
+    group_stage = None
+    sort_stage = None
+    limit_val = None
+    skip_val = None
+    for stage in pipeline:
+        key = next(iter(stage))
+        if key not in _SUPPORTED_STAGES:
+            raise ValueError(f"Unsupported pipeline stage: {key}")
+        if key == "$match":
+            match_filter = stage[key]
+        elif key == "$group":
+            group_stage = stage[key]
+        elif key == "$sort":
+            sort_stage = stage[key]
+        elif key == "$limit":
+            limit_val = stage[key]
+        elif key == "$skip":
+            skip_val = stage[key]
+    params = []
+    if group_stage:
+        select_parts, group_by = _build_group(group_stage)
+        sql = f"SELECT {', '.join(select_parts)} FROM {collection}"
+    else:
+        sql = f"SELECT _id, data, created_at FROM {collection}"
+        group_by = None
+    if match_filter:
+        sql += " WHERE data @> %s::jsonb"
+        params.append(json.dumps(match_filter))
+    if group_by:
+        sql += f" GROUP BY {group_by}"
+    if sort_stage:
+        order_parts = []
+        for key, direction in sort_stage.items():
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
+                raise ValueError(f"Invalid sort key: {key}")
+            dir_str = "ASC" if direction == 1 else "DESC"
+            if group_stage:
+                order_parts.append(f"{key} {dir_str}")
+            else:
+                order_parts.append(f"data->>'{key}' {dir_str}")
+        sql += " ORDER BY " + ", ".join(order_parts)
+    if limit_val is not None:
+        sql += " LIMIT %s"
+        params.append(limit_val)
+    if skip_val is not None:
+        sql += " OFFSET %s"
+        params.append(skip_val)
+    cur.execute(sql, tuple(params))
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
 def _get_raw_connection(conn):
     """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
     if hasattr(conn, '_conn'):

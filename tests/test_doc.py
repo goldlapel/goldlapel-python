@@ -14,6 +14,7 @@ from goldlapel.utils import (
     doc_delete_one,
     doc_count,
     doc_create_index,
+    doc_aggregate,
 )
 
 
@@ -447,3 +448,119 @@ class TestDocParameterBinding:
         doc_delete(conn, "users", {"key": "'; DROP TABLE users; --"})
         sql = cur.execute.call_args[0][0]
         assert "DROP TABLE" not in sql
+
+
+# ---------------------------------------------------------------------------
+# 11. doc_aggregate()
+# ---------------------------------------------------------------------------
+
+class TestDocAggregate:
+    def test_group_count(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("electronics", 5)],
+            description=[("_id",), ("count",)],
+        )
+        result = doc_aggregate(conn, "products", [
+            {"$match": {"status": "active"}},
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 10},
+        ])
+        sql = cur.execute.call_args[0][0]
+        params = cur.execute.call_args[0][1]
+        assert "GROUP BY" in sql
+        assert "COUNT(*)" in sql
+        assert "WHERE data @> %s::jsonb" in sql
+        assert "ORDER BY count DESC" in sql
+        assert "LIMIT %s" in sql
+        assert params[0] == json.dumps({"status": "active"})
+        assert params[1] == 10
+        assert result == [{"_id": "electronics", "count": 5}]
+
+    def test_group_avg(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("electronics", 42.5)],
+            description=[("_id",), ("avg_price",)],
+        )
+        doc_aggregate(conn, "products", [
+            {"$group": {"_id": "$category", "avg_price": {"$avg": "$price"}}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "AVG((data->>'price')::numeric)" in sql
+
+    def test_group_null_id(self):
+        conn, cur = capture_sql(
+            fetchall_result=[(100,)],
+            description=[("total",)],
+        )
+        doc_aggregate(conn, "orders", [
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "GROUP BY" not in sql
+        assert "SUM((data->>'amount')::numeric)" in sql
+
+    def test_match_only(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("id1", {"status": "active"}, "ts")],
+        )
+        doc_aggregate(conn, "users", [
+            {"$match": {"status": "active"}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "SELECT _id, data, created_at FROM users" in sql
+        assert "WHERE data @> %s::jsonb" in sql
+
+    def test_no_group_sort(self):
+        conn, cur = capture_sql(fetchall_result=[])
+        doc_aggregate(conn, "users", [
+            {"$match": {"active": True}},
+            {"$sort": {"name": 1}},
+            {"$limit": 5},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "ORDER BY data->>'name' ASC" in sql
+        assert "LIMIT %s" in sql
+
+    def test_group_sort_uses_alias(self):
+        conn, cur = capture_sql(
+            fetchall_result=[],
+            description=[("_id",), ("count",)],
+        )
+        doc_aggregate(conn, "products", [
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "ORDER BY count DESC" in sql
+        assert "data->>'count'" not in sql
+
+    def test_unsupported_stage(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Unsupported pipeline stage"):
+            doc_aggregate(conn, "users", [{"$lookup": {}}])
+
+    def test_unsupported_accumulator(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Unsupported accumulator"):
+            doc_aggregate(conn, "users", [
+                {"$group": {"_id": "$category", "items": {"$push": "$name"}}},
+            ])
+
+    def test_invalid_field(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Invalid field name"):
+            doc_aggregate(conn, "users", [
+                {"$group": {"_id": "$bad; field", "count": {"$sum": 1}}},
+            ])
+
+    def test_empty_pipeline(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("id1", {"a": 1}, "ts")],
+        )
+        result = doc_aggregate(conn, "users", [])
+        sql = cur.execute.call_args[0][0]
+        assert "SELECT _id, data, created_at FROM users" in sql
+        assert "WHERE" not in sql
+        assert "GROUP BY" not in sql
+        assert result == [{"_id": "id1", "data": {"a": 1}, "created_at": "ts"}]
