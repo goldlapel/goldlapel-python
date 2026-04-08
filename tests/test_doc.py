@@ -18,6 +18,7 @@ from goldlapel.utils import (
     _build_filter,
     _build_project,
     _field_path,
+    _expand_dot_keys,
 )
 
 
@@ -933,3 +934,53 @@ class TestFilterOperators:
     def test_unsupported_op(self):
         with pytest.raises(ValueError, match="Unsupported filter operator"):
             _build_filter({"x": {"$foo": 1}})
+
+
+# ---------------------------------------------------------------------------
+# Dot notation expansion in plain containment filters
+# ---------------------------------------------------------------------------
+
+class TestDotNotationExpansion:
+    def test_dot_single_level(self):
+        result = _expand_dot_keys({"addr.city": "NY"})
+        assert result == {"addr": {"city": "NY"}}
+
+    def test_dot_deep_nesting(self):
+        result = _expand_dot_keys({"a.b.c": 1})
+        assert result == {"a": {"b": {"c": 1}}}
+
+    def test_dot_mixed_with_plain(self):
+        result = _expand_dot_keys({"status": "active", "addr.city": "NY"})
+        assert result == {"status": "active", "addr": {"city": "NY"}}
+
+    def test_dot_merge_siblings(self):
+        result = _expand_dot_keys({"a.b": 1, "a.c": 2})
+        assert result == {"a": {"b": 1, "c": 2}}
+
+    def test_no_dots_unchanged(self):
+        result = _expand_dot_keys({"status": "active"})
+        assert result == {"status": "active"}
+
+    def test_dot_with_operators(self):
+        clause, params = _build_filter({"addr.city": "NY", "age": {"$gt": 25}})
+        assert "data @> %s::jsonb" in clause
+        containment_json = params[0]
+        assert json.loads(containment_json) == {"addr": {"city": "NY"}}
+        assert "::numeric >" in clause
+        assert 25 in params
+
+    def test_dot_in_doc_find(self):
+        conn, cur = capture_sql(fetchall_result=[])
+        doc_find(conn, "users", filter={"addr.city": "NY"})
+        sql = cur.execute.call_args[0][0]
+        params = cur.execute.call_args[0][1]
+        assert "WHERE data @> %s::jsonb" in sql
+        assert json.loads(params[0]) == {"addr": {"city": "NY"}}
+
+    def test_dot_in_doc_count(self):
+        conn, cur = capture_sql(fetchone_result=(3,))
+        doc_count(conn, "users", filter={"addr.city": "NY"})
+        sql = cur.execute.call_args[0][0]
+        params = cur.execute.call_args[0][1]
+        assert "WHERE data @> %s::jsonb" in sql
+        assert json.loads(params[0]) == {"addr": {"city": "NY"}}

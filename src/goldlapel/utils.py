@@ -921,6 +921,19 @@ def _field_path(key):
     return arrow_chain
 
 
+def _expand_dot_keys(d):
+    result = {}
+    for key, value in d.items():
+        parts = key.split('.')
+        current = result
+        for part in parts[:-1]:
+            if part not in current:
+                current[part] = {}
+            current = current[part]
+        current[parts[-1]] = value
+    return result
+
+
 def _build_filter(filter_dict):
     if not filter_dict:
         return "", []
@@ -966,7 +979,7 @@ def _build_filter(filter_dict):
     all_params = []
     if containment:
         all_clauses.append("data @> %s::jsonb")
-        all_params.append(json.dumps(containment))
+        all_params.append(json.dumps(_expand_dot_keys(containment)))
     all_clauses.extend(clauses)
     all_params.extend(params)
     return " AND ".join(all_clauses), all_params
