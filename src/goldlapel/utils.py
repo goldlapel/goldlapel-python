@@ -1175,7 +1175,7 @@ def doc_create_index(conn, collection, keys=None):
 
 def _build_group(group):
     _CAST_ACCUMULATORS = {"$avg", "$min", "$max", "$sum"}
-    _SUPPORTED_ACCUMULATORS = _CAST_ACCUMULATORS | {"$count"}
+    _SUPPORTED_ACCUMULATORS = _CAST_ACCUMULATORS | {"$count", "$push", "$addToSet"}
     select_parts = []
     group_by = None
     group_id = group.get("_id")
@@ -1185,6 +1185,22 @@ def _build_group(group):
             raise ValueError(f"Invalid field name: {field}")
         select_parts.append(f"data->>'{field}' AS _id")
         group_by = f"data->>'{field}'"
+    elif isinstance(group_id, dict):
+        if not group_id:
+            raise ValueError("Composite _id must have at least one field")
+        parts_select = []
+        parts_group = []
+        for alias, ref in group_id.items():
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', alias):
+                raise ValueError(f"Invalid alias: {alias}")
+            if not isinstance(ref, str) or not ref.startswith("$"):
+                raise ValueError(f"Invalid field reference: {ref}")
+            field = ref[1:]
+            expr = _field_path(field)
+            parts_select.append(f"'{alias}', {expr}")
+            parts_group.append(expr)
+        select_parts.append(f"json_build_object({', '.join(parts_select)}) AS _id")
+        group_by = ", ".join(parts_group)
     elif group_id is None:
         pass
     for alias, expr in group.items():
@@ -1230,6 +1246,22 @@ def _build_group(group):
                 if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
                     raise ValueError(f"Invalid field name: {field}")
                 select_parts.append(f"MAX((data->>'{field}')::numeric) AS {alias}")
+        elif op == "$push":
+            if isinstance(val, str) and val.startswith("$"):
+                field = val[1:]
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
+                    raise ValueError(f"Invalid field name: {field}")
+                select_parts.append(f"array_agg(data->>'{field}') AS {alias}")
+            else:
+                raise ValueError(f"Invalid $push value: {val}")
+        elif op == "$addToSet":
+            if isinstance(val, str) and val.startswith("$"):
+                field = val[1:]
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
+                    raise ValueError(f"Invalid field name: {field}")
+                select_parts.append(f"array_agg(DISTINCT data->>'{field}') AS {alias}")
+            else:
+                raise ValueError(f"Invalid $addToSet value: {val}")
     return select_parts, group_by
 
 

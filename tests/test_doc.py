@@ -546,7 +546,7 @@ class TestDocAggregate:
         conn, _ = capture_sql()
         with pytest.raises(ValueError, match="Unsupported accumulator"):
             doc_aggregate(conn, "users", [
-                {"$group": {"_id": "$category", "items": {"$push": "$name"}}},
+                {"$group": {"_id": "$category", "items": {"$first": "$name"}}},
             ])
 
     def test_invalid_field(self):
@@ -566,6 +566,100 @@ class TestDocAggregate:
         assert "WHERE" not in sql
         assert "GROUP BY" not in sql
         assert result == [{"_id": "id1", "data": {"a": 1}, "created_at": "ts"}]
+
+    def test_composite_id(self):
+        conn, cur = capture_sql(
+            fetchall_result=[('{"region":"us","type":"pro"}', 3)],
+            description=[("_id",), ("count",)],
+        )
+        doc_aggregate(conn, "orders", [
+            {"$group": {
+                "_id": {"region": "$region", "type": "$type"},
+                "count": {"$sum": 1},
+            }},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "json_build_object(" in sql
+        assert "'region', data->>'region'" in sql
+        assert "'type', data->>'type'" in sql
+        assert "GROUP BY data->>'region', data->>'type'" in sql
+
+    def test_composite_id_dot_notation(self):
+        conn, cur = capture_sql(
+            fetchall_result=[('{"city":"NY"}', 1)],
+            description=[("_id",), ("count",)],
+        )
+        doc_aggregate(conn, "users", [
+            {"$group": {
+                "_id": {"city": "$addr.city"},
+                "count": {"$sum": 1},
+            }},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "json_build_object(" in sql
+        assert "'city', data->'addr'->>'city'" in sql
+        assert "GROUP BY data->'addr'->>'city'" in sql
+
+    def test_composite_id_invalid_ref(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Invalid field reference"):
+            doc_aggregate(conn, "users", [
+                {"$group": {"_id": {"x": "not_a_ref"}, "count": {"$sum": 1}}},
+            ])
+
+    def test_composite_id_invalid_alias(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Invalid alias"):
+            doc_aggregate(conn, "users", [
+                {"$group": {"_id": {"bad;name": "$field"}, "count": {"$sum": 1}}},
+            ])
+
+    def test_push_accumulator(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("electronics", ["tv", "phone"])],
+            description=[("_id",), ("tags",)],
+        )
+        doc_aggregate(conn, "products", [
+            {"$group": {"_id": "$category", "tags": {"$push": "$tag"}}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "array_agg(data->>'tag') AS tags" in sql
+
+    def test_addtoset_accumulator(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("electronics", ["tv", "phone"])],
+            description=[("_id",), ("cats",)],
+        )
+        doc_aggregate(conn, "products", [
+            {"$group": {"_id": "$category", "cats": {"$addToSet": "$cat"}}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "array_agg(DISTINCT data->>'cat') AS cats" in sql
+
+    def test_single_id_unchanged(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("electronics", 5)],
+            description=[("_id",), ("count",)],
+        )
+        doc_aggregate(conn, "products", [
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "data->>'category' AS _id" in sql
+        assert "GROUP BY data->>'category'" in sql
+        assert "json_build_object" not in sql
+
+    def test_null_id_unchanged(self):
+        conn, cur = capture_sql(
+            fetchall_result=[(100,)],
+            description=[("total",)],
+        )
+        doc_aggregate(conn, "orders", [
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "GROUP BY" not in sql
+        assert "json_build_object" not in sql
 
 
 # ---------------------------------------------------------------------------
