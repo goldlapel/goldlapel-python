@@ -898,6 +898,80 @@ def explain_score(conn, table, column, query, id_column, id_value, lang='english
     return dict(zip(cols, row))
 
 
+_FIELD_PART_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+_COMPARISON_OPS = {
+    "$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<=",
+    "$eq": "=", "$ne": "!=",
+}
+_SUPPORTED_FILTER_OPS = set(_COMPARISON_OPS) | {"$in", "$nin", "$exists", "$regex"}
+
+
+def _field_path(key):
+    parts = key.split(".")
+    for part in parts:
+        if not _FIELD_PART_RE.match(part):
+            raise ValueError(f"Invalid filter key: {key}")
+    if len(parts) == 1:
+        return f"data->>'{parts[0]}'"
+    arrow_chain = "data"
+    for part in parts[:-1]:
+        arrow_chain += f"->'{part}'"
+    arrow_chain += f"->>'{parts[-1]}'"
+    return arrow_chain
+
+
+def _build_filter(filter_dict):
+    if not filter_dict:
+        return "", []
+    containment = {}
+    clauses = []
+    params = []
+    for key, value in filter_dict.items():
+        if isinstance(value, dict) and any(k.startswith("$") for k in value):
+            field_expr = _field_path(key)
+            for op, operand in value.items():
+                if op in _COMPARISON_OPS:
+                    sql_op = _COMPARISON_OPS[op]
+                    if isinstance(operand, (int, float)):
+                        clauses.append(f"({field_expr})::numeric {sql_op} %s")
+                        params.append(operand)
+                    else:
+                        clauses.append(f"{field_expr} {sql_op} %s")
+                        params.append(str(operand))
+                elif op == "$in":
+                    placeholders = ", ".join(["%s"] * len(operand))
+                    clauses.append(f"{field_expr} IN ({placeholders})")
+                    params.extend(str(v) for v in operand)
+                elif op == "$nin":
+                    placeholders = ", ".join(["%s"] * len(operand))
+                    clauses.append(f"{field_expr} NOT IN ({placeholders})")
+                    params.extend(str(v) for v in operand)
+                elif op == "$exists":
+                    parts = key.split(".")
+                    top_key = parts[0]
+                    if operand:
+                        clauses.append("data ? %s")
+                    else:
+                        clauses.append("NOT (data ? %s)")
+                    params.append(top_key)
+                elif op == "$regex":
+                    clauses.append(f"{field_expr} ~ %s")
+                    params.append(operand)
+                else:
+                    raise ValueError(f"Unsupported filter operator: {op}")
+        else:
+            containment[key] = value
+    all_clauses = []
+    all_params = []
+    if containment:
+        all_clauses.append("data @> %s::jsonb")
+        all_params.append(json.dumps(containment))
+    all_clauses.extend(clauses)
+    all_params.extend(params)
+    return " AND ".join(all_clauses), all_params
+
+
 def _ensure_collection(cur, collection):
     cur.execute(
         f"CREATE TABLE IF NOT EXISTS {collection} ("
@@ -947,9 +1021,10 @@ def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None):
     cur = raw.cursor()
     sql = f"SELECT _id, data, created_at FROM {collection}"
     params = []
-    if filter:
-        sql += " WHERE data @> %s::jsonb"
-        params.append(json.dumps(filter))
+    where_clause, filter_params = _build_filter(filter)
+    if where_clause:
+        sql += " WHERE " + where_clause
+        params.extend(filter_params)
     if sort:
         order_parts = []
         for key, direction in sort.items():
@@ -976,9 +1051,10 @@ def doc_find_one(conn, collection, filter=None):
     cur = raw.cursor()
     sql = f"SELECT _id, data, created_at FROM {collection}"
     params = []
-    if filter:
-        sql += " WHERE data @> %s::jsonb"
-        params.append(json.dumps(filter))
+    where_clause, filter_params = _build_filter(filter)
+    if where_clause:
+        sql += " WHERE " + where_clause
+        params.extend(filter_params)
     sql += " LIMIT 1"
     cur.execute(sql, tuple(params))
     cols = [desc[0] for desc in cur.description]
@@ -993,10 +1069,13 @@ def doc_update(conn, collection, filter, update):
     _validate_identifier(collection)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(
-        f"UPDATE {collection} SET data = data || %s::jsonb WHERE data @> %s::jsonb",
-        (json.dumps(update), json.dumps(filter)),
-    )
+    where_clause, filter_params = _build_filter(filter)
+    sql = f"UPDATE {collection} SET data = data || %s::jsonb"
+    params = [json.dumps(update)]
+    if where_clause:
+        sql += " WHERE " + where_clause
+        params.extend(filter_params)
+    cur.execute(sql, tuple(params))
     rowcount = cur.rowcount
     raw.commit()
     cur.close()
@@ -1007,11 +1086,17 @@ def doc_update_one(conn, collection, filter, update):
     _validate_identifier(collection)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(
-        f"WITH target AS (SELECT _id FROM {collection} WHERE data @> %s::jsonb LIMIT 1) "
-        f"UPDATE {collection} SET data = data || %s::jsonb FROM target WHERE {collection}._id = target._id",
-        (json.dumps(filter), json.dumps(update)),
+    where_clause, filter_params = _build_filter(filter)
+    if where_clause:
+        cte_where = " WHERE " + where_clause
+    else:
+        cte_where = ""
+    sql = (
+        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
+        f"UPDATE {collection} SET data = data || %s::jsonb FROM target WHERE {collection}._id = target._id"
     )
+    params = list(filter_params) + [json.dumps(update)]
+    cur.execute(sql, tuple(params))
     rowcount = cur.rowcount
     raw.commit()
     cur.close()
@@ -1022,10 +1107,11 @@ def doc_delete(conn, collection, filter):
     _validate_identifier(collection)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(
-        f"DELETE FROM {collection} WHERE data @> %s::jsonb",
-        (json.dumps(filter),),
-    )
+    where_clause, filter_params = _build_filter(filter)
+    sql = f"DELETE FROM {collection}"
+    if where_clause:
+        sql += " WHERE " + where_clause
+    cur.execute(sql, tuple(filter_params))
     rowcount = cur.rowcount
     raw.commit()
     cur.close()
@@ -1036,10 +1122,15 @@ def doc_delete_one(conn, collection, filter):
     _validate_identifier(collection)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
+    where_clause, filter_params = _build_filter(filter)
+    if where_clause:
+        cte_where = " WHERE " + where_clause
+    else:
+        cte_where = ""
     cur.execute(
-        f"WITH target AS (SELECT _id FROM {collection} WHERE data @> %s::jsonb LIMIT 1) "
+        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
         f"DELETE FROM {collection} USING target WHERE {collection}._id = target._id",
-        (json.dumps(filter),),
+        tuple(filter_params),
     )
     rowcount = cur.rowcount
     raw.commit()
@@ -1053,9 +1144,10 @@ def doc_count(conn, collection, filter=None):
     cur = raw.cursor()
     sql = f"SELECT COUNT(*) FROM {collection}"
     params = []
-    if filter:
-        sql += " WHERE data @> %s::jsonb"
-        params.append(json.dumps(filter))
+    where_clause, filter_params = _build_filter(filter)
+    if where_clause:
+        sql += " WHERE " + where_clause
+        params.extend(filter_params)
     cur.execute(sql, tuple(params))
     result = cur.fetchone()[0]
     cur.close()
@@ -1172,9 +1264,10 @@ def doc_aggregate(conn, collection, pipeline):
     else:
         sql = f"SELECT _id, data, created_at FROM {collection}"
         group_by = None
-    if match_filter:
-        sql += " WHERE data @> %s::jsonb"
-        params.append(json.dumps(match_filter))
+    where_clause, filter_params = _build_filter(match_filter)
+    if where_clause:
+        sql += " WHERE " + where_clause
+        params.extend(filter_params)
     if group_by:
         sql += f" GROUP BY {group_by}"
     if sort_stage:

@@ -15,6 +15,8 @@ from goldlapel.utils import (
     doc_count,
     doc_create_index,
     doc_aggregate,
+    _build_filter,
+    _field_path,
 )
 
 
@@ -564,3 +566,91 @@ class TestDocAggregate:
         assert "WHERE" not in sql
         assert "GROUP BY" not in sql
         assert result == [{"_id": "id1", "data": {"a": 1}, "created_at": "ts"}]
+
+
+# ---------------------------------------------------------------------------
+# 12. Filter operators (_build_filter / _field_path)
+# ---------------------------------------------------------------------------
+
+class TestFilterOperators:
+    def test_gt_numeric(self):
+        clause, params = _build_filter({"age": {"$gt": 25}})
+        assert "::numeric" in clause
+        assert ">" in clause
+        assert params == [25]
+
+    def test_lte_string(self):
+        clause, params = _build_filter({"name": {"$lte": "M"}})
+        assert "::numeric" not in clause
+        assert "<=" in clause
+        assert params == ["M"]
+
+    def test_in(self):
+        clause, params = _build_filter({"status": {"$in": ["a", "b"]}})
+        assert "IN (%s, %s)" in clause
+        assert params == ["a", "b"]
+
+    def test_nin(self):
+        clause, params = _build_filter({"status": {"$nin": ["x"]}})
+        assert "NOT IN (%s)" in clause
+        assert params == ["x"]
+
+    def test_exists_true(self):
+        clause, params = _build_filter({"email": {"$exists": True}})
+        assert "data ? %s" in clause
+        assert "NOT" not in clause
+        assert params == ["email"]
+
+    def test_exists_false(self):
+        clause, params = _build_filter({"email": {"$exists": False}})
+        assert "NOT (data ? %s)" in clause
+        assert params == ["email"]
+
+    def test_regex(self):
+        clause, params = _build_filter({"name": {"$regex": "^J"}})
+        assert "~ %s" in clause
+        assert params == ["^J"]
+
+    def test_eq_ne(self):
+        clause, params = _build_filter({"x": {"$eq": "a"}, "y": {"$ne": "b"}})
+        assert "= %s" in clause
+        assert "!= %s" in clause
+        assert "a" in params
+        assert "b" in params
+
+    def test_mixed(self):
+        clause, params = _build_filter({"active": True, "age": {"$gt": 18}})
+        assert "data @> %s::jsonb" in clause
+        assert "::numeric >" in clause
+        assert params[0] == json.dumps({"active": True})
+        assert params[1] == 18
+
+    def test_dot_notation(self):
+        clause, params = _build_filter({"addr.city": {"$eq": "NY"}})
+        assert "data->'addr'->>'city'" in clause
+        assert params == ["NY"]
+
+    def test_range(self):
+        clause, params = _build_filter({"age": {"$gte": 18, "$lt": 65}})
+        assert ">=" in clause
+        assert "<" in clause
+        assert 18 in params
+        assert 65 in params
+
+    def test_plain_unchanged(self):
+        clause, params = _build_filter({"status": "active"})
+        assert clause == "data @> %s::jsonb"
+        assert params == [json.dumps({"status": "active"})]
+
+    def test_empty_unchanged(self):
+        clause, params = _build_filter(None)
+        assert clause == ""
+        assert params == []
+
+    def test_invalid_key(self):
+        with pytest.raises(ValueError, match="Invalid filter key"):
+            _build_filter({"bad;key": {"$gt": 1}})
+
+    def test_unsupported_op(self):
+        with pytest.raises(ValueError, match="Unsupported filter operator"):
+            _build_filter({"x": {"$foo": 1}})
