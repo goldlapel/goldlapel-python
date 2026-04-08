@@ -51,6 +51,15 @@ _instances = {}
 _cleanup_registered = False
 _lock = threading.Lock()
 _next_port = DEFAULT_PORT
+_utils_mod = None
+
+
+def _utils():
+    global _utils_mod
+    if _utils_mod is None:
+        from goldlapel import utils
+        _utils_mod = utils
+    return _utils_mod
 
 
 def _config_to_args(config):
@@ -217,6 +226,7 @@ class GoldLapel:
         self._extra_args = extra_args or []
         self._process = None
         self._proxy_url = None
+        self._conn = None
 
     def start(self):
         if self._process and self._process.poll() is None:
@@ -254,6 +264,16 @@ class GoldLapel:
         self._process.stderr.close()
         self._proxy_url = _make_proxy_url(self._upstream, self._port)
 
+        driver_name, driver = _detect_sync_driver()
+        if driver is not None:
+            if driver_name == "psycopg3":
+                raw_conn = driver.connect(self._proxy_url, autocommit=True)
+            else:
+                raw_conn = driver.connect(self._proxy_url)
+            from goldlapel.wrap import wrap
+            inv_port = int((self._config or {}).get("invalidation_port", self._port + 2))
+            self._conn = wrap(raw_conn, invalidation_port=inv_port)
+
         if self._dashboard_port:
             print(f"goldlapel → :{self._port} (proxy) | http://127.0.0.1:{self._dashboard_port} (dashboard)")
         else:
@@ -262,6 +282,12 @@ class GoldLapel:
         return self._proxy_url
 
     def stop(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
         if self._process and self._process.poll() is None:
             self._process.terminate()
             try:
@@ -271,6 +297,12 @@ class GoldLapel:
                 self._process.wait()
         self._process = None
         self._proxy_url = None
+
+    @property
+    def conn(self):
+        if self._conn is None:
+            raise RuntimeError("Not connected. Call start() first.")
+        return self._conn
 
     @property
     def url(self):
@@ -285,6 +317,178 @@ class GoldLapel:
     @property
     def running(self):
         return self._process is not None and self._process.poll() is None
+
+    # -- Document store --------------------------------------------------------
+
+    def doc_insert(self, *args, **kwargs):
+        return _utils().doc_insert(self.conn, *args, **kwargs)
+
+    def doc_insert_many(self, *args, **kwargs):
+        return _utils().doc_insert_many(self.conn, *args, **kwargs)
+
+    def doc_find(self, *args, **kwargs):
+        return _utils().doc_find(self.conn, *args, **kwargs)
+
+    def doc_find_one(self, *args, **kwargs):
+        return _utils().doc_find_one(self.conn, *args, **kwargs)
+
+    def doc_update(self, *args, **kwargs):
+        return _utils().doc_update(self.conn, *args, **kwargs)
+
+    def doc_update_one(self, *args, **kwargs):
+        return _utils().doc_update_one(self.conn, *args, **kwargs)
+
+    def doc_delete(self, *args, **kwargs):
+        return _utils().doc_delete(self.conn, *args, **kwargs)
+
+    def doc_delete_one(self, *args, **kwargs):
+        return _utils().doc_delete_one(self.conn, *args, **kwargs)
+
+    def doc_count(self, *args, **kwargs):
+        return _utils().doc_count(self.conn, *args, **kwargs)
+
+    def doc_create_index(self, *args, **kwargs):
+        return _utils().doc_create_index(self.conn, *args, **kwargs)
+
+    def doc_aggregate(self, *args, **kwargs):
+        return _utils().doc_aggregate(self.conn, *args, **kwargs)
+
+    # -- Search ----------------------------------------------------------------
+
+    def search(self, *args, **kwargs):
+        return _utils().search(self.conn, *args, **kwargs)
+
+    def search_fuzzy(self, *args, **kwargs):
+        return _utils().search_fuzzy(self.conn, *args, **kwargs)
+
+    def search_phonetic(self, *args, **kwargs):
+        return _utils().search_phonetic(self.conn, *args, **kwargs)
+
+    def similar(self, *args, **kwargs):
+        return _utils().similar(self.conn, *args, **kwargs)
+
+    def suggest(self, *args, **kwargs):
+        return _utils().suggest(self.conn, *args, **kwargs)
+
+    def facets(self, *args, **kwargs):
+        return _utils().facets(self.conn, *args, **kwargs)
+
+    def aggregate(self, *args, **kwargs):
+        return _utils().aggregate(self.conn, *args, **kwargs)
+
+    def create_search_config(self, *args, **kwargs):
+        return _utils().create_search_config(self.conn, *args, **kwargs)
+
+    # -- Pub/sub & queues ------------------------------------------------------
+
+    def publish(self, *args, **kwargs):
+        return _utils().publish(self.conn, *args, **kwargs)
+
+    def subscribe(self, *args, **kwargs):
+        return _utils().subscribe(self.conn, *args, **kwargs)
+
+    def enqueue(self, *args, **kwargs):
+        return _utils().enqueue(self.conn, *args, **kwargs)
+
+    def dequeue(self, *args, **kwargs):
+        return _utils().dequeue(self.conn, *args, **kwargs)
+
+    # -- Counters --------------------------------------------------------------
+
+    def incr(self, *args, **kwargs):
+        return _utils().incr(self.conn, *args, **kwargs)
+
+    def get_counter(self, *args, **kwargs):
+        return _utils().get_counter(self.conn, *args, **kwargs)
+
+    # -- Hashes ----------------------------------------------------------------
+
+    def hset(self, *args, **kwargs):
+        return _utils().hset(self.conn, *args, **kwargs)
+
+    def hget(self, *args, **kwargs):
+        return _utils().hget(self.conn, *args, **kwargs)
+
+    def hgetall(self, *args, **kwargs):
+        return _utils().hgetall(self.conn, *args, **kwargs)
+
+    def hdel(self, *args, **kwargs):
+        return _utils().hdel(self.conn, *args, **kwargs)
+
+    # -- Sorted sets -----------------------------------------------------------
+
+    def zadd(self, *args, **kwargs):
+        return _utils().zadd(self.conn, *args, **kwargs)
+
+    def zincrby(self, *args, **kwargs):
+        return _utils().zincrby(self.conn, *args, **kwargs)
+
+    def zrange(self, *args, **kwargs):
+        return _utils().zrange(self.conn, *args, **kwargs)
+
+    def zrank(self, *args, **kwargs):
+        return _utils().zrank(self.conn, *args, **kwargs)
+
+    def zscore(self, *args, **kwargs):
+        return _utils().zscore(self.conn, *args, **kwargs)
+
+    def zrem(self, *args, **kwargs):
+        return _utils().zrem(self.conn, *args, **kwargs)
+
+    # -- Geo -------------------------------------------------------------------
+
+    def georadius(self, *args, **kwargs):
+        return _utils().georadius(self.conn, *args, **kwargs)
+
+    def geoadd(self, *args, **kwargs):
+        return _utils().geoadd(self.conn, *args, **kwargs)
+
+    def geodist(self, *args, **kwargs):
+        return _utils().geodist(self.conn, *args, **kwargs)
+
+    # -- Misc ------------------------------------------------------------------
+
+    def count_distinct(self, *args, **kwargs):
+        return _utils().count_distinct(self.conn, *args, **kwargs)
+
+    def script(self, *args, **kwargs):
+        return _utils().script(self.conn, *args, **kwargs)
+
+    # -- Streams ---------------------------------------------------------------
+
+    def stream_add(self, *args, **kwargs):
+        return _utils().stream_add(self.conn, *args, **kwargs)
+
+    def stream_create_group(self, *args, **kwargs):
+        return _utils().stream_create_group(self.conn, *args, **kwargs)
+
+    def stream_read(self, *args, **kwargs):
+        return _utils().stream_read(self.conn, *args, **kwargs)
+
+    def stream_ack(self, *args, **kwargs):
+        return _utils().stream_ack(self.conn, *args, **kwargs)
+
+    def stream_claim(self, *args, **kwargs):
+        return _utils().stream_claim(self.conn, *args, **kwargs)
+
+    # -- Percolator ------------------------------------------------------------
+
+    def percolate_add(self, *args, **kwargs):
+        return _utils().percolate_add(self.conn, *args, **kwargs)
+
+    def percolate(self, *args, **kwargs):
+        return _utils().percolate(self.conn, *args, **kwargs)
+
+    def percolate_delete(self, *args, **kwargs):
+        return _utils().percolate_delete(self.conn, *args, **kwargs)
+
+    # -- Analysis --------------------------------------------------------------
+
+    def analyze(self, *args, **kwargs):
+        return _utils().analyze(self.conn, *args, **kwargs)
+
+    def explain_score(self, *args, **kwargs):
+        return _utils().explain_score(self.conn, *args, **kwargs)
 
 
 def _ensure_running(upstream, config=None, port=None, extra_args=None):
