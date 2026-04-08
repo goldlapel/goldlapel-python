@@ -1173,7 +1173,37 @@ def doc_create_index(conn, collection, keys=None):
     cur.close()
 
 
-def _build_group(group):
+def _resolve_field(field, unwind_map=None):
+    if unwind_map and field in unwind_map:
+        return unwind_map[field]
+    return _field_path(field)
+
+
+def _build_project(project, group_aliases=None):
+    select_parts = []
+    for key, val in project.items():
+        if key == "_id" and val == 0:
+            continue
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', key):
+            raise ValueError(f"Invalid field name: {key}")
+        if val == 1:
+            if group_aliases and key in group_aliases:
+                select_parts.append(key)
+            else:
+                select_parts.append(f"data->>'{key}' AS {key}")
+        elif isinstance(val, str) and val.startswith("$"):
+            field = val[1:]
+            if group_aliases and field in group_aliases:
+                select_parts.append(f"{field} AS {key}")
+            else:
+                expr = _field_path(field)
+                select_parts.append(f"{expr} AS {key}")
+        else:
+            raise ValueError(f"Invalid $project value for {key}: {val}")
+    return select_parts
+
+
+def _build_group(group, unwind_map=None):
     _CAST_ACCUMULATORS = {"$avg", "$min", "$max", "$sum"}
     _SUPPORTED_ACCUMULATORS = _CAST_ACCUMULATORS | {"$count", "$push", "$addToSet"}
     select_parts = []
@@ -1183,8 +1213,9 @@ def _build_group(group):
         field = group_id[1:]
         if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
             raise ValueError(f"Invalid field name: {field}")
-        select_parts.append(f"data->>'{field}' AS _id")
-        group_by = f"data->>'{field}'"
+        resolved = _resolve_field(field, unwind_map)
+        select_parts.append(f"{resolved} AS _id")
+        group_by = resolved
     elif isinstance(group_id, dict):
         if not group_id:
             raise ValueError("Composite _id must have at least one field")
@@ -1196,7 +1227,7 @@ def _build_group(group):
             if not isinstance(ref, str) or not ref.startswith("$"):
                 raise ValueError(f"Invalid field reference: {ref}")
             field = ref[1:]
-            expr = _field_path(field)
+            expr = _resolve_field(field, unwind_map)
             parts_select.append(f"'{alias}', {expr}")
             parts_group.append(expr)
         select_parts.append(f"json_build_object({', '.join(parts_select)}) AS _id")
@@ -1223,7 +1254,11 @@ def _build_group(group):
                 field = val[1:]
                 if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
                     raise ValueError(f"Invalid field name: {field}")
-                select_parts.append(f"SUM((data->>'{field}')::numeric) AS {alias}")
+                resolved = _resolve_field(field, unwind_map)
+                if unwind_map and field in unwind_map:
+                    select_parts.append(f"SUM({resolved}::numeric) AS {alias}")
+                else:
+                    select_parts.append(f"SUM(({resolved})::numeric) AS {alias}")
             elif isinstance(val, (int, float)):
                 select_parts.append(f"SUM({val}) AS {alias}")
             else:
@@ -1233,25 +1268,38 @@ def _build_group(group):
                 field = val[1:]
                 if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
                     raise ValueError(f"Invalid field name: {field}")
-                select_parts.append(f"AVG((data->>'{field}')::numeric) AS {alias}")
+                resolved = _resolve_field(field, unwind_map)
+                if unwind_map and field in unwind_map:
+                    select_parts.append(f"AVG({resolved}::numeric) AS {alias}")
+                else:
+                    select_parts.append(f"AVG(({resolved})::numeric) AS {alias}")
         elif op == "$min":
             if isinstance(val, str) and val.startswith("$"):
                 field = val[1:]
                 if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
                     raise ValueError(f"Invalid field name: {field}")
-                select_parts.append(f"MIN((data->>'{field}')::numeric) AS {alias}")
+                resolved = _resolve_field(field, unwind_map)
+                if unwind_map and field in unwind_map:
+                    select_parts.append(f"MIN({resolved}::numeric) AS {alias}")
+                else:
+                    select_parts.append(f"MIN(({resolved})::numeric) AS {alias}")
         elif op == "$max":
             if isinstance(val, str) and val.startswith("$"):
                 field = val[1:]
                 if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
                     raise ValueError(f"Invalid field name: {field}")
-                select_parts.append(f"MAX((data->>'{field}')::numeric) AS {alias}")
+                resolved = _resolve_field(field, unwind_map)
+                if unwind_map and field in unwind_map:
+                    select_parts.append(f"MAX({resolved}::numeric) AS {alias}")
+                else:
+                    select_parts.append(f"MAX(({resolved})::numeric) AS {alias}")
         elif op == "$push":
             if isinstance(val, str) and val.startswith("$"):
                 field = val[1:]
                 if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
                     raise ValueError(f"Invalid field name: {field}")
-                select_parts.append(f"array_agg(data->>'{field}') AS {alias}")
+                resolved = _resolve_field(field, unwind_map)
+                select_parts.append(f"array_agg({resolved}) AS {alias}")
             else:
                 raise ValueError(f"Invalid $push value: {val}")
         elif op == "$addToSet":
@@ -1259,7 +1307,8 @@ def _build_group(group):
                 field = val[1:]
                 if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
                     raise ValueError(f"Invalid field name: {field}")
-                select_parts.append(f"array_agg(DISTINCT data->>'{field}') AS {alias}")
+                resolved = _resolve_field(field, unwind_map)
+                select_parts.append(f"array_agg(DISTINCT {resolved}) AS {alias}")
             else:
                 raise ValueError(f"Invalid $addToSet value: {val}")
     return select_parts, group_by
@@ -1269,12 +1318,18 @@ def doc_aggregate(conn, collection, pipeline):
     _validate_identifier(collection)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    _SUPPORTED_STAGES = {"$match", "$group", "$sort", "$limit", "$skip"}
+    _SUPPORTED_STAGES = {
+        "$match", "$group", "$sort", "$limit", "$skip",
+        "$project", "$unwind", "$lookup",
+    }
     match_filter = None
     group_stage = None
     sort_stage = None
     limit_val = None
     skip_val = None
+    project_stage = None
+    unwind_stages = []
+    lookup_stages = []
     for stage in pipeline:
         key = next(iter(stage))
         if key not in _SUPPORTED_STAGES:
@@ -1289,13 +1344,107 @@ def doc_aggregate(conn, collection, pipeline):
             limit_val = stage[key]
         elif key == "$skip":
             skip_val = stage[key]
+        elif key == "$project":
+            project_stage = stage[key]
+        elif key == "$unwind":
+            spec = stage[key]
+            if isinstance(spec, str):
+                path = spec
+            elif isinstance(spec, dict):
+                path = spec.get("path", "")
+            else:
+                raise ValueError(f"Invalid $unwind value: {spec}")
+            if not isinstance(path, str) or not path.startswith("$"):
+                raise ValueError(
+                    f"$unwind path must be a string starting with '$': {path}"
+                )
+            field = path[1:]
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', field):
+                raise ValueError(f"Invalid field name: {field}")
+            unwind_stages.append(field)
+        elif key == "$lookup":
+            spec = stage[key]
+            for required in ("from", "localField", "foreignField", "as"):
+                if required not in spec:
+                    raise ValueError(
+                        f"$lookup missing required field: {required}"
+                    )
+            from_table = spec["from"]
+            _validate_identifier(from_table)
+            local_field = spec["localField"]
+            foreign_field = spec["foreignField"]
+            as_name = spec["as"]
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', local_field):
+                raise ValueError(f"Invalid field name: {local_field}")
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', foreign_field):
+                raise ValueError(f"Invalid field name: {foreign_field}")
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', as_name):
+                raise ValueError(f"Invalid identifier: {as_name}")
+            lookup_stages.append({
+                "from": from_table,
+                "localField": local_field,
+                "foreignField": foreign_field,
+                "as": as_name,
+            })
+
+    # Build unwind_map: field -> alias
+    unwind_map = {}
+    from_extras = []
+    for field in unwind_stages:
+        alias = f"_unwound_{field}"
+        unwind_map[field] = alias
+        from_extras.append(
+            f"jsonb_array_elements_text(data->'{field}') AS {alias}"
+        )
+
+    # Build SELECT
     params = []
+    group_by = None
     if group_stage:
-        select_parts, group_by = _build_group(group_stage)
-        sql = f"SELECT {', '.join(select_parts)} FROM {collection}"
+        _, group_by = _build_group(group_stage, unwind_map)
+    if project_stage:
+        group_aliases = None
+        if group_stage:
+            group_aliases = set()
+            for k in group_stage:
+                if k == "_id":
+                    group_aliases.add("_id")
+                else:
+                    group_aliases.add(k)
+        select_parts = _build_project(project_stage, group_aliases)
+    elif group_stage:
+        select_parts, group_by = _build_group(group_stage, unwind_map)
     else:
-        sql = f"SELECT _id, data, created_at FROM {collection}"
-        group_by = None
+        select_parts = ["_id", "data", "created_at"]
+
+    # Append $lookup subqueries to SELECT
+    for lookup in lookup_stages:
+        local_expr = _field_path(lookup["localField"])
+        foreign_parts = lookup["foreignField"].split(".")
+        for part in foreign_parts:
+            if not _FIELD_PART_RE.match(part):
+                raise ValueError(f"Invalid filter key: {lookup['foreignField']}")
+        if len(foreign_parts) == 1:
+            foreign_expr = f"b.data->>'{foreign_parts[0]}'"
+        else:
+            foreign_expr = "b.data"
+            for part in foreign_parts[:-1]:
+                foreign_expr += f"->'{part}'"
+            foreign_expr += f"->>'{foreign_parts[-1]}'"
+        subquery = (
+            f"COALESCE((SELECT json_agg(b.data) FROM {lookup['from']} b "
+            f"WHERE {foreign_expr} = {collection}.{local_expr}), '[]'::json) "
+            f"AS {lookup['as']}"
+        )
+        select_parts.append(subquery)
+
+    # Build FROM clause
+    from_clause = collection
+    for extra in from_extras:
+        from_clause += f", {extra}"
+
+    sql = f"SELECT {', '.join(select_parts)} FROM {from_clause}"
+
     where_clause, filter_params = _build_filter(match_filter)
     if where_clause:
         sql += " WHERE " + where_clause
@@ -1308,7 +1457,7 @@ def doc_aggregate(conn, collection, pipeline):
             if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
                 raise ValueError(f"Invalid sort key: {key}")
             dir_str = "ASC" if direction == 1 else "DESC"
-            if group_stage:
+            if group_stage or project_stage:
                 order_parts.append(f"{key} {dir_str}")
             else:
                 order_parts.append(f"data->>'{key}' {dir_str}")

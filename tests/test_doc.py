@@ -16,6 +16,7 @@ from goldlapel.utils import (
     doc_create_index,
     doc_aggregate,
     _build_filter,
+    _build_project,
     _field_path,
 )
 
@@ -540,7 +541,7 @@ class TestDocAggregate:
     def test_unsupported_stage(self):
         conn, _ = capture_sql()
         with pytest.raises(ValueError, match="Unsupported pipeline stage"):
-            doc_aggregate(conn, "users", [{"$lookup": {}}])
+            doc_aggregate(conn, "users", [{"$redact": {}}])
 
     def test_unsupported_accumulator(self):
         conn, _ = capture_sql()
@@ -663,7 +664,191 @@ class TestDocAggregate:
 
 
 # ---------------------------------------------------------------------------
-# 12. Filter operators (_build_filter / _field_path)
+# 12. $project / $unwind / $lookup pipeline stages
+# ---------------------------------------------------------------------------
+
+class TestProjectStage:
+    def test_project_include(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("alice", "active")],
+            description=[("name",), ("status",)],
+        )
+        doc_aggregate(conn, "users", [
+            {"$project": {"name": 1, "status": 1}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "data->>'name' AS name" in sql
+        assert "data->>'status' AS status" in sql
+
+    def test_project_exclude_id(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("alice",)],
+            description=[("name",)],
+        )
+        doc_aggregate(conn, "users", [
+            {"$project": {"_id": 0, "name": 1}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "_id" not in sql or "data->>'name' AS name" in sql
+        assert "AS _id" not in sql
+
+    def test_project_rename(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("alice",)],
+            description=[("fullName",)],
+        )
+        doc_aggregate(conn, "users", [
+            {"$project": {"fullName": "$name"}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "data->>'name' AS fullName" in sql
+
+    def test_project_after_group(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("electronics", 5)],
+            description=[("_id",), ("count",)],
+        )
+        doc_aggregate(conn, "products", [
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+            {"$project": {"_id": 1, "count": 1}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        # $project after $group should pass through aliases, not data->>
+        assert "data->>'_id'" not in sql
+        assert "data->>'count'" not in sql
+        # The select should reference the group aliases directly
+        assert "_id" in sql
+        assert "count" in sql
+        # GROUP BY should still be present from $group
+        assert "GROUP BY" in sql
+
+    def test_project_dot_notation(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("NY",)],
+            description=[("city",)],
+        )
+        doc_aggregate(conn, "users", [
+            {"$project": {"city": "$addr.city"}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "data->'addr'->>'city' AS city" in sql
+
+
+class TestUnwindStage:
+    def test_unwind_basic(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("id1", {"tags": ["a"]}, "ts")],
+        )
+        doc_aggregate(conn, "posts", [
+            {"$unwind": "$tags"},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "jsonb_array_elements_text(data->'tags') AS _unwound_tags" in sql
+
+    def test_unwind_then_group(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("python", 3)],
+            description=[("_id",), ("count",)],
+        )
+        doc_aggregate(conn, "posts", [
+            {"$unwind": "$tags"},
+            {"$group": {"_id": "$tags", "count": {"$sum": 1}}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        # GROUP BY should use the unwound alias, not data->>'tags'
+        assert "_unwound_tags AS _id" in sql
+        assert "GROUP BY _unwound_tags" in sql
+        assert "data->>'tags'" not in sql
+
+    def test_unwind_object_form(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("id1", {"tags": ["a"]}, "ts")],
+        )
+        doc_aggregate(conn, "posts", [
+            {"$unwind": {"path": "$tags"}},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "jsonb_array_elements_text(data->'tags') AS _unwound_tags" in sql
+
+    def test_unwind_invalid(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="must be a string starting with"):
+            doc_aggregate(conn, "posts", [{"$unwind": "no_dollar"}])
+
+
+class TestLookupStage:
+    def test_lookup_basic(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("id1", {"name": "alice"}, "ts", "[]")],
+            description=[("_id",), ("data",), ("created_at",), ("user_orders",)],
+        )
+        doc_aggregate(conn, "users", [
+            {"$lookup": {
+                "from": "orders",
+                "localField": "uid",
+                "foreignField": "uid",
+                "as": "user_orders",
+            }},
+        ])
+        sql = cur.execute.call_args[0][0]
+        assert "COALESCE(" in sql
+        assert "json_agg(b.data)" in sql
+        assert "FROM orders b" in sql
+        assert "b.data->>'uid'" in sql
+        assert "users.data->>'uid'" in sql
+        assert "AS user_orders" in sql
+
+    def test_lookup_missing_field(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="missing required field"):
+            doc_aggregate(conn, "users", [
+                {"$lookup": {"localField": "uid", "foreignField": "uid", "as": "x"}},
+            ])
+
+    def test_lookup_validates_identifiers(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            doc_aggregate(conn, "users", [
+                {"$lookup": {
+                    "from": "DROP TABLE; --",
+                    "localField": "uid",
+                    "foreignField": "uid",
+                    "as": "x",
+                }},
+            ])
+
+
+class TestFullPipeline:
+    def test_full_pipeline(self):
+        conn, cur = capture_sql(
+            fetchall_result=[("python", 3)],
+            description=[("_id",), ("count",)],
+        )
+        doc_aggregate(conn, "posts", [
+            {"$match": {"status": "published"}},
+            {"$unwind": "$tags"},
+            {"$group": {"_id": "$tags", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 5},
+        ])
+        sql = cur.execute.call_args[0][0]
+        params = cur.execute.call_args[0][1]
+        # FROM has the unwind cross join
+        assert "jsonb_array_elements_text(data->'tags')" in sql
+        # GROUP BY uses the unwound alias
+        assert "GROUP BY _unwound_tags" in sql
+        # SELECT uses the unwound alias
+        assert "_unwound_tags AS _id" in sql
+        # WHERE from $match
+        assert "WHERE data @> %s::jsonb" in sql
+        # ORDER BY + LIMIT
+        assert "ORDER BY count DESC" in sql
+        assert "LIMIT %s" in sql
+        assert params[1] == 5
+
+
+# ---------------------------------------------------------------------------
+# 13. Filter operators (_build_filter / _field_path)
 # ---------------------------------------------------------------------------
 
 class TestFilterOperators:
