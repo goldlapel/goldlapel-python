@@ -320,6 +320,9 @@ class GoldLapel:
 
     # -- Document store --------------------------------------------------------
 
+    def doc_create_collection(self, *args, **kwargs):
+        return _utils().doc_create_collection(self.conn, *args, **kwargs)
+
     def doc_insert(self, *args, **kwargs):
         return _utils().doc_insert(self.conn, *args, **kwargs)
 

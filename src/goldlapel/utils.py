@@ -1166,13 +1166,22 @@ def _build_filter(filter_dict):
     return " AND ".join(all_clauses), all_params
 
 
-def _ensure_collection(cur, collection):
+def _ensure_collection(cur, collection, unlogged=False):
+    prefix = "CREATE UNLOGGED TABLE" if unlogged else "CREATE TABLE"
     cur.execute(
-        f"CREATE TABLE IF NOT EXISTS {collection} ("
+        f"{prefix} IF NOT EXISTS {collection} ("
         "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
         "data JSONB NOT NULL, "
         "created_at TIMESTAMPTZ DEFAULT NOW())"
     )
+
+
+def doc_create_collection(conn, collection, unlogged=False):
+    _validate_identifier(collection)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    _ensure_collection(cur, collection, unlogged=unlogged)
+    raw.commit()
 
 
 def doc_insert(conn, collection, document):

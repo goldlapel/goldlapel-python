@@ -25,6 +25,7 @@ from goldlapel.utils import (
     doc_find_one_and_delete,
     doc_distinct,
     doc_find_cursor,
+    doc_create_collection,
     _build_filter,
     _build_update,
     _build_project,
@@ -52,6 +53,43 @@ def capture_sql(fetchall_result=None, fetchone_result=None, description=None, ro
     cursor.rowcount = rowcount
     conn = FakeConn(cursor)
     return conn, cursor
+
+
+# ---------------------------------------------------------------------------
+# 0. doc_create_collection()
+# ---------------------------------------------------------------------------
+
+class TestDocCreateCollection:
+    def test_creates_logged_table_by_default(self):
+        conn, cur = capture_sql()
+        doc_create_collection(conn, "users")
+        sql = cur.execute.call_args_list[0][0][0]
+        assert "CREATE TABLE IF NOT EXISTS users" in sql
+        assert "UNLOGGED" not in sql
+
+    def test_creates_unlogged_table(self):
+        conn, cur = capture_sql()
+        doc_create_collection(conn, "sessions", unlogged=True)
+        sql = cur.execute.call_args_list[0][0][0]
+        assert "CREATE UNLOGGED TABLE IF NOT EXISTS sessions" in sql
+
+    def test_unlogged_table_has_correct_schema(self):
+        conn, cur = capture_sql()
+        doc_create_collection(conn, "cache", unlogged=True)
+        sql = cur.execute.call_args_list[0][0][0]
+        assert "_id UUID PRIMARY KEY" in sql
+        assert "data JSONB NOT NULL" in sql
+        assert "created_at TIMESTAMPTZ" in sql
+
+    def test_commits_after_creation(self):
+        conn, cur = capture_sql()
+        doc_create_collection(conn, "test_col")
+        conn.commit.assert_called_once()
+
+    def test_rejects_invalid_identifier(self):
+        conn, cur = capture_sql()
+        with pytest.raises(ValueError):
+            doc_create_collection(conn, "Robert'; DROP TABLE")
 
 
 # ---------------------------------------------------------------------------
