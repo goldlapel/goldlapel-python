@@ -399,6 +399,7 @@ def geoadd(conn, table, name_column, geom_column, name, lon, lat):
     _validate_identifier(geom_column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
     cur.execute(f"""
         CREATE TABLE IF NOT EXISTS {table} (
             id BIGSERIAL PRIMARY KEY,
@@ -434,6 +435,8 @@ def geodist(conn, table, geom_column, name_column, name_a, name_b):
 def script(conn, lua_code, *args):
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS pllua")
+    raw.commit()
     func_name = "_gl_lua_" + format(abs(hash(lua_code)), 'x')[:8]
     tag = f"$_gl_{hashlib.md5(lua_code.encode()).hexdigest()[:8]}$"
     n = len(args)
