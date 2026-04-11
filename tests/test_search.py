@@ -140,12 +140,6 @@ class TestSearchFuzzy:
         assert params == ("jon", "jon", 0.3, 50)
         assert results[0]["_score"] == 0.7
 
-    def test_creates_extension(self):
-        conn, cur = capture_sql()
-        search_fuzzy(conn, "users", "name", "jon")
-        calls = [c[0][0] for c in cur.execute.call_args_list]
-        assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in calls
-
     def test_custom_threshold_and_limit(self):
         conn, cur = capture_sql()
         search_fuzzy(conn, "users", "name", "jon", limit=5, threshold=0.5)
@@ -175,13 +169,6 @@ class TestSearchPhonetic:
         assert "soundex(name) = soundex(%s)" in sql
         assert "similarity(name, %s)" in sql
         assert params == ("smythe", "smythe", 50)
-
-    def test_creates_extensions(self):
-        conn, cur = capture_sql()
-        search_phonetic(conn, "users", "name", "smythe")
-        calls = [c[0][0] for c in cur.execute.call_args_list]
-        assert "CREATE EXTENSION IF NOT EXISTS fuzzystrmatch" in calls
-        assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in calls
 
     def test_custom_limit(self):
         conn, cur = capture_sql()
@@ -218,12 +205,6 @@ class TestSimilar:
         assert params[0] == "[0.1,0.2,0.3]"
         assert params[1] == 10
 
-    def test_creates_vector_extension(self):
-        conn, cur = capture_sql()
-        similar(conn, "docs", "embedding", [1.0])
-        calls = [c[0][0] for c in cur.execute.call_args_list]
-        assert "CREATE EXTENSION IF NOT EXISTS vector" in calls
-
     def test_custom_limit(self):
         conn, cur = capture_sql()
         similar(conn, "docs", "embedding", [1.0, 2.0], limit=5)
@@ -258,12 +239,6 @@ class TestSuggest:
         assert "ILIKE" in sql
         assert "similarity(name, %s)" in sql
         assert params == ("new", "new%", 10)
-
-    def test_creates_extension(self):
-        conn, cur = capture_sql()
-        suggest(conn, "cities", "name", "new")
-        calls = [c[0][0] for c in cur.execute.call_args_list]
-        assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in calls
 
     def test_custom_limit(self):
         conn, cur = capture_sql()

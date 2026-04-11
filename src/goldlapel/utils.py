@@ -399,7 +399,6 @@ def geoadd(conn, table, name_column, geom_column, name, lon, lat):
     _validate_identifier(geom_column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
     cur.execute(f"""
         CREATE TABLE IF NOT EXISTS {table} (
             id BIGSERIAL PRIMARY KEY,
@@ -435,8 +434,6 @@ def geodist(conn, table, geom_column, name_column, name_a, name_b):
 def script(conn, lua_code, *args):
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS pllua")
-    raw.commit()
     func_name = "_gl_lua_" + format(abs(hash(lua_code)), 'x')[:8]
     tag = f"$_gl_{hashlib.md5(lua_code.encode()).hexdigest()[:8]}$"
     n = len(args)
@@ -645,8 +642,6 @@ def search_fuzzy(conn, table, column, query, limit=50, threshold=0.3):
     _validate_identifier(column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-    raw.commit()
     cur.execute(f"""
         SELECT *, similarity({column}, %s) AS _score
         FROM {table}
@@ -665,9 +660,6 @@ def search_phonetic(conn, table, column, query, limit=50):
     _validate_identifier(column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
-    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-    raw.commit()
     cur.execute(f"""
         SELECT *, similarity({column}, %s) AS _score
         FROM {table}
@@ -686,8 +678,6 @@ def similar(conn, table, column, vector, limit=10):
     _validate_identifier(column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    raw.commit()
     vec_literal = "[" + ",".join(str(float(v)) for v in vector) + "]"
     cur.execute(f"""
         SELECT *, ({column} <=> %s::vector) AS _score
@@ -706,8 +696,6 @@ def suggest(conn, table, column, prefix, limit=10):
     _validate_identifier(column)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-    raw.commit()
     pattern = prefix + "%"
     cur.execute(f"""
         SELECT *, similarity({column}, %s) AS _score
