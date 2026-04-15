@@ -17,11 +17,12 @@ uv pip install goldlapel
 ```python
 import goldlapel
 
-# Start the proxy — returns a database connection with L1 cache built in
-conn = goldlapel.start("postgresql://user:pass@localhost:5432/mydb")
+# Create a proxy instance and start it
+gl = goldlapel.GoldLapel("postgresql://user:pass@localhost:5432/mydb")
+gl.start()
 
-# Use the connection directly — no driver setup needed
-result = conn.execute("SELECT * FROM users WHERE id = $1", [42])
+# Use the proxy connection directly — no driver setup needed
+result = gl.execute("SELECT * FROM users WHERE id = $1", [42])
 ```
 
 For async applications:
@@ -29,41 +30,46 @@ For async applications:
 ```python
 import goldlapel
 
-conn = await goldlapel.start_async("postgresql://user:pass@localhost:5432/mydb")
+gl = goldlapel.GoldLapel("postgresql://user:pass@localhost:5432/mydb")
+await gl.start_async()
 
-result = await conn.fetch("SELECT * FROM users WHERE id = $1", 42)
+result = await gl.fetch("SELECT * FROM users WHERE id = $1", 42)
 ```
 
 Gold Lapel prints the proxy and dashboard URLs on startup. Access the dashboard programmatically:
 
 ```python
-goldlapel.dashboard_url()  # http://127.0.0.1:7933
+gl.dashboard_url()  # http://127.0.0.1:7933
 ```
 
 ## API
 
-### `goldlapel.start(upstream, config=None, port=None, extra_args=None)`
+### `goldlapel.GoldLapel(upstream, config=None, port=None, extra_args=None)`
 
-Starts the Gold Lapel proxy and returns a database connection with L1 cache.
+Creates a Gold Lapel proxy instance.
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
 - `config` — dict of configuration options (see [Configuration](#configuration))
 - `port` — proxy port (default: 7932)
 - `extra_args` — additional CLI flags passed to the binary (e.g. `["--threshold-impact", "5000"]`)
 
-### `goldlapel.start_async(upstream, config=None, port=None, extra_args=None)`
+### `gl.start()`
 
-Async version of `start()`. Returns an async database connection with L1 cache.
+Starts the proxy. Returns the instance for chaining.
 
-### `goldlapel.stop()`
+### `gl.start_async()`
+
+Async version of `start()`.
+
+### `gl.stop()`
 
 Stops the proxy. Also called automatically on process exit.
 
-### `goldlapel.proxy_url()`
+### `gl.proxy_url()`
 
 Returns the current proxy URL, or `None` if not running.
 
-### `goldlapel.dashboard_url()`
+### `gl.dashboard_url()`
 
 Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `None` if the proxy is not running or the dashboard is disabled.
 
@@ -71,30 +77,20 @@ Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `None` if the proxy
 
 Returns the set of all valid config key names.
 
-### `goldlapel.GoldLapel(upstream, config=None, port=None, extra_args=None)`
-
-Class interface for managing multiple instances:
-
-```python
-proxy = goldlapel.GoldLapel("postgresql://user:pass@localhost:5432/mydb", port=7932)
-conn = proxy.start()
-# ...
-proxy.stop()
-```
-
 ## Configuration
 
-Pass a config dict as the second argument to `start()` to configure the proxy:
+Pass a config dict to the constructor to configure the proxy:
 
 ```python
 import goldlapel
 
-conn = goldlapel.start("postgresql://user:pass@localhost/mydb", {
+gl = goldlapel.GoldLapel("postgresql://user:pass@localhost/mydb", config={
     "mode": "waiter",
     "pool_size": 50,
     "disable_matviews": True,
     "replica": ["postgresql://user:pass@replica1/mydb"],
 })
+gl.start()
 ```
 
 Keys use `snake_case` and map directly to CLI flags (`pool_size` → `--pool-size`). Boolean keys like `disable_matviews` are flags — `True` enables them, `False` (or omitting) leaves them off. List keys like `replica` accept arrays and produce repeated flags.
