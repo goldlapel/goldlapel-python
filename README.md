@@ -139,6 +139,8 @@ You can also set environment variables (`GOLDLAPEL_PROXY_PORT`, `GOLDLAPEL_UPSTR
 - **SQLAlchemy** — integration code is included. Install separately: `pip install sqlalchemy`.
 - **FastAPI / Starlette / etc.** — use `goldlapel.asyncio.start()` and any async driver.
 
+> Upgrading from v0.1.x? The `pip install goldlapel[django]` and `pip install goldlapel[sqlalchemy]` extras were removed in v0.2. The integration code still ships with the package — just install `django` or `sqlalchemy` yourself.
+
 ## How it works
 
 This package bundles the Gold Lapel Rust binary for your platform. When you call `start()`, it:
