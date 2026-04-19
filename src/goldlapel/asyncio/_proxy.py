@@ -127,26 +127,8 @@ for _name in _WRAPPED_METHODS:
 
 # -- Module-level factory -----------------------------------------------------
 
-async def start(upstream, config=None, port=None, extra_args=None):
-    """Factory: spawn a Gold Lapel proxy in front of `upstream` and return an
-    AsyncGoldLapel instance. All wrapper methods on the returned instance are
-    awaitable.
-
-    Eager: starts the subprocess and opens the internal DB connection before
-    returning. Requires a sync Postgres driver (psycopg2 or psycopg3) —
-    raises ImportError otherwise. (Native asyncpg will become the default
-    driver in a future release; API is stable.)
-
-    Usage:
-        from goldlapel.asyncio import start
-        gl = await start("postgresql://user:pass@db/mydb")
-        hits = await gl.search("articles", "body", "postgres")
-        await gl.stop()
-
-    Async context manager:
-        async with start("postgresql://...") as gl:
-            hits = await gl.search(...)
-    """
+async def _actual_start(upstream, config=None, port=None, extra_args=None):
+    """The real async start — spawns subprocess + returns ready AsyncGoldLapel."""
     driver_name, driver = _detect_sync_driver()
     if driver is None:
         raise ImportError(
@@ -154,10 +136,62 @@ async def start(upstream, config=None, port=None, extra_args=None):
             "Install one: `pip install psycopg2-binary` or `pip install psycopg`. "
             "(Native asyncpg support will land in a future release.)"
         )
-    # Reuse the sync _ensure_running — it manages the subprocess + singleton-per-URL
     sync_inst = await asyncio.to_thread(
         _ensure_running, upstream, config=config, port=port, extra_args=extra_args,
     )
     async_inst = AsyncGoldLapel.__new__(AsyncGoldLapel)
     async_inst._sync = sync_inst
     return async_inst
+
+
+class _StartHandle:
+    """Dual-interface object returned by `start()`. Both:
+
+      - Awaitable: `gl = await start(url)`
+      - Async context manager: `async with start(url) as gl: ...`
+
+    Mirrors the pattern used by asyncpg.create_pool().
+    """
+
+    def __init__(self, upstream, config=None, port=None, extra_args=None):
+        self._args = (upstream, config, port, extra_args)
+        self._inst = None
+
+    def __await__(self):
+        # Enable `gl = await start(url)` — just run the underlying coroutine.
+        return _actual_start(*self._args).__await__()
+
+    async def __aenter__(self):
+        # Enable `async with start(url) as gl:`.
+        self._inst = await _actual_start(*self._args)
+        return self._inst
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._inst is not None:
+            await self._inst.stop()
+        return False
+
+
+def start(upstream, config=None, port=None, extra_args=None):
+    """Factory: spawn a Gold Lapel proxy in front of `upstream` and return an
+    AsyncGoldLapel instance. Usable both as an awaitable and as an async
+    context manager.
+
+    Eager: starts the subprocess and opens the internal DB connection before
+    returning. Requires a Postgres driver (psycopg2 or psycopg3) — raises
+    ImportError otherwise. (Native asyncpg will become the default driver
+    in a future release; API is stable.)
+
+    Usage:
+        from goldlapel.asyncio import start
+
+        # await form
+        gl = await start("postgresql://user:pass@db/mydb")
+        hits = await gl.search("articles", "body", "postgres")
+        await gl.stop()
+
+        # async context manager form (auto-stop on exit)
+        async with start("postgresql://...") as gl:
+            hits = await gl.search(...)
+    """
+    return _StartHandle(upstream, config=config, port=port, extra_args=extra_args)
