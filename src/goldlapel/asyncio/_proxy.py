@@ -92,10 +92,17 @@ def _detect_asyncpg():
 
 
 async def _open_asyncpg_conn(proxy_url):
-    """Open an asyncpg connection to `proxy_url`, register the JSONB codec so
-    return shapes match the sync path, and return the raw connection."""
+    """Open an asyncpg connection to `proxy_url` and return the raw conn.
+
+    `statement_cache_size=0` disables asyncpg's prepared-statement cache.
+    The Gold Lapel proxy has a known CloseComplete-framing interaction with
+    persistent prepared statements (see docs/wrapper-v0.2/03-proxy-closecomplete-framing.md
+    in the main repo — the .NET wrapper hit the same thing). Disabling the
+    cache sidesteps it; asyncpg parses on every call, which is fine for the
+    wrapper-utility workload (short queries, many different SQL shapes).
+    """
     asyncpg = _detect_asyncpg()
-    conn = await asyncpg.connect(proxy_url)
+    conn = await asyncpg.connect(proxy_url, statement_cache_size=0)
     await autils._register_jsonb_codec(conn)
     return conn
 
@@ -199,8 +206,7 @@ class AsyncGoldLapel:
             )
 
         try:
-            raw = await asyncpg.connect(self._sync._proxy_url)
-            await autils._register_jsonb_codec(raw)
+            raw = await _open_asyncpg_conn(self._sync._proxy_url)
             from goldlapel.wrap import wrap
             inv_port = int(
                 (self._sync._config or {}).get("invalidation_port", self._sync._port + 2),
@@ -407,8 +413,7 @@ async def _actual_start(upstream, config=None, port=None, extra_args=None):
             await inst.start()
         else:
             # Reusing existing subprocess — just open the conn.
-            raw = await asyncpg.connect(inst._sync._proxy_url)
-            await autils._register_jsonb_codec(raw)
+            raw = await _open_asyncpg_conn(inst._sync._proxy_url)
             from goldlapel.wrap import wrap
             inv_port = int(
                 (inst._sync._config or {}).get(

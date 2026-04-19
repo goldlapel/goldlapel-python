@@ -809,7 +809,7 @@ async def doc_insert(conn, collection, document):
         f"INSERT INTO {collection} (data) VALUES (%s::jsonb) RETURNING _id, data, created_at",
         (json.dumps(document),),
     )
-    return _row_to_dict(row)
+    return _decode_doc_row(_row_to_dict(row))
 
 
 async def doc_insert_many(conn, collection, documents):
@@ -822,7 +822,7 @@ async def doc_insert_many(conn, collection, documents):
         f"INSERT INTO {collection} (data) VALUES {placeholders} RETURNING _id, data, created_at",
         params,
     )
-    return _rows_to_dicts(rows)
+    return _decode_doc_rows(_rows_to_dicts(rows))
 
 
 def _build_doc_find_sql(collection, filter=None, sort=None, limit=None, skip=None):
@@ -852,7 +852,7 @@ async def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=No
     _validate_identifier(collection)
     sql, params = _build_doc_find_sql(collection, filter, sort, limit, skip)
     rows = await _fetch(conn, sql, tuple(params))
-    return _rows_to_dicts(rows)
+    return _decode_doc_rows(_rows_to_dicts(rows))
 
 
 async def doc_find_cursor(
@@ -874,7 +874,7 @@ async def doc_find_cursor(
             if not rows:
                 break
             for row in rows:
-                yield dict(row)
+                yield _decode_doc_row(dict(row))
 
 
 async def doc_find_one(conn, collection, filter=None):
@@ -887,7 +887,7 @@ async def doc_find_one(conn, collection, filter=None):
         params.extend(filter_params)
     sql += " LIMIT 1"
     row = await _fetchrow(conn, sql, tuple(params))
-    return _row_to_dict(row)
+    return _decode_doc_row(_row_to_dict(row))
 
 
 async def doc_update(conn, collection, filter, update):
@@ -965,7 +965,7 @@ async def doc_find_one_and_update(conn, collection, filter, update):
     )
     params = list(filter_params) + list(update_params)
     row = await _fetchrow(conn, sql, tuple(params))
-    return _row_to_dict(row)
+    return _decode_doc_row(_row_to_dict(row))
 
 
 async def doc_find_one_and_delete(conn, collection, filter):
@@ -979,7 +979,7 @@ async def doc_find_one_and_delete(conn, collection, filter):
         f"RETURNING {collection}._id, {collection}.data, {collection}.created_at"
     )
     row = await _fetchrow(conn, sql, tuple(filter_params))
-    return _row_to_dict(row)
+    return _decode_doc_row(_row_to_dict(row))
 
 
 async def doc_distinct(conn, collection, field, filter=None):
@@ -1161,7 +1161,10 @@ async def doc_aggregate(conn, collection, pipeline):
         params.append(skip_val)
 
     rows = await _fetch(conn, sql, tuple(params))
-    return _rows_to_dicts(rows)
+    # When the pipeline has no $project/$group, the bare docs flow through
+    # with `data` as jsonb — decode defensively. For projected / grouped
+    # pipelines, there's no `data` field, so _decode_doc_rows is a no-op.
+    return _decode_doc_rows(_rows_to_dicts(rows))
 
 
 # -- Watch / TTL / capped ---------------------------------------------------
@@ -1190,22 +1193,49 @@ def _dsn_for_listen(asyncpg_conn):
 
 
 async def _register_jsonb_codec(conn):
-    """Register json ↔ dict codec on an asyncpg connection so JSONB returns
-    native Python dicts/lists (matching the sync path via psycopg)."""
-    # `format='text'` is the default and most compatible path.
-    for type_name in ("jsonb", "json"):
+    """No-op placeholder — kept for API compat with callers.
+
+    We intentionally do NOT register an asyncpg JSONB codec. Registering
+    `encoder=json.dumps, decoder=json.loads` interferes with the sync-style
+    SQL the util layer generates: filters emit `data @> %s::jsonb` with a
+    `json.dumps(...)` text parameter, and asyncpg's codec machinery would
+    double-encode on that path (match returns zero rows). Instead, the
+    doc_* utils post-process results with `_maybe_json_decode`, which gives
+    a predictable dict/list shape regardless of which asyncpg internal
+    codepath is taken. See test_v02_asyncio_integration.TestSyncAsyncParity
+    for the parity contract this preserves.
+    """
+    # Intentionally empty — see docstring.
+    return None
+
+
+def _maybe_json_decode(value):
+    """If `value` is a JSON-formatted string, return the decoded dict/list.
+    Otherwise (already a dict/list/None), return it unchanged.
+
+    Used on the `data` field of doc_* results to guarantee a consistent
+    return shape whether asyncpg's jsonb codec ran or not.
+    """
+    if isinstance(value, str):
         try:
-            await conn.set_type_codec(
-                type_name,
-                schema="pg_catalog",
-                encoder=json.dumps,
-                decoder=json.loads,
-                format="text",
-            )
-        except Exception:
-            # If the type isn't present in this DB (very rare — both ship with
-            # Postgres by default), just skip — callers can still use text.
-            pass
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return value
+    return value
+
+
+def _decode_doc_row(d):
+    """Decode the `data` field of a doc_* result dict if it came back as a
+    string instead of a native dict/list."""
+    if d is None:
+        return None
+    if "data" in d:
+        d["data"] = _maybe_json_decode(d["data"])
+    return d
+
+
+def _decode_doc_rows(rows):
+    return [_decode_doc_row(r) for r in rows]
 
 
 async def doc_watch(conn, collection, callback, blocking=True):
