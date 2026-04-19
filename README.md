@@ -118,6 +118,7 @@ gl = goldlapel.start("postgresql://user:pass@localhost/mydb", config={
     "pool_size": 50,
     "disable_matviews": True,
     "replica": ["postgresql://user:pass@replica1/mydb"],
+    "log_level": "info",  # trace | debug | info | warn | error
 })
 ```
 

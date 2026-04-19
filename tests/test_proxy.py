@@ -301,6 +301,45 @@ class TestConfigToArgs:
         with pytest.raises(TypeError, match="expects a list"):
             _config_to_args({"replica": 42})
 
+    def test_log_level_trace(self):
+        assert _config_to_args({"log_level": "trace"}) == ["-vvv"]
+
+    def test_log_level_debug(self):
+        assert _config_to_args({"log_level": "debug"}) == ["-vv"]
+
+    def test_log_level_info(self):
+        assert _config_to_args({"log_level": "info"}) == ["-v"]
+
+    def test_log_level_warn_omitted(self):
+        assert _config_to_args({"log_level": "warn"}) == []
+
+    def test_log_level_warning_alias_omitted(self):
+        assert _config_to_args({"log_level": "warning"}) == []
+
+    def test_log_level_error_omitted(self):
+        assert _config_to_args({"log_level": "error"}) == []
+
+    def test_log_level_none_omitted(self):
+        assert _config_to_args({"log_level": None}) == []
+
+    def test_log_level_case_insensitive(self):
+        assert _config_to_args({"log_level": "DEBUG"}) == ["-vv"]
+
+    def test_log_level_invalid_raises(self):
+        with pytest.raises(ValueError, match="log_level must be one of"):
+            _config_to_args({"log_level": "verbose"})
+
+    def test_log_level_non_string_raises(self):
+        with pytest.raises(TypeError, match="expects a string"):
+            _config_to_args({"log_level": 2})
+
+    def test_log_level_combined_with_other_args(self):
+        result = _config_to_args({"mode": "waiter", "log_level": "debug"})
+        assert "-vv" in result
+        assert "--mode" in result
+        assert "waiter" in result
+        assert "--log-level" not in result
+
     def test_config_with_constructor(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb", config={"mode": "waiter"})
         assert gl._config == {"mode": "waiter"}
@@ -312,7 +351,8 @@ class TestConfigKeys:
         assert isinstance(keys, set)
         assert "mode" in keys
         assert "pool_size" in keys
-        assert len(keys) == 42
+        assert "log_level" in keys
+        assert len(keys) == 43
 
 
 class TestModuleFunctions:

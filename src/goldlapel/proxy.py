@@ -33,7 +33,7 @@ _VALID_CONFIG_KEYS = frozenset({
     "disable_result_cache", "disable_pool",
     "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
     "enable_coalescing", "replica", "exclude_tables",
-    "invalidation_port",
+    "invalidation_port", "log_level",
 })
 
 _BOOLEAN_KEYS = frozenset({
@@ -48,6 +48,20 @@ _BOOLEAN_KEYS = frozenset({
 _LIST_KEYS = frozenset({
     "replica", "exclude_tables",
 })
+
+# log_level string → count of `-v` flags on the proxy CLI. The Rust binary
+# currently exposes verbosity as a count flag (`-v`, `-vv`, `-vvv`) rather than
+# `--log-level <level>`, so wrappers translate on the spawn side. Kept as a
+# supported config option for API stability — if the proxy later adds
+# `--log-level`, this mapping can be swapped out without breaking users.
+_LOG_LEVEL_TO_VERBOSE = {
+    "trace": "-vvv",
+    "debug": "-vv",
+    "info": "-v",
+    "warn": None,
+    "warning": None,
+    "error": None,
+}
 
 _instances = {}
 _cleanup_registered = False
@@ -76,7 +90,22 @@ def _config_to_args(config):
     for key, value in config.items():
         flag = "--" + key.replace("_", "-")
 
-        if key in _BOOLEAN_KEYS:
+        if key == "log_level":
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"Config key 'log_level' expects a string, got {type(value).__name__}"
+                )
+            normalized = value.lower()
+            if normalized not in _LOG_LEVEL_TO_VERBOSE:
+                raise ValueError(
+                    "log_level must be one of: trace, debug, info, warn, error"
+                )
+            verbose_flag = _LOG_LEVEL_TO_VERBOSE[normalized]
+            if verbose_flag is not None:
+                args.append(verbose_flag)
+        elif key in _BOOLEAN_KEYS:
             if not isinstance(value, bool):
                 raise TypeError(
                     f"Config key '{key}' expects a bool, got {type(value).__name__}"
