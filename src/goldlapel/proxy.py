@@ -388,6 +388,12 @@ class GoldLapel:
         self._proxy_url = _make_proxy_url(self._upstream, self._port)
 
         driver_name, driver = _detect_sync_driver()
+        # The factory entry point `goldlapel.start(url)` raises ImportError if no
+        # driver is available, so in that flow `driver` is always non-None here.
+        # This guard protects direct `GoldLapel(...)` construction (a supported
+        # public entry point, re-exported from `goldlapel.__init__`), which doesn't
+        # pre-check: without a driver we skip opening the internal connection, and
+        # the user can still use `gl.url` with their own async/raw driver.
         if driver is not None:
             # If driver.connect() raises (network hiccup, bad creds, auth failure, etc.),
             # the subprocess is already running and would leak. Clean it up before re-raising.
