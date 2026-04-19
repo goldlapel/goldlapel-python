@@ -452,6 +452,13 @@ class GoldLapel:
                 self._process.wait()
         self._process = None
         self._proxy_url = None
+        # Drop ourselves from the registry so the next start(same_url) gets a
+        # fresh allocation instead of silently drifting to a new port because
+        # _next_port has advanced. Option A from the v0.2 review findings —
+        # clean slate on next start. dict.pop is atomic under the GIL, so this
+        # is safe without _lock (and reacquiring _lock here would deadlock the
+        # bulk stop()/atexit paths that hold it while iterating _instances).
+        _instances.pop(self._upstream, None)
 
     @property
     def conn(self):
@@ -796,7 +803,10 @@ def stop(upstream=None):
             if inst:
                 inst.stop()
         else:
-            for inst in _instances.values():
+            # Snapshot values — inst.stop() pops itself from _instances, so
+            # iterating the live view would raise "dict changed size during
+            # iteration".
+            for inst in list(_instances.values()):
                 inst.stop()
             _instances.clear()
 
@@ -839,6 +849,8 @@ def config_keys():
 
 def _cleanup():
     with _lock:
-        for inst in _instances.values():
+        # Snapshot values — inst.stop() pops itself from _instances, so
+        # iterating the live view would raise during shutdown.
+        for inst in list(_instances.values()):
             inst.stop()
         _instances.clear()

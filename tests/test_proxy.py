@@ -630,6 +630,39 @@ class TestMultiInstance:
         with pytest.raises(ImportError, match="sync Postgres driver"):
             start("postgresql://host:5432/mydb")
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._kill_orphan_on_port")
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_instance_stop_removes_from_registry(
+        self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect, mock_wrap,
+    ):
+        # Regression for v0.2 review finding (MEDIUM, Option A): after
+        # gl.stop(), the _instances entry must be dropped so the next
+        # start(same_url) doesn't get a stale entry (and silently land on a
+        # different port because _next_port has advanced).
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url = "postgresql://host:5432/mydb"
+        gl = start(url)
+        assert url in proxy_mod._instances
+
+        gl.stop()
+        assert url not in proxy_mod._instances, \
+            "gl.stop() must remove itself from _instances"
+
+        # Start a second, different upstream so _next_port advances; then
+        # the re-start of `url` should get the freshly allocated port
+        # (7934), not the stale 7932. The key invariant is: the port is
+        # *newly* allocated — no silent reuse of the stale entry.
+        start("postgresql://other:5432/other_db")
+        gl2 = start(url)
+        assert gl2._port != 7932, \
+            f"restart after stop silently reused stale port 7932: got {gl2._port}"
+        assert gl2._port == 7934  # two intermediate allocations advanced _next_port
+
 
 class TestStartupBanner:
     """Regression tests for the startup banner stream + silent opt-out.
