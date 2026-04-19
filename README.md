@@ -10,9 +10,9 @@ Gold Lapel sits between your app and Postgres, watches query patterns, and autom
 pip install goldlapel
 
 # You also need a Postgres driver — any of these works:
-pip install psycopg2-binary   # most common
-pip install psycopg            # psycopg3 (newer)
-pip install asyncpg            # async Python apps (used alongside one of the above)
+pip install psycopg2-binary   # most common, sync
+pip install psycopg            # psycopg3 (newer), sync or async
+pip install asyncpg            # async-only, for asyncio / FastAPI
 ```
 
 ## Quick start — sync
