@@ -245,6 +245,18 @@ class TestDashboardUrl:
         gl = GoldLapel("postgresql://localhost:5432/mydb", config={"dashboard_port": "9090"})
         assert gl._dashboard_port == 9090
 
+    def test_dashboard_port_derives_from_custom_proxy_port(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", port=17932)
+        assert gl._dashboard_port == 17933
+
+    def test_explicit_dashboard_port_overrides_derivation(self):
+        gl = GoldLapel(
+            "postgresql://localhost:5432/mydb",
+            port=17932,
+            config={"dashboard_port": 9999},
+        )
+        assert gl._dashboard_port == 9999
+
 
 class TestConfigToArgs:
     def test_string_value(self):

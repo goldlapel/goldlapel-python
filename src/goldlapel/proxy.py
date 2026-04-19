@@ -15,7 +15,6 @@ from pathlib import Path
 
 
 DEFAULT_PORT = 7932
-DEFAULT_DASHBOARD_PORT = 7933
 _STARTUP_TIMEOUT = 10.0
 _STARTUP_POLL_INTERVAL = 0.05
 
@@ -291,7 +290,10 @@ class GoldLapel:
     def __init__(self, upstream, config=None, port=None, extra_args=None):
         self._upstream = upstream
         self._port = port if port is not None else DEFAULT_PORT
-        self._dashboard_port = int(config.get("dashboard_port", DEFAULT_DASHBOARD_PORT)) if config else DEFAULT_DASHBOARD_PORT
+        if config and "dashboard_port" in config:
+            self._dashboard_port = int(config["dashboard_port"])
+        else:
+            self._dashboard_port = self._port + 1
         self._config = config
         self._extra_args = extra_args or []
         self._process = None
