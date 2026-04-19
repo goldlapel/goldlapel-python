@@ -21,9 +21,15 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+# Contributor-only. Everyone who clones the repo installs `[dev]` to run the
+# test suite. Not customer-facing — customers just `pip install goldlapel`.
 dev = [
     "pytest",
     "pytest-asyncio",
+    "django",
+    "sqlalchemy",
+    "psycopg2-binary",
+    "psycopg[binary]",
 ]
 
 [project.urls]
