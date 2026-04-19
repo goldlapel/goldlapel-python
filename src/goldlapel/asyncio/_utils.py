@@ -200,6 +200,17 @@ async def enqueue(conn, queue_table, payload):
 
 
 async def dequeue(conn, queue_table):
+    # KNOWN ISSUE: this specific query shape (DELETE WHERE id = (SELECT …
+    # FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING payload) hits the Gold Lapel
+    # proxy's CloseComplete-framing interaction with asyncpg's extended query
+    # protocol when it follows an INSERT-with-parameter on the same conn.
+    # asyncpg caches a bogus parameter descriptor from the proxy and fails
+    # the no-param fetchrow with "server expects 1 argument". See the main
+    # repo's docs/wrapper-v0.2/03-proxy-closecomplete-framing.md. Tracking
+    # the proxy-side fix separately. For now enqueue/dequeue work when used
+    # on a fresh conn per call; the AsyncGoldLapel internal conn reuse is
+    # where the issue surfaces. Integration tests for the doc_*/search
+    # methods do not exercise this shape.
     _validate_identifier(queue_table)
     row = await _fetchrow(conn, f"""
         DELETE FROM {queue_table}
