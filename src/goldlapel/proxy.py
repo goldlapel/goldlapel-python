@@ -32,7 +32,14 @@ _VALID_CONFIG_KEYS = frozenset({
     "disable_result_cache", "disable_pool",
     "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
     "enable_coalescing", "replica", "exclude_tables",
-    "invalidation_port", "log_level",
+    "invalidation_port", "log_level", "silent",
+})
+
+# Config keys consumed by the Python wrapper itself — not forwarded to the
+# Rust binary as CLI flags. Keep this list tight; each key here is a
+# wrapper-side behavior toggle.
+_WRAPPER_ONLY_KEYS = frozenset({
+    "silent",
 })
 
 _BOOLEAN_KEYS = frozenset({
@@ -41,7 +48,7 @@ _BOOLEAN_KEYS = frozenset({
     "disable_partial_indexes", "disable_rewrite", "disable_prepared_cache",
     "disable_result_cache", "disable_pool",
     "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
-    "enable_coalescing",
+    "enable_coalescing", "silent",
 })
 
 _LIST_KEYS = frozenset({
@@ -87,6 +94,15 @@ def _config_to_args(config):
 
     args = []
     for key, value in config.items():
+        # Wrapper-side-only keys (e.g. `silent`) aren't forwarded to the Rust
+        # binary as CLI flags — they control Python wrapper behavior.
+        if key in _WRAPPER_ONLY_KEYS:
+            if key in _BOOLEAN_KEYS and not isinstance(value, bool):
+                raise TypeError(
+                    f"Config key '{key}' expects a bool, got {type(value).__name__}"
+                )
+            continue
+
         flag = "--" + key.replace("_", "-")
 
         if key == "log_level":
@@ -398,10 +414,19 @@ class GoldLapel:
                     self._proxy_url = None
                 raise
 
-        if self._dashboard_port:
-            print(f"goldlapel → :{self._port} (proxy) | http://127.0.0.1:{self._dashboard_port} (dashboard)")
-        else:
-            print(f"goldlapel → :{self._port} (proxy)")
+        # Startup banner: stderr, not stdout. Library code writing to stdout
+        # pollutes app output, CI logs, and anything that captures stdout
+        # (pytest -s, subprocess piping). Suppressed entirely when the caller
+        # passes `config={"silent": True}`.
+        if not (self._config or {}).get("silent", False):
+            if self._dashboard_port:
+                banner = (
+                    f"goldlapel → :{self._port} (proxy) | "
+                    f"http://127.0.0.1:{self._dashboard_port} (dashboard)"
+                )
+            else:
+                banner = f"goldlapel → :{self._port} (proxy)"
+            print(banner, file=sys.stderr)
 
         return self._proxy_url
 

@@ -364,7 +364,8 @@ class TestConfigKeys:
         assert "mode" in keys
         assert "pool_size" in keys
         assert "log_level" in keys
-        assert len(keys) == 43
+        assert "silent" in keys
+        assert len(keys) == 44
 
 
 class TestModuleFunctions:
@@ -628,3 +629,147 @@ class TestMultiInstance:
 
         with pytest.raises(ImportError, match="sync Postgres driver"):
             start("postgresql://host:5432/mydb")
+
+
+class TestStartupBanner:
+    """Regression tests for the startup banner stream + silent opt-out.
+
+    Library code must not unconditionally print to stdout — it pollutes app
+    output, CI logs, and anything that captures stdout (pytest -s, subprocess
+    piping). Banner goes to stderr; `config={"silent": True}` suppresses it
+    entirely.
+    """
+
+    def setup_method(self):
+        _reset_module_state()
+
+    def teardown_method(self):
+        _reset_module_state()
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_banner_writes_to_stderr_not_stdout(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb")
+
+        captured = capsys.readouterr()
+        assert "goldlapel →" not in captured.out, \
+            f"Banner leaked to stdout: {captured.out!r}"
+        assert "goldlapel →" in captured.err, \
+            f"Banner missing from stderr: {captured.err!r}"
+        assert "(proxy)" in captured.err
+        assert "(dashboard)" in captured.err
+        assert "7932" in captured.err
+        assert "7933" in captured.err
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_silent_config_suppresses_banner(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", config={"silent": True})
+
+        captured = capsys.readouterr()
+        assert "goldlapel →" not in captured.out, \
+            f"Banner leaked to stdout under silent=True: {captured.out!r}"
+        assert "goldlapel →" not in captured.err, \
+            f"Banner leaked to stderr under silent=True: {captured.err!r}"
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_silent_false_prints_banner_to_stderr(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        # Explicit silent=False should behave the same as the default — banner
+        # on stderr, nothing on stdout.
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", config={"silent": False})
+
+        captured = capsys.readouterr()
+        assert "goldlapel →" not in captured.out
+        assert "goldlapel →" in captured.err
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_silent_not_forwarded_to_binary(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        # `silent` is a wrapper-side-only key — it must never appear in the
+        # argv passed to the Rust binary.
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", config={"silent": True})
+
+        # Popen is called as Popen(cmd, **popen_kwargs); first positional arg is the cmd list.
+        call_args, _ = mock_popen.call_args
+        cmd = call_args[0]
+        assert "--silent" not in cmd, f"--silent leaked into binary argv: {cmd}"
+
+    def test_silent_non_bool_raises(self):
+        with pytest.raises(TypeError, match="expects a bool"):
+            _config_to_args({"silent": "yes"})
+
+    def test_silent_true_produces_no_args(self):
+        assert _config_to_args({"silent": True}) == []
+
+    def test_silent_false_produces_no_args(self):
+        assert _config_to_args({"silent": False}) == []
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_banner_suppressed_when_dashboard_disabled(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        # With dashboard_port=0 we take the no-dashboard banner branch; it
+        # must still go to stderr and still honor silent.
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start(
+            "postgresql://host:5432/mydb",
+            config={"dashboard_port": 0, "silent": True},
+        )
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "goldlapel →" not in captured.err
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_banner_without_dashboard_goes_to_stderr(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start(
+            "postgresql://host:5432/mydb",
+            config={"dashboard_port": 0},
+        )
+        captured = capsys.readouterr()
+        assert "goldlapel →" not in captured.out
+        assert "goldlapel →" in captured.err
+        assert "(proxy)" in captured.err
+        # No-dashboard branch — banner should not include the dashboard URL.
+        assert "dashboard" not in captured.err

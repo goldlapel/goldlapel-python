@@ -133,3 +133,65 @@ class TestAllMethodsCount:
         missing = sync_methods - async_wrapped
         # any sync method not wrapped asynchronously is a gap worth surfacing
         assert not missing, f"async wrapper missing: {missing}"
+
+
+class TestAsyncStartupBanner:
+    """Regression tests for async start()'s banner — it goes through the sync
+    path under asyncio.to_thread, so stream/silent behavior must match sync.
+    """
+
+    def _mock_popen(self):
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.stderr = MagicMock()
+        return proc
+
+    def _reset(self):
+        from goldlapel import proxy as proxy_mod
+        from goldlapel.proxy import DEFAULT_PORT
+        proxy_mod._instances.clear()
+        proxy_mod._next_port = DEFAULT_PORT
+
+    @pytest.mark.asyncio
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", return_value=("psycopg3", MagicMock(**{"connect.return_value": MagicMock()})))
+    @patch("goldlapel.asyncio._proxy._detect_sync_driver", return_value=("psycopg3", MagicMock()))
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    async def test_async_banner_writes_to_stderr(
+        self, mock_find, mock_popen, mock_wait,
+        mock_async_detect, mock_sync_detect, mock_wrap, capsys,
+    ):
+        self._reset()
+        try:
+            mock_popen.side_effect = lambda *a, **kw: self._mock_popen()
+
+            await gl_async.start("postgresql://host:5432/mydb")
+            captured = capsys.readouterr()
+            assert "goldlapel →" not in captured.out
+            assert "goldlapel →" in captured.err
+        finally:
+            self._reset()
+
+    @pytest.mark.asyncio
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", return_value=("psycopg3", MagicMock(**{"connect.return_value": MagicMock()})))
+    @patch("goldlapel.asyncio._proxy._detect_sync_driver", return_value=("psycopg3", MagicMock()))
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    async def test_async_silent_suppresses_banner(
+        self, mock_find, mock_popen, mock_wait,
+        mock_async_detect, mock_sync_detect, mock_wrap, capsys,
+    ):
+        self._reset()
+        try:
+            mock_popen.side_effect = lambda *a, **kw: self._mock_popen()
+
+            await gl_async.start("postgresql://host:5432/mydb", config={"silent": True})
+            captured = capsys.readouterr()
+            assert "goldlapel →" not in captured.out
+            assert "goldlapel →" not in captured.err
+        finally:
+            self._reset()
