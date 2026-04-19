@@ -151,18 +151,34 @@ class _StartHandle:
       - Async context manager: `async with start(url) as gl: ...`
 
     Mirrors the pattern used by asyncpg.create_pool().
+
+    A handle is single-use: `await`ing it OR entering it as a context manager
+    consumes it. A second use would spawn a second subprocess while orphaning
+    the first — Option B from the v0.2 review findings raises loudly instead.
     """
+
+    _CONSUMED_MSG = (
+        "_StartHandle already consumed — "
+        "call goldlapel.asyncio.start(...) again for a new handle"
+    )
 
     def __init__(self, upstream, config=None, port=None, extra_args=None):
         self._args = (upstream, config, port, extra_args)
         self._inst = None
+        self._consumed = False
 
     def __await__(self):
         # Enable `gl = await start(url)` — just run the underlying coroutine.
+        if self._consumed:
+            raise RuntimeError(self._CONSUMED_MSG)
+        self._consumed = True
         return _actual_start(*self._args).__await__()
 
     async def __aenter__(self):
         # Enable `async with start(url) as gl:`.
+        if self._consumed:
+            raise RuntimeError(self._CONSUMED_MSG)
+        self._consumed = True
         self._inst = await _actual_start(*self._args)
         return self._inst
 

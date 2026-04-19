@@ -26,6 +26,58 @@ class TestAsyncStart:
             await gl_async.start("postgresql://host/db")
 
 
+class TestStartHandleDoubleUse:
+    """Regression for v0.2 review finding (MEDIUM, Option B):
+    _StartHandle is single-use. A second use (await then async-with, or
+    vice versa) would spawn a second subprocess while orphaning the first —
+    we raise RuntimeError instead.
+    """
+
+    @pytest.mark.asyncio
+    @patch("goldlapel.asyncio._proxy._ensure_running")
+    @patch("goldlapel.asyncio._proxy._detect_sync_driver", return_value=("psycopg2", MagicMock()))
+    async def test_await_then_async_with_raises(self, mock_detect, mock_ensure):
+        mock_ensure.return_value = MagicMock(name="fake_sync_instance")
+        handle = gl_async.start("postgresql://host/db")
+        await handle  # first use — consumes the handle
+        with pytest.raises(RuntimeError, match="already consumed"):
+            async with handle:
+                pass
+
+    @pytest.mark.asyncio
+    @patch("goldlapel.asyncio._proxy._ensure_running")
+    @patch("goldlapel.asyncio._proxy._detect_sync_driver", return_value=("psycopg2", MagicMock()))
+    async def test_async_with_then_await_raises(self, mock_detect, mock_ensure):
+        mock_ensure.return_value = MagicMock(name="fake_sync_instance")
+        handle = gl_async.start("postgresql://host/db")
+        async with handle:
+            pass  # first use — consumes the handle
+        with pytest.raises(RuntimeError, match="already consumed"):
+            await handle
+
+    @pytest.mark.asyncio
+    @patch("goldlapel.asyncio._proxy._ensure_running")
+    @patch("goldlapel.asyncio._proxy._detect_sync_driver", return_value=("psycopg2", MagicMock()))
+    async def test_double_await_raises(self, mock_detect, mock_ensure):
+        mock_ensure.return_value = MagicMock(name="fake_sync_instance")
+        handle = gl_async.start("postgresql://host/db")
+        await handle
+        with pytest.raises(RuntimeError, match="already consumed"):
+            await handle
+
+    @pytest.mark.asyncio
+    @patch("goldlapel.asyncio._proxy._ensure_running")
+    @patch("goldlapel.asyncio._proxy._detect_sync_driver", return_value=("psycopg2", MagicMock()))
+    async def test_fresh_handle_per_call(self, mock_detect, mock_ensure):
+        # Calling start() again yields a fresh, usable handle — the
+        # single-use guard is per-handle, not global.
+        mock_ensure.return_value = MagicMock(name="fake_sync_instance")
+        gl1 = await gl_async.start("postgresql://host/db")
+        gl2 = await gl_async.start("postgresql://host/db")
+        assert isinstance(gl1, AsyncGoldLapel)
+        assert isinstance(gl2, AsyncGoldLapel)
+
+
 class TestAsyncContextManager:
     @pytest.mark.asyncio
     async def test_aenter_calls_start_if_not_running(self):
