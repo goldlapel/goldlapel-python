@@ -30,6 +30,7 @@ dev = [
     "sqlalchemy",
     "psycopg2-binary",
     "psycopg[binary]",
+    "asyncpg",
 ]
 
 [project.urls]
