@@ -57,10 +57,57 @@ class TestFindBinary:
 
     def test_not_found_raises(self, tmp_path):
         fake_module = str(tmp_path / "proxy.py")
-        with patch.dict(os.environ, {}, clear=False):
+        empty_path = str(tmp_path / "empty-path-dir")
+        Path(empty_path).mkdir()
+        with patch.dict(os.environ, {"PATH": empty_path}, clear=False):
             os.environ.pop("GOLDLAPEL_BINARY", None)
-            with patch("goldlapel.proxy.__file__", fake_module), \
-                 patch("goldlapel.proxy.shutil.which", return_value=None):
+            with patch("goldlapel.proxy.__file__", fake_module):
+                with pytest.raises(FileNotFoundError, match="Gold Lapel binary not found"):
+                    _find_binary()
+
+    def test_skips_python_shim_on_path(self, tmp_path):
+        # Regression test for TODO 04: pip-installed `[project.scripts]` shim at
+        # .venv/bin/goldlapel would shadow the real Rust binary in dev installs.
+        # `_find_binary()` must skip the Python shim and find the real binary
+        # further down PATH.
+        shim_dir = tmp_path / "shim"
+        shim_dir.mkdir()
+        shim = shim_dir / "goldlapel"
+        shim.write_text("#!/usr/bin/env python\nimport sys\nsys.exit(0)\n")
+        shim.chmod(0o755)
+
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        real_binary = real_dir / "goldlapel"
+        # Real Rust binary — starts with ELF magic, no shebang, just needs to be
+        # an executable file that isn't a Python script.
+        real_binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 56)
+        real_binary.chmod(0o755)
+
+        fake_module = str(tmp_path / "proxy.py")
+        # Shim is first on PATH; real binary is second. Without the fix, the
+        # shim would be returned.
+        patched_path = os.pathsep.join([str(shim_dir), str(real_dir)])
+        with patch.dict(os.environ, {"PATH": patched_path}, clear=False):
+            os.environ.pop("GOLDLAPEL_BINARY", None)
+            with patch("goldlapel.proxy.__file__", fake_module):
+                result = _find_binary()
+                assert result == str(real_binary), \
+                    f"Expected real binary {real_binary}, got {result} (shim was not skipped)"
+
+    def test_raises_when_only_python_shim_on_path(self, tmp_path):
+        # If the only candidate on PATH is a Python shim, _find_binary must
+        # raise the "binary not found" error rather than returning the shim.
+        shim_dir = tmp_path / "shim"
+        shim_dir.mkdir()
+        shim = shim_dir / "goldlapel"
+        shim.write_text("#!/usr/bin/env python\nimport sys\nsys.exit(0)\n")
+        shim.chmod(0o755)
+
+        fake_module = str(tmp_path / "proxy.py")
+        with patch.dict(os.environ, {"PATH": str(shim_dir)}, clear=False):
+            os.environ.pop("GOLDLAPEL_BINARY", None)
+            with patch("goldlapel.proxy.__file__", fake_module):
                 with pytest.raises(FileNotFoundError, match="Gold Lapel binary not found"):
                     _find_binary()
 
@@ -198,6 +245,18 @@ class TestDashboardUrl:
         gl = GoldLapel("postgresql://localhost:5432/mydb", config={"dashboard_port": "9090"})
         assert gl._dashboard_port == 9090
 
+    def test_dashboard_port_derives_from_custom_proxy_port(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", port=17932)
+        assert gl._dashboard_port == 17933
+
+    def test_explicit_dashboard_port_overrides_derivation(self):
+        gl = GoldLapel(
+            "postgresql://localhost:5432/mydb",
+            port=17932,
+            config={"dashboard_port": 9999},
+        )
+        assert gl._dashboard_port == 9999
+
 
 class TestConfigToArgs:
     def test_string_value(self):
@@ -254,6 +313,45 @@ class TestConfigToArgs:
         with pytest.raises(TypeError, match="expects a list"):
             _config_to_args({"replica": 42})
 
+    def test_log_level_trace(self):
+        assert _config_to_args({"log_level": "trace"}) == ["-vvv"]
+
+    def test_log_level_debug(self):
+        assert _config_to_args({"log_level": "debug"}) == ["-vv"]
+
+    def test_log_level_info(self):
+        assert _config_to_args({"log_level": "info"}) == ["-v"]
+
+    def test_log_level_warn_omitted(self):
+        assert _config_to_args({"log_level": "warn"}) == []
+
+    def test_log_level_warning_alias_omitted(self):
+        assert _config_to_args({"log_level": "warning"}) == []
+
+    def test_log_level_error_omitted(self):
+        assert _config_to_args({"log_level": "error"}) == []
+
+    def test_log_level_none_omitted(self):
+        assert _config_to_args({"log_level": None}) == []
+
+    def test_log_level_case_insensitive(self):
+        assert _config_to_args({"log_level": "DEBUG"}) == ["-vv"]
+
+    def test_log_level_invalid_raises(self):
+        with pytest.raises(ValueError, match="log_level must be one of"):
+            _config_to_args({"log_level": "verbose"})
+
+    def test_log_level_non_string_raises(self):
+        with pytest.raises(TypeError, match="expects a string"):
+            _config_to_args({"log_level": 2})
+
+    def test_log_level_combined_with_other_args(self):
+        result = _config_to_args({"mode": "waiter", "log_level": "debug"})
+        assert "-vv" in result
+        assert "--mode" in result
+        assert "waiter" in result
+        assert "--log-level" not in result
+
     def test_config_with_constructor(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb", config={"mode": "waiter"})
         assert gl._config == {"mode": "waiter"}
@@ -265,7 +363,9 @@ class TestConfigKeys:
         assert isinstance(keys, set)
         assert "mode" in keys
         assert "pool_size" in keys
-        assert len(keys) == 42
+        assert "log_level" in keys
+        assert "silent" in keys
+        assert len(keys) == 44
 
 
 class TestModuleFunctions:
@@ -527,5 +627,182 @@ class TestMultiInstance:
     def test_start_raises_when_no_driver(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
-        with pytest.raises(ImportError, match="No supported database driver found"):
+        with pytest.raises(ImportError, match="sync Postgres driver"):
             start("postgresql://host:5432/mydb")
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._kill_orphan_on_port")
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_instance_stop_removes_from_registry(
+        self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect, mock_wrap,
+    ):
+        # Regression for v0.2 review finding (MEDIUM, Option A): after
+        # gl.stop(), the _instances entry must be dropped so the next
+        # start(same_url) doesn't get a stale entry (and silently land on a
+        # different port because _next_port has advanced).
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url = "postgresql://host:5432/mydb"
+        gl = start(url)
+        assert url in proxy_mod._instances
+
+        gl.stop()
+        assert url not in proxy_mod._instances, \
+            "gl.stop() must remove itself from _instances"
+
+        # Start a second, different upstream so _next_port advances; then
+        # the re-start of `url` should get the freshly allocated port
+        # (7934), not the stale 7932. The key invariant is: the port is
+        # *newly* allocated — no silent reuse of the stale entry.
+        start("postgresql://other:5432/other_db")
+        gl2 = start(url)
+        assert gl2._port != 7932, \
+            f"restart after stop silently reused stale port 7932: got {gl2._port}"
+        assert gl2._port == 7934  # two intermediate allocations advanced _next_port
+
+
+class TestStartupBanner:
+    """Regression tests for the startup banner stream + silent opt-out.
+
+    Library code must not unconditionally print to stdout — it pollutes app
+    output, CI logs, and anything that captures stdout (pytest -s, subprocess
+    piping). Banner goes to stderr; `config={"silent": True}` suppresses it
+    entirely.
+    """
+
+    def setup_method(self):
+        _reset_module_state()
+
+    def teardown_method(self):
+        _reset_module_state()
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_banner_writes_to_stderr_not_stdout(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb")
+
+        captured = capsys.readouterr()
+        assert "goldlapel →" not in captured.out, \
+            f"Banner leaked to stdout: {captured.out!r}"
+        assert "goldlapel →" in captured.err, \
+            f"Banner missing from stderr: {captured.err!r}"
+        assert "(proxy)" in captured.err
+        assert "(dashboard)" in captured.err
+        assert "7932" in captured.err
+        assert "7933" in captured.err
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_silent_config_suppresses_banner(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", config={"silent": True})
+
+        captured = capsys.readouterr()
+        assert "goldlapel →" not in captured.out, \
+            f"Banner leaked to stdout under silent=True: {captured.out!r}"
+        assert "goldlapel →" not in captured.err, \
+            f"Banner leaked to stderr under silent=True: {captured.err!r}"
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_silent_false_prints_banner_to_stderr(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        # Explicit silent=False should behave the same as the default — banner
+        # on stderr, nothing on stdout.
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", config={"silent": False})
+
+        captured = capsys.readouterr()
+        assert "goldlapel →" not in captured.out
+        assert "goldlapel →" in captured.err
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_silent_not_forwarded_to_binary(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        # `silent` is a wrapper-side-only key — it must never appear in the
+        # argv passed to the Rust binary.
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", config={"silent": True})
+
+        # Popen is called as Popen(cmd, **popen_kwargs); first positional arg is the cmd list.
+        call_args, _ = mock_popen.call_args
+        cmd = call_args[0]
+        assert "--silent" not in cmd, f"--silent leaked into binary argv: {cmd}"
+
+    def test_silent_non_bool_raises(self):
+        with pytest.raises(TypeError, match="expects a bool"):
+            _config_to_args({"silent": "yes"})
+
+    def test_silent_true_produces_no_args(self):
+        assert _config_to_args({"silent": True}) == []
+
+    def test_silent_false_produces_no_args(self):
+        assert _config_to_args({"silent": False}) == []
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_banner_suppressed_when_dashboard_disabled(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        # With dashboard_port=0 we take the no-dashboard banner branch; it
+        # must still go to stderr and still honor silent.
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start(
+            "postgresql://host:5432/mydb",
+            config={"dashboard_port": 0, "silent": True},
+        )
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "goldlapel →" not in captured.err
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_banner_without_dashboard_goes_to_stderr(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start(
+            "postgresql://host:5432/mydb",
+            config={"dashboard_port": 0},
+        )
+        captured = capsys.readouterr()
+        assert "goldlapel →" not in captured.out
+        assert "goldlapel →" in captured.err
+        assert "(proxy)" in captured.err
+        # No-dashboard branch — banner should not include the dashboard URL.
+        assert "dashboard" not in captured.err
