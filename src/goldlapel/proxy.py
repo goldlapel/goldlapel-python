@@ -303,13 +303,30 @@ class GoldLapel:
 
         driver_name, driver = _detect_sync_driver()
         if driver is not None:
-            if driver_name == "psycopg3":
-                raw_conn = driver.connect(self._proxy_url, autocommit=True)
-            else:
-                raw_conn = driver.connect(self._proxy_url)
-            from goldlapel.wrap import wrap
-            inv_port = int((self._config or {}).get("invalidation_port", self._port + 2))
-            self._conn = wrap(raw_conn, invalidation_port=inv_port)
+            # If driver.connect() raises (network hiccup, bad creds, auth failure, etc.),
+            # the subprocess is already running and would leak. Clean it up before re-raising.
+            try:
+                if driver_name == "psycopg3":
+                    raw_conn = driver.connect(self._proxy_url, autocommit=True)
+                else:
+                    raw_conn = driver.connect(self._proxy_url)
+                from goldlapel.wrap import wrap
+                inv_port = int((self._config or {}).get("invalidation_port", self._port + 2))
+                self._conn = wrap(raw_conn, invalidation_port=inv_port)
+            except BaseException:
+                # Kill the subprocess we just spawned; leaked running processes = port
+                # collisions on retry + zombie resources. BaseException catches KeyboardInterrupt too.
+                try:
+                    self._process.terminate()
+                    try:
+                        self._process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        self._process.kill()
+                        self._process.wait()
+                finally:
+                    self._process = None
+                    self._proxy_url = None
+                raise
 
         if self._dashboard_port:
             print(f"goldlapel → :{self._port} (proxy) | http://127.0.0.1:{self._dashboard_port} (dashboard)")
