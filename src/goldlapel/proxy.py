@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 
@@ -227,6 +229,41 @@ class GoldLapel:
         self._process = None
         self._proxy_url = None
         self._conn = None
+        # Per-instance contextvar for `with gl.using(conn):` — async-safe, scoped override.
+        self._using_conn = ContextVar(f"goldlapel_using_conn_{id(self)}", default=None)
+
+    # Context manager support: `with goldlapel.start(...) as gl:` auto-stops on exit.
+    def __enter__(self):
+        if not self.running:
+            self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
+
+    @contextmanager
+    def using(self, conn):
+        """Scoped override: all wrapper methods called inside this `with` block
+        will use `conn` (typically your own psycopg2/psycopg3 connection that may
+        be inside a transaction) instead of the instance's internal connection.
+        """
+        token = self._using_conn.set(conn)
+        try:
+            yield self
+        finally:
+            self._using_conn.reset(token)
+
+    def _effective_conn(self, override=None):
+        """Resolve which conn a wrapper method should use.
+        Precedence: explicit method kwarg > scoped `using()` conn > internal conn.
+        """
+        if override is not None:
+            return override
+        scoped = self._using_conn.get()
+        if scoped is not None:
+            return scoped
+        return self.conn  # raises if not started
 
     def start(self):
         if self._process and self._process.poll() is None:
@@ -320,208 +357,208 @@ class GoldLapel:
 
     # -- Document store --------------------------------------------------------
 
-    def doc_create_collection(self, *args, **kwargs):
-        return _utils().doc_create_collection(self.conn, *args, **kwargs)
+    def doc_create_collection(self, *args, conn=None, **kwargs):
+        return _utils().doc_create_collection(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_insert(self, *args, **kwargs):
-        return _utils().doc_insert(self.conn, *args, **kwargs)
+    def doc_insert(self, *args, conn=None, **kwargs):
+        return _utils().doc_insert(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_insert_many(self, *args, **kwargs):
-        return _utils().doc_insert_many(self.conn, *args, **kwargs)
+    def doc_insert_many(self, *args, conn=None, **kwargs):
+        return _utils().doc_insert_many(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_find(self, *args, **kwargs):
-        return _utils().doc_find(self.conn, *args, **kwargs)
+    def doc_find(self, *args, conn=None, **kwargs):
+        return _utils().doc_find(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_find_one(self, *args, **kwargs):
-        return _utils().doc_find_one(self.conn, *args, **kwargs)
+    def doc_find_one(self, *args, conn=None, **kwargs):
+        return _utils().doc_find_one(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_update(self, *args, **kwargs):
-        return _utils().doc_update(self.conn, *args, **kwargs)
+    def doc_update(self, *args, conn=None, **kwargs):
+        return _utils().doc_update(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_update_one(self, *args, **kwargs):
-        return _utils().doc_update_one(self.conn, *args, **kwargs)
+    def doc_update_one(self, *args, conn=None, **kwargs):
+        return _utils().doc_update_one(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_delete(self, *args, **kwargs):
-        return _utils().doc_delete(self.conn, *args, **kwargs)
+    def doc_delete(self, *args, conn=None, **kwargs):
+        return _utils().doc_delete(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_delete_one(self, *args, **kwargs):
-        return _utils().doc_delete_one(self.conn, *args, **kwargs)
+    def doc_delete_one(self, *args, conn=None, **kwargs):
+        return _utils().doc_delete_one(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_find_one_and_update(self, *args, **kwargs):
-        return _utils().doc_find_one_and_update(self.conn, *args, **kwargs)
+    def doc_find_one_and_update(self, *args, conn=None, **kwargs):
+        return _utils().doc_find_one_and_update(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_find_one_and_delete(self, *args, **kwargs):
-        return _utils().doc_find_one_and_delete(self.conn, *args, **kwargs)
+    def doc_find_one_and_delete(self, *args, conn=None, **kwargs):
+        return _utils().doc_find_one_and_delete(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_distinct(self, *args, **kwargs):
-        return _utils().doc_distinct(self.conn, *args, **kwargs)
+    def doc_distinct(self, *args, conn=None, **kwargs):
+        return _utils().doc_distinct(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_find_cursor(self, *args, **kwargs):
-        return _utils().doc_find_cursor(self.conn, *args, **kwargs)
+    def doc_find_cursor(self, *args, conn=None, **kwargs):
+        return _utils().doc_find_cursor(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_count(self, *args, **kwargs):
-        return _utils().doc_count(self.conn, *args, **kwargs)
+    def doc_count(self, *args, conn=None, **kwargs):
+        return _utils().doc_count(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_create_index(self, *args, **kwargs):
-        return _utils().doc_create_index(self.conn, *args, **kwargs)
+    def doc_create_index(self, *args, conn=None, **kwargs):
+        return _utils().doc_create_index(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_aggregate(self, *args, **kwargs):
-        return _utils().doc_aggregate(self.conn, *args, **kwargs)
+    def doc_aggregate(self, *args, conn=None, **kwargs):
+        return _utils().doc_aggregate(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_watch(self, *args, **kwargs):
-        return _utils().doc_watch(self.conn, *args, **kwargs)
+    def doc_watch(self, *args, conn=None, **kwargs):
+        return _utils().doc_watch(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_unwatch(self, *args, **kwargs):
-        return _utils().doc_unwatch(self.conn, *args, **kwargs)
+    def doc_unwatch(self, *args, conn=None, **kwargs):
+        return _utils().doc_unwatch(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_create_ttl_index(self, *args, **kwargs):
-        return _utils().doc_create_ttl_index(self.conn, *args, **kwargs)
+    def doc_create_ttl_index(self, *args, conn=None, **kwargs):
+        return _utils().doc_create_ttl_index(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_remove_ttl_index(self, *args, **kwargs):
-        return _utils().doc_remove_ttl_index(self.conn, *args, **kwargs)
+    def doc_remove_ttl_index(self, *args, conn=None, **kwargs):
+        return _utils().doc_remove_ttl_index(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_create_capped(self, *args, **kwargs):
-        return _utils().doc_create_capped(self.conn, *args, **kwargs)
+    def doc_create_capped(self, *args, conn=None, **kwargs):
+        return _utils().doc_create_capped(self._effective_conn(conn), *args, **kwargs)
 
-    def doc_remove_cap(self, *args, **kwargs):
-        return _utils().doc_remove_cap(self.conn, *args, **kwargs)
+    def doc_remove_cap(self, *args, conn=None, **kwargs):
+        return _utils().doc_remove_cap(self._effective_conn(conn), *args, **kwargs)
 
     # -- Search ----------------------------------------------------------------
 
-    def search(self, *args, **kwargs):
-        return _utils().search(self.conn, *args, **kwargs)
+    def search(self, *args, conn=None, **kwargs):
+        return _utils().search(self._effective_conn(conn), *args, **kwargs)
 
-    def search_fuzzy(self, *args, **kwargs):
-        return _utils().search_fuzzy(self.conn, *args, **kwargs)
+    def search_fuzzy(self, *args, conn=None, **kwargs):
+        return _utils().search_fuzzy(self._effective_conn(conn), *args, **kwargs)
 
-    def search_phonetic(self, *args, **kwargs):
-        return _utils().search_phonetic(self.conn, *args, **kwargs)
+    def search_phonetic(self, *args, conn=None, **kwargs):
+        return _utils().search_phonetic(self._effective_conn(conn), *args, **kwargs)
 
-    def similar(self, *args, **kwargs):
-        return _utils().similar(self.conn, *args, **kwargs)
+    def similar(self, *args, conn=None, **kwargs):
+        return _utils().similar(self._effective_conn(conn), *args, **kwargs)
 
-    def suggest(self, *args, **kwargs):
-        return _utils().suggest(self.conn, *args, **kwargs)
+    def suggest(self, *args, conn=None, **kwargs):
+        return _utils().suggest(self._effective_conn(conn), *args, **kwargs)
 
-    def facets(self, *args, **kwargs):
-        return _utils().facets(self.conn, *args, **kwargs)
+    def facets(self, *args, conn=None, **kwargs):
+        return _utils().facets(self._effective_conn(conn), *args, **kwargs)
 
-    def aggregate(self, *args, **kwargs):
-        return _utils().aggregate(self.conn, *args, **kwargs)
+    def aggregate(self, *args, conn=None, **kwargs):
+        return _utils().aggregate(self._effective_conn(conn), *args, **kwargs)
 
-    def create_search_config(self, *args, **kwargs):
-        return _utils().create_search_config(self.conn, *args, **kwargs)
+    def create_search_config(self, *args, conn=None, **kwargs):
+        return _utils().create_search_config(self._effective_conn(conn), *args, **kwargs)
 
     # -- Pub/sub & queues ------------------------------------------------------
 
-    def publish(self, *args, **kwargs):
-        return _utils().publish(self.conn, *args, **kwargs)
+    def publish(self, *args, conn=None, **kwargs):
+        return _utils().publish(self._effective_conn(conn), *args, **kwargs)
 
-    def subscribe(self, *args, **kwargs):
-        return _utils().subscribe(self.conn, *args, **kwargs)
+    def subscribe(self, *args, conn=None, **kwargs):
+        return _utils().subscribe(self._effective_conn(conn), *args, **kwargs)
 
-    def enqueue(self, *args, **kwargs):
-        return _utils().enqueue(self.conn, *args, **kwargs)
+    def enqueue(self, *args, conn=None, **kwargs):
+        return _utils().enqueue(self._effective_conn(conn), *args, **kwargs)
 
-    def dequeue(self, *args, **kwargs):
-        return _utils().dequeue(self.conn, *args, **kwargs)
+    def dequeue(self, *args, conn=None, **kwargs):
+        return _utils().dequeue(self._effective_conn(conn), *args, **kwargs)
 
     # -- Counters --------------------------------------------------------------
 
-    def incr(self, *args, **kwargs):
-        return _utils().incr(self.conn, *args, **kwargs)
+    def incr(self, *args, conn=None, **kwargs):
+        return _utils().incr(self._effective_conn(conn), *args, **kwargs)
 
-    def get_counter(self, *args, **kwargs):
-        return _utils().get_counter(self.conn, *args, **kwargs)
+    def get_counter(self, *args, conn=None, **kwargs):
+        return _utils().get_counter(self._effective_conn(conn), *args, **kwargs)
 
     # -- Hashes ----------------------------------------------------------------
 
-    def hset(self, *args, **kwargs):
-        return _utils().hset(self.conn, *args, **kwargs)
+    def hset(self, *args, conn=None, **kwargs):
+        return _utils().hset(self._effective_conn(conn), *args, **kwargs)
 
-    def hget(self, *args, **kwargs):
-        return _utils().hget(self.conn, *args, **kwargs)
+    def hget(self, *args, conn=None, **kwargs):
+        return _utils().hget(self._effective_conn(conn), *args, **kwargs)
 
-    def hgetall(self, *args, **kwargs):
-        return _utils().hgetall(self.conn, *args, **kwargs)
+    def hgetall(self, *args, conn=None, **kwargs):
+        return _utils().hgetall(self._effective_conn(conn), *args, **kwargs)
 
-    def hdel(self, *args, **kwargs):
-        return _utils().hdel(self.conn, *args, **kwargs)
+    def hdel(self, *args, conn=None, **kwargs):
+        return _utils().hdel(self._effective_conn(conn), *args, **kwargs)
 
     # -- Sorted sets -----------------------------------------------------------
 
-    def zadd(self, *args, **kwargs):
-        return _utils().zadd(self.conn, *args, **kwargs)
+    def zadd(self, *args, conn=None, **kwargs):
+        return _utils().zadd(self._effective_conn(conn), *args, **kwargs)
 
-    def zincrby(self, *args, **kwargs):
-        return _utils().zincrby(self.conn, *args, **kwargs)
+    def zincrby(self, *args, conn=None, **kwargs):
+        return _utils().zincrby(self._effective_conn(conn), *args, **kwargs)
 
-    def zrange(self, *args, **kwargs):
-        return _utils().zrange(self.conn, *args, **kwargs)
+    def zrange(self, *args, conn=None, **kwargs):
+        return _utils().zrange(self._effective_conn(conn), *args, **kwargs)
 
-    def zrank(self, *args, **kwargs):
-        return _utils().zrank(self.conn, *args, **kwargs)
+    def zrank(self, *args, conn=None, **kwargs):
+        return _utils().zrank(self._effective_conn(conn), *args, **kwargs)
 
-    def zscore(self, *args, **kwargs):
-        return _utils().zscore(self.conn, *args, **kwargs)
+    def zscore(self, *args, conn=None, **kwargs):
+        return _utils().zscore(self._effective_conn(conn), *args, **kwargs)
 
-    def zrem(self, *args, **kwargs):
-        return _utils().zrem(self.conn, *args, **kwargs)
+    def zrem(self, *args, conn=None, **kwargs):
+        return _utils().zrem(self._effective_conn(conn), *args, **kwargs)
 
     # -- Geo -------------------------------------------------------------------
 
-    def georadius(self, *args, **kwargs):
-        return _utils().georadius(self.conn, *args, **kwargs)
+    def georadius(self, *args, conn=None, **kwargs):
+        return _utils().georadius(self._effective_conn(conn), *args, **kwargs)
 
-    def geoadd(self, *args, **kwargs):
-        return _utils().geoadd(self.conn, *args, **kwargs)
+    def geoadd(self, *args, conn=None, **kwargs):
+        return _utils().geoadd(self._effective_conn(conn), *args, **kwargs)
 
-    def geodist(self, *args, **kwargs):
-        return _utils().geodist(self.conn, *args, **kwargs)
+    def geodist(self, *args, conn=None, **kwargs):
+        return _utils().geodist(self._effective_conn(conn), *args, **kwargs)
 
     # -- Misc ------------------------------------------------------------------
 
-    def count_distinct(self, *args, **kwargs):
-        return _utils().count_distinct(self.conn, *args, **kwargs)
+    def count_distinct(self, *args, conn=None, **kwargs):
+        return _utils().count_distinct(self._effective_conn(conn), *args, **kwargs)
 
-    def script(self, *args, **kwargs):
-        return _utils().script(self.conn, *args, **kwargs)
+    def script(self, *args, conn=None, **kwargs):
+        return _utils().script(self._effective_conn(conn), *args, **kwargs)
 
     # -- Streams ---------------------------------------------------------------
 
-    def stream_add(self, *args, **kwargs):
-        return _utils().stream_add(self.conn, *args, **kwargs)
+    def stream_add(self, *args, conn=None, **kwargs):
+        return _utils().stream_add(self._effective_conn(conn), *args, **kwargs)
 
-    def stream_create_group(self, *args, **kwargs):
-        return _utils().stream_create_group(self.conn, *args, **kwargs)
+    def stream_create_group(self, *args, conn=None, **kwargs):
+        return _utils().stream_create_group(self._effective_conn(conn), *args, **kwargs)
 
-    def stream_read(self, *args, **kwargs):
-        return _utils().stream_read(self.conn, *args, **kwargs)
+    def stream_read(self, *args, conn=None, **kwargs):
+        return _utils().stream_read(self._effective_conn(conn), *args, **kwargs)
 
-    def stream_ack(self, *args, **kwargs):
-        return _utils().stream_ack(self.conn, *args, **kwargs)
+    def stream_ack(self, *args, conn=None, **kwargs):
+        return _utils().stream_ack(self._effective_conn(conn), *args, **kwargs)
 
-    def stream_claim(self, *args, **kwargs):
-        return _utils().stream_claim(self.conn, *args, **kwargs)
+    def stream_claim(self, *args, conn=None, **kwargs):
+        return _utils().stream_claim(self._effective_conn(conn), *args, **kwargs)
 
     # -- Percolator ------------------------------------------------------------
 
-    def percolate_add(self, *args, **kwargs):
-        return _utils().percolate_add(self.conn, *args, **kwargs)
+    def percolate_add(self, *args, conn=None, **kwargs):
+        return _utils().percolate_add(self._effective_conn(conn), *args, **kwargs)
 
-    def percolate(self, *args, **kwargs):
-        return _utils().percolate(self.conn, *args, **kwargs)
+    def percolate(self, *args, conn=None, **kwargs):
+        return _utils().percolate(self._effective_conn(conn), *args, **kwargs)
 
-    def percolate_delete(self, *args, **kwargs):
-        return _utils().percolate_delete(self.conn, *args, **kwargs)
+    def percolate_delete(self, *args, conn=None, **kwargs):
+        return _utils().percolate_delete(self._effective_conn(conn), *args, **kwargs)
 
     # -- Analysis --------------------------------------------------------------
 
-    def analyze(self, *args, **kwargs):
-        return _utils().analyze(self.conn, *args, **kwargs)
+    def analyze(self, *args, conn=None, **kwargs):
+        return _utils().analyze(self._effective_conn(conn), *args, **kwargs)
 
-    def explain_score(self, *args, **kwargs):
-        return _utils().explain_score(self.conn, *args, **kwargs)
+    def explain_score(self, *args, conn=None, **kwargs):
+        return _utils().explain_score(self._effective_conn(conn), *args, **kwargs)
 
 
 def _ensure_running(upstream, config=None, port=None, extra_args=None):
@@ -581,40 +618,32 @@ def _detect_async_driver():
 
 
 def start(upstream, config=None, port=None, extra_args=None):
-    inst = _ensure_running(upstream, config=config, port=port, extra_args=extra_args)
+    """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
+    GoldLapel instance. Call wrapper methods on the returned instance
+    (e.g. `gl.search(...)`), or use `gl.url` with your own Postgres driver.
+
+    Eager: opens the instance's internal DB connection before returning so the
+    first wrapper method call is fast. Requires a sync Postgres driver
+    installed (psycopg2 or psycopg3) — raises ImportError otherwise.
+
+    Usage:
+        gl = goldlapel.start("postgresql://user:pass@db/mydb")
+        gl.search("articles", "body", "postgres")
+        conn = psycopg2.connect(gl.url)    # raw driver usage still supported
+
+    Context manager usage:
+        with goldlapel.start("postgresql://...") as gl:
+            gl.search(...)
+        # proxy stopped automatically on exit
+    """
     driver_name, driver = _detect_sync_driver()
     if driver is None:
         raise ImportError(
-            "No supported database driver found. "
-            "Install one (e.g. pip install psycopg or pip install psycopg2) "
-            "or use proxy_url() if you only need the connection string."
+            "Gold Lapel wrapper methods need a sync Postgres driver. "
+            "Install one: `pip install psycopg2-binary` or `pip install psycopg`."
         )
-    if driver_name == "psycopg3":
-        conn = driver.connect(inst.url, autocommit=True)
-    else:
-        conn = driver.connect(inst.url)
-    from goldlapel.wrap import wrap
-    inv_port = int((config or {}).get("invalidation_port", inst._port + 2))
-    return wrap(conn, invalidation_port=inv_port)
-
-
-async def start_async(upstream, config=None, port=None, extra_args=None):
     inst = _ensure_running(upstream, config=config, port=port, extra_args=extra_args)
-    driver_name, driver = _detect_async_driver()
-    if driver is None:
-        raise ImportError(
-            "No supported async Postgres driver found. "
-            "Install one: pip install asyncpg (recommended) or pip install psycopg"
-        )
-    from goldlapel.wrap import wrap
-    inv_port = int((config or {}).get("invalidation_port", inst._port + 2))
-    if driver_name == "asyncpg":
-        conn = await driver.connect(inst.url)
-        return wrap(conn, invalidation_port=inv_port)
-    else:
-        # psycopg3 async
-        conn = await driver.AsyncConnection.connect(inst.url, autocommit=True)
-        return wrap(conn, invalidation_port=inv_port)
+    return inst
 
 
 

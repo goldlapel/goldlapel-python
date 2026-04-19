@@ -527,5 +527,5 @@ class TestMultiInstance:
     def test_start_raises_when_no_driver(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
-        with pytest.raises(ImportError, match="No supported database driver found"):
+        with pytest.raises(ImportError, match="sync Postgres driver"):
             start("postgresql://host:5432/mydb")
