@@ -19,21 +19,27 @@ asyncpg differences handled here:
     by asyncpg or by `gl.using()` with a user-supplied transaction), writes
     are deferred as expected.
 
-  - JSONB codec: asyncpg returns JSONB as a string unless a codec is
-    registered. We register json.loads/json.dumps at connection-setup time
-    (see `_proxy._register_jsonb_codec`) so return values match the sync
-    path (which gets dicts/lists from psycopg/psycopg2's JSONB decoder).
+  - JSONB result shape: we do NOT register an asyncpg jsonb codec — it
+    double-encodes on the `data @> %s::jsonb` filter path that the sync
+    `_build_filter` emits. Instead, doc_* functions that return rows with
+    a `data` column run the values through `_maybe_json_decode` at the
+    util-return boundary, so async results match the sync path's dict/list
+    shape regardless of which asyncpg internal codec ran. See
+    `_register_jsonb_codec` docstring for the full rationale.
 
   - Record → dict: asyncpg fetch returns asyncpg.Record objects. The sync
     path returns dict(zip(cols, row)). We convert here with `dict(record)`
     which is O(n) but consistent with the sync return shape.
 
-Not async-ported (see report):
+Notes on specific utilities:
 
-  - `subscribe`, `doc_watch`: LISTEN/NOTIFY via asyncpg is a different API
-    (conn.add_listener) — implemented here using asyncpg's native listener.
-  - `doc_find_cursor`: asyncpg uses `conn.cursor()` inside a transaction
-    and async iteration — implemented as an async generator.
+  - `subscribe`, `doc_watch`: LISTEN/NOTIFY via asyncpg uses conn.add_listener
+    on a fresh connection (asyncpg doesn't expose select() on notify queues).
+  - `doc_find_cursor`: implemented as an async generator (asyncpg cursors are
+    scoped to a transaction — we open one, iterate, close).
+  - `stream_read`: opens an explicit transaction for `FOR UPDATE` semantics.
+  - `script`: unchanged shape vs sync; works because pllua functions are a
+    one-shot DDL+SELECT sequence.
 """
 
 import json
@@ -45,10 +51,8 @@ from goldlapel.utils import (
     _build_update,
     _field_path,
     _FIELD_PART_RE,
-    _resolve_field,
     _build_project,
     _build_group,
-    _ensure_collection as _sync_ensure_collection,  # noqa: F401 -- kept for parity
 )
 
 

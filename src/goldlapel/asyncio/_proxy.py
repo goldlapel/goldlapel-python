@@ -19,7 +19,6 @@ install hint. The sync fallback (psycopg3 async) is not implemented here —
 asyncpg is the canonical async driver and is declared a dev dependency.
 """
 
-import asyncio
 import sys
 from contextlib import asynccontextmanager
 
@@ -31,11 +30,6 @@ from goldlapel.proxy import (
     _set_pdeathsig,
     _wait_for_port,
     _STARTUP_TIMEOUT,
-    _instances,
-    _lock,
-    _cleanup_registered,
-    _next_port,
-    DEFAULT_PORT,
     GoldLapel,
 )
 from goldlapel.asyncio import _utils as autils
@@ -76,11 +70,6 @@ _WRAPPED_METHODS = (
 
 # Methods that return async generators (can't be `await`ed, only `async for`).
 _GENERATOR_METHODS = frozenset({"doc_find_cursor"})
-
-# Methods that are already implemented above the dispatcher as explicit
-# `async def` (e.g. subscribe/doc_watch block forever, doc_find_cursor is a
-# generator). These names are SKIPPED when auto-generating wrappers.
-_EXPLICITLY_IMPLEMENTED = frozenset({"doc_find_cursor"})
 
 
 def _detect_asyncpg():
@@ -379,7 +368,6 @@ async def _actual_start(upstream, config=None, port=None, extra_args=None):
             "Install with: pip install asyncpg"
         )
 
-    global _next_port
     from goldlapel import proxy as proxy_mod
     with proxy_mod._lock:
         # If an instance already exists for this upstream and is running, reuse
