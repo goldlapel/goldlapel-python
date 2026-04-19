@@ -752,4 +752,11 @@ class TestGetRawConnection:
     def test_plain_connection_passes_through(self):
         conn, cur = capture_sql()
         search(conn, "articles", "title", "test")
-        assert cur.execute.called
+        # Plain (non-wrapped) connection should run search SQL directly
+        # against the cursor we handed it — assert the actual query shape
+        # hit that cursor, not just that *anything* was executed.
+        assert cur.execute.call_count == 1
+        sql = cur.execute.call_args_list[0][0][0]
+        assert "FROM articles" in sql
+        assert "ts_rank" in sql
+        assert "plainto_tsquery" in sql
