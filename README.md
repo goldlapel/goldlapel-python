@@ -8,115 +8,158 @@ Gold Lapel sits between your app and Postgres, watches query patterns, and autom
 
 ```bash
 pip install goldlapel
-# or
-uv pip install goldlapel
+
+# You also need a Postgres driver — any of these works:
+pip install psycopg2-binary   # most common
+pip install psycopg            # psycopg3 (newer)
+pip install asyncpg            # async Python apps (used alongside one of the above)
 ```
 
-## Quick Start
+## Quick start — sync
 
 ```python
 import goldlapel
+import psycopg2
 
-# Create a proxy instance and start it
-gl = goldlapel.GoldLapel("postgresql://user:pass@localhost:5432/mydb")
-gl.start()
+# Spawn the proxy in front of your upstream DB, get back a GoldLapel instance
+gl = goldlapel.start("postgresql://user:pass@localhost:5432/mydb")
 
-# Use the proxy connection directly — no driver setup needed
-result = gl.execute("SELECT * FROM users WHERE id = $1", [42])
+# Use gl.url with any Postgres driver for raw SQL
+conn = psycopg2.connect(gl.url)
+cursor = conn.cursor()
+cursor.execute("SELECT * FROM users WHERE id = %s", (42,))
+
+# Or use Gold Lapel's wrapper methods directly — no conn arg needed
+hits = gl.search("articles", "body", "postgres tuning")
+gl.doc_insert("events", {"type": "signup", "user": "steve"})
+
+# Clean up (happens automatically on process exit too)
+gl.stop()
 ```
 
-For async applications:
+### Context manager
 
 ```python
-import goldlapel
-
-gl = goldlapel.GoldLapel("postgresql://user:pass@localhost:5432/mydb")
-await gl.start_async()
-
-result = await gl.fetch("SELECT * FROM users WHERE id = $1", 42)
+with goldlapel.start("postgresql://...") as gl:
+    results = gl.search("articles", "body", "query")
+# proxy stopped automatically on exit
 ```
 
-Gold Lapel prints the proxy and dashboard URLs on startup. Access the dashboard programmatically:
+## Quick start — async
 
 ```python
-gl.dashboard_url()  # http://127.0.0.1:7933
+from goldlapel.asyncio import start
+import asyncpg
+
+gl = await start("postgresql://user:pass@localhost:5432/mydb")
+
+conn = await asyncpg.connect(gl.url)
+rows = await conn.fetch("SELECT * FROM users WHERE id = $1", 42)
+
+hits = await gl.search("articles", "body", "postgres tuning")
+await gl.doc_insert("events", {"type": "signup"})
+
+await gl.stop()
 ```
 
-## API
+### Async context manager
 
-### `goldlapel.GoldLapel(upstream, config=None, port=None, extra_args=None)`
+```python
+from goldlapel.asyncio import start
 
-Creates a Gold Lapel proxy instance.
+async with start("postgresql://...") as gl:
+    hits = await gl.search("articles", "body", "query")
+```
 
-- `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
-- `config` — dict of configuration options (see [Configuration](#configuration))
-- `port` — proxy port (default: 7932)
-- `extra_args` — additional CLI flags passed to the binary (e.g. `["--threshold-impact", "5000"]`)
+## Transactional coordination
 
-### `gl.start()`
+When you want wrapper methods to run inside your own transaction, pass your
+connection via `gl.using(conn)` (scoped) or the `conn=` kwarg (per call):
 
-Starts the proxy. Returns the instance for chaining.
+```python
+import psycopg2
+gl = goldlapel.start("postgresql://...")
+conn = psycopg2.connect(gl.url)
+conn.autocommit = False
+cur = conn.cursor()
 
-### `gl.start_async()`
+# Scoped: all wrapper methods inside this block use `conn`
+with gl.using(conn):
+    cur.execute("INSERT INTO orders (total) VALUES (%s)", (99,))
+    gl.doc_insert("events", {"type": "order.created"})
+    cur.execute("UPDATE inventory SET qty = qty - 1")
+    conn.commit()
 
-Async version of `start()`.
+# Or per-call
+gl.doc_insert("events", {"type": "x"}, conn=conn)
+```
 
-### `gl.stop()`
+Async has the same shape with `async with gl.using(conn): ...` and `conn=` kwarg.
 
-Stops the proxy. Also called automatically on process exit.
+## Multiple proxies in one process
 
-### `gl.proxy_url()`
+`goldlapel.start()` is a factory — each URL gets its own instance:
 
-Returns the current proxy URL, or `None` if not running.
+```python
+gl_primary = goldlapel.start("postgresql://primary/mydb")
+gl_replica = goldlapel.start("postgresql://replica/mydb")
 
-### `gl.dashboard_url()`
-
-Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `None` if the proxy is not running or the dashboard is disabled.
-
-### `goldlapel.config_keys()`
-
-Returns the set of all valid config key names.
+gl_primary.search(...)  # hits primary
+gl_replica.search(...)  # hits replica
+```
 
 ## Configuration
 
-Pass a config dict to the constructor to configure the proxy:
+Pass a config dict at `start()`:
 
 ```python
-import goldlapel
-
-gl = goldlapel.GoldLapel("postgresql://user:pass@localhost/mydb", config={
+gl = goldlapel.start("postgresql://user:pass@localhost/mydb", config={
     "mode": "waiter",
     "pool_size": 50,
     "disable_matviews": True,
     "replica": ["postgresql://user:pass@replica1/mydb"],
 })
-gl.start()
 ```
 
-Keys use `snake_case` and map directly to CLI flags (`pool_size` → `--pool-size`). Boolean keys like `disable_matviews` are flags — `True` enables them, `False` (or omitting) leaves them off. List keys like `replica` accept arrays and produce repeated flags.
-
-Unknown keys raise `ValueError` immediately. To see all valid keys:
+Keys use `snake_case` and map directly to CLI flags. To see all valid keys:
 
 ```python
 import goldlapel
 print(goldlapel.config_keys())
 ```
 
-For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
+Full configuration reference in the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
 
 You can also set environment variables (`GOLDLAPEL_PROXY_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
 
-## How It Works
+## Framework / ORM integrations
+
+- **Django** — integration code is included in the `goldlapel` package. Install Django separately: `pip install django`.
+- **SQLAlchemy** — integration code is included. Install separately: `pip install sqlalchemy`.
+- **FastAPI / Starlette / etc.** — use `goldlapel.asyncio.start()` and any async driver.
+
+## How it works
 
 This package bundles the Gold Lapel Rust binary for your platform. When you call `start()`, it:
 
-1. Locates the binary (bundled in package, on PATH, or via `GOLDLAPEL_BINARY` env var)
+1. Locates the binary (bundled, on PATH, or via `GOLDLAPEL_BINARY` env var)
 2. Spawns it as a subprocess listening on localhost
 3. Waits for the port to be ready
-4. Returns a database connection with L1 native cache built in
+4. Opens the wrapper's internal DB connection (eagerly, so wrapper methods are fast)
 5. Cleans up automatically on process exit
 
-The binary does all the work — this wrapper just manages its lifecycle.
+The binary does all the optimization work — this wrapper just manages its lifecycle and exposes convenience methods.
+
+## Upgrading from v0.1.x
+
+v0.2.0 is a breaking change. Summary:
+
+- `goldlapel.start(url)` now returns a `GoldLapel` instance (previously returned a wrapped connection).
+  - For raw SQL: use `psycopg2.connect(gl.url)` (or equivalent).
+  - For wrapper methods: call `gl.search(...)`, `gl.doc_insert(...)`, etc. directly on the instance.
+- `goldlapel.start_async` moved to `goldlapel.asyncio.start`.
+- Optional dependencies `[django]` and `[sqlalchemy]` removed — install those packages directly.
+- All wrapper methods now accept an optional `conn=` kwarg, and `gl.using(conn)` provides scoped override.
 
 ## Links
 
