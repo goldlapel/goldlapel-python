@@ -1,5 +1,7 @@
 # Gold Lapel
 
+[![Tests](https://github.com/goldlapel/goldlapel-python/actions/workflows/test.yml/badge.svg)](https://github.com/goldlapel/goldlapel-python/actions/workflows/test.yml)
+
 Self-optimizing Postgres proxy — automatic materialized views and indexes, with an L1 native cache that serves repeated reads in microseconds. Zero code changes required.
 
 Gold Lapel sits between your app and Postgres, watches query patterns, and automatically creates materialized views and indexes to make your database faster. Port 7932 (79 = atomic number for gold, 32 from Postgres).
