@@ -57,10 +57,57 @@ class TestFindBinary:
 
     def test_not_found_raises(self, tmp_path):
         fake_module = str(tmp_path / "proxy.py")
-        with patch.dict(os.environ, {}, clear=False):
+        empty_path = str(tmp_path / "empty-path-dir")
+        Path(empty_path).mkdir()
+        with patch.dict(os.environ, {"PATH": empty_path}, clear=False):
             os.environ.pop("GOLDLAPEL_BINARY", None)
-            with patch("goldlapel.proxy.__file__", fake_module), \
-                 patch("goldlapel.proxy.shutil.which", return_value=None):
+            with patch("goldlapel.proxy.__file__", fake_module):
+                with pytest.raises(FileNotFoundError, match="Gold Lapel binary not found"):
+                    _find_binary()
+
+    def test_skips_python_shim_on_path(self, tmp_path):
+        # Regression test for TODO 04: pip-installed `[project.scripts]` shim at
+        # .venv/bin/goldlapel would shadow the real Rust binary in dev installs.
+        # `_find_binary()` must skip the Python shim and find the real binary
+        # further down PATH.
+        shim_dir = tmp_path / "shim"
+        shim_dir.mkdir()
+        shim = shim_dir / "goldlapel"
+        shim.write_text("#!/usr/bin/env python\nimport sys\nsys.exit(0)\n")
+        shim.chmod(0o755)
+
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        real_binary = real_dir / "goldlapel"
+        # Real Rust binary — starts with ELF magic, no shebang, just needs to be
+        # an executable file that isn't a Python script.
+        real_binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 56)
+        real_binary.chmod(0o755)
+
+        fake_module = str(tmp_path / "proxy.py")
+        # Shim is first on PATH; real binary is second. Without the fix, the
+        # shim would be returned.
+        patched_path = os.pathsep.join([str(shim_dir), str(real_dir)])
+        with patch.dict(os.environ, {"PATH": patched_path}, clear=False):
+            os.environ.pop("GOLDLAPEL_BINARY", None)
+            with patch("goldlapel.proxy.__file__", fake_module):
+                result = _find_binary()
+                assert result == str(real_binary), \
+                    f"Expected real binary {real_binary}, got {result} (shim was not skipped)"
+
+    def test_raises_when_only_python_shim_on_path(self, tmp_path):
+        # If the only candidate on PATH is a Python shim, _find_binary must
+        # raise the "binary not found" error rather than returning the shim.
+        shim_dir = tmp_path / "shim"
+        shim_dir.mkdir()
+        shim = shim_dir / "goldlapel"
+        shim.write_text("#!/usr/bin/env python\nimport sys\nsys.exit(0)\n")
+        shim.chmod(0o755)
+
+        fake_module = str(tmp_path / "proxy.py")
+        with patch.dict(os.environ, {"PATH": str(shim_dir)}, clear=False):
+            os.environ.pop("GOLDLAPEL_BINARY", None)
+            with patch("goldlapel.proxy.__file__", fake_module):
                 with pytest.raises(FileNotFoundError, match="Gold Lapel binary not found"):
                     _find_binary()
 

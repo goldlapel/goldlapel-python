@@ -98,7 +98,37 @@ def _config_to_args(config):
     return args
 
 
+def _is_python_shim(path):
+    """Return True if `path` is a Python wrapper script (e.g. a pip-installed
+    `[project.scripts]` entry point) rather than the real Rust binary.
+
+    Detected by reading the first line: if it's a `#!` shebang that mentions
+    `python`, it's a shim. Unreadable files (binaries, permission errors) are
+    treated as not-a-shim so we don't spuriously skip the real binary.
+    """
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(256)
+    except OSError:
+        return False
+    if not first.startswith(b"#!"):
+        return False
+    return b"python" in first.lower()
+
+
 def _find_binary():
+    """Locate the Gold Lapel Rust binary. Search order:
+
+    1. `GOLDLAPEL_BINARY` env var (explicit override — used as-is, no shim check).
+    2. Bundled platform binary inside the installed package (`bin/goldlapel-<os>-<arch>`).
+    3. `goldlapel` on `PATH`, walking entries in order and skipping Python shim
+       scripts. In dev installs (`pip install -e .`), `pyproject.toml`'s
+       `[project.scripts] goldlapel = "goldlapel.cli:main"` drops a Python
+       wrapper into `.venv/bin/goldlapel` that would otherwise shadow the real
+       Rust binary installed elsewhere on PATH.
+
+    Raises `FileNotFoundError` if no real binary is found.
+    """
     # 1. Explicit override via env var
     env_path = os.environ.get("GOLDLAPEL_BINARY")
     if env_path:
@@ -132,10 +162,19 @@ def _find_binary():
     if bundled.is_file():
         return str(bundled)
 
-    # 3. On PATH
-    on_path = shutil.which("goldlapel")
-    if on_path:
-        return on_path
+    # 3. On PATH — walk entries manually so we can skip Python shims.
+    path_env = os.environ.get("PATH", "")
+    exe_names = ["goldlapel.exe", "goldlapel"] if system == "windows" else ["goldlapel"]
+    for path_dir in path_env.split(os.pathsep):
+        if not path_dir:
+            continue
+        for name in exe_names:
+            candidate = os.path.join(path_dir, name)
+            if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+                continue
+            if _is_python_shim(candidate):
+                continue
+            return candidate
 
     raise FileNotFoundError(
         "Gold Lapel binary not found. Set GOLDLAPEL_BINARY env var, "
