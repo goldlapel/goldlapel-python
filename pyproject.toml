@@ -20,6 +20,12 @@ classifiers = [
     "Operating System :: MacOS",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
 [project.urls]
 Homepage = "https://goldlapel.com"
 Repository = "https://github.com/goldlapel/goldlapel-python"
