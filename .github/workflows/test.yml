@@ -41,13 +41,15 @@ jobs:
           until PGPASSWORD=postgres pg_isready -h localhost -U postgres; do sleep 1; done
 
       - name: Download goldlapel binary
-        # Source from the public goldlapel-go repo (which commits binaries for
-        # the Go module proxy). Avoids needing a PAT to reach the private
-        # goldlapel/goldlapel release assets. raw.githubusercontent.com serves
-        # the file on main with no auth required.
+        # Download the latest release asset from the private goldlapel/goldlapel
+        # repo using the org-level RELEASE_TOKEN PAT (same token used by all
+        # release-*.yml workflows). Org secret has visibility=ALL, so it
+        # propagates to this public wrapper repo's workflow runs.
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
-          curl -fSL -o /tmp/goldlapel-linux-x86_64 \
-            https://raw.githubusercontent.com/goldlapel/goldlapel-go/main/bin/goldlapel-linux-x86_64
+          LATEST=$(gh release list --repo goldlapel/goldlapel --limit 1 --json tagName -q '.[0].tagName')
+          gh release download "$LATEST" --repo goldlapel/goldlapel --pattern "goldlapel-linux-x86_64" --dir /tmp
           chmod +x /tmp/goldlapel-linux-x86_64
           echo "GOLDLAPEL_BINARY=/tmp/goldlapel-linux-x86_64" >> $GITHUB_ENV
 
