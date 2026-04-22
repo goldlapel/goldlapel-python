@@ -7,3 +7,8 @@ build/
 *.egg
 .venv/
 src/goldlapel/bin/
+
+# Local secrets
+.env
+.env.local
+.env.*.local
