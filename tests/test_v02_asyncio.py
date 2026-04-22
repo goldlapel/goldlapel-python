@@ -7,6 +7,7 @@ verify wiring, lifecycle, `using()` semantics, and the startup banner
 without touching a real Postgres.
 """
 
+import asyncio
 import inspect
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +15,7 @@ import pytest
 
 import goldlapel.asyncio as gl_async
 from goldlapel.asyncio._proxy import AsyncGoldLapel, _WRAPPED_METHODS, _GENERATOR_METHODS
+from goldlapel.proxy import GoldLapel
 
 
 class TestAsyncStart:
@@ -172,6 +174,120 @@ class TestAsyncUsing:
             async with inst.using(user_conn):
                 raise RuntimeError("bang")
         sync._using_conn.reset.assert_called_once_with("token")
+
+
+class TestAsyncUsingScopeIsolation:
+    """Regression: Task A's `using(conn)` scope must not leak to a sibling
+    Task B running concurrently via `asyncio.gather`.
+
+    Analogue of Ruby's test_async_native.rb::test_using_scope_under_async_reactor.
+    Ruby once had a real bug in this class where fiber-local scope leaked
+    across sibling fibers; this test codifies the expected Python-asyncio
+    behavior so a future refactor from ContextVar to instance state
+    (e.g. `self._scope_conn = conn`) would be caught.
+
+    Why this works with ContextVar: `asyncio.gather` wraps each coroutine
+    via `ensure_future`, and `Task.__init__` copies the *current* context
+    at task-creation time. Task A's `using()` set() runs inside Task A's
+    context copy and is never visible to Task B's copy. If scope were
+    stored in shared instance state, both tasks would see the same slot
+    and B would observe A's conn.
+
+    Synchronization is deterministic (asyncio.Event), not timing-based.
+    """
+
+    @pytest.mark.asyncio
+    async def test_using_scope_does_not_leak_to_sibling_task(self):
+        # Real AsyncGoldLapel instance wired to a real GoldLapel (real
+        # ContextVar) — no subprocess spawned because we never call start().
+        # The internal _conn is a distinctive mock so we can assert B's
+        # effective conn against it.
+        inst = AsyncGoldLapel.__new__(AsyncGoldLapel)
+        inst._sync = GoldLapel("postgresql://fake/db", port=0)
+        default_conn = MagicMock(name="default_internal_conn")
+        inst._conn = default_conn
+
+        conn_a = MagicMock(name="conn_a_scoped_by_task_a")
+
+        enter_using = asyncio.Event()     # A → B: scope is now active on A
+        b_observed = asyncio.Event()      # B → A: I've recorded my effective
+        observations = {}
+
+        async def task_a():
+            # A enters using(conn_a); while inside, hand control to B and
+            # wait until B has observed its effective conn.
+            async with inst.using(conn_a):
+                # Sanity: inside A's context, A's effective conn is conn_a.
+                observations["a_effective_inside"] = inst._effective_conn(None)
+                enter_using.set()
+                await b_observed.wait()
+            # After the block exits, A's context is restored to default.
+            observations["a_effective_after"] = inst._effective_conn(None)
+
+        async def task_b():
+            # B waits until A is inside the using block, then samples the
+            # effective conn. A real scope leak (shared instance state)
+            # would surface here as `conn_a`.
+            await enter_using.wait()
+            observations["b_effective_while_a_scoped"] = inst._effective_conn(None)
+            b_observed.set()
+
+        await asyncio.gather(task_a(), task_b())
+
+        assert observations["a_effective_inside"] is conn_a, (
+            "Task A should see its own scoped conn_a inside using()"
+        )
+        assert observations["b_effective_while_a_scoped"] is default_conn, (
+            "SCOPE LEAK: Task B observed Task A's scoped conn_a. "
+            "The async using() block is storing scope in shared state "
+            "instead of a ContextVar, so sibling tasks corrupt each other."
+        )
+        assert observations["a_effective_after"] is default_conn, (
+            "Task A's scope should unwind to the default conn after using()"
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_sibling_using_blocks_do_not_cross_contaminate(self):
+        """Stronger form: two sibling tasks each inside their own using()
+        block concurrently. Each must see its own scoped conn, never the
+        other's. Covers the symmetric leak case.
+
+        Rendezvous via a pair of Events so both tasks are guaranteed to be
+        inside their respective using() blocks before either samples —
+        otherwise a one-sided leak from the earlier-entering task could
+        slip past.
+        """
+        inst = AsyncGoldLapel.__new__(AsyncGoldLapel)
+        inst._sync = GoldLapel("postgresql://fake/db", port=0)
+        inst._conn = MagicMock(name="default_internal_conn")
+
+        conn_a = MagicMock(name="conn_a")
+        conn_b = MagicMock(name="conn_b")
+
+        a_entered = asyncio.Event()
+        b_entered = asyncio.Event()
+        observations = {}
+
+        async def task_a():
+            async with inst.using(conn_a):
+                a_entered.set()
+                await b_entered.wait()
+                observations["a"] = inst._effective_conn(None)
+
+        async def task_b():
+            async with inst.using(conn_b):
+                b_entered.set()
+                await a_entered.wait()
+                observations["b"] = inst._effective_conn(None)
+
+        await asyncio.gather(task_a(), task_b())
+
+        assert observations["a"] is conn_a, (
+            "Task A should see conn_a; got something else — cross-contamination"
+        )
+        assert observations["b"] is conn_b, (
+            "Task B should see conn_b; got something else — cross-contamination"
+        )
 
 
 class TestEffectiveConn:
