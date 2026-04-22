@@ -431,7 +431,7 @@ class _StartHandle:
     """
 
     _CONSUMED_MSG = (
-        "_StartHandle already consumed — "
+        "Gold Lapel start handle already consumed — "
         "call goldlapel.asyncio.start(...) again for a new handle"
     )
 
