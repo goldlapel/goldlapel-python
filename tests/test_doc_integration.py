@@ -10,22 +10,23 @@ CTE-based ``doc_update_one`` roundtrips, filter-operator AST correctness (``$in`
 nested ``$or``/``$and``), pagination ordering stability, capped-collection trigger
 firing, and ``doc_find_one_and_update`` RETURNING correctness.
 
-Requires Postgres reachable via DATABASE_URL (default
-``postgresql://sgibson@localhost/postgres``). Skipped automatically when
-Postgres isn't reachable, matching ``tests/test_v02_integration.py``.
+Gated on GOLDLAPEL_INTEGRATION=1 + GOLDLAPEL_TEST_UPSTREAM — the
+standardized integration-test convention shared across all Gold Lapel
+wrappers. See tests/_integration_gate.py.
 """
 
-import os
 import time
 
 import pytest
+
+from _integration_gate import require_integration_upstream
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
 def pg_url():
-    url = os.environ.get("DATABASE_URL", "postgresql://sgibson@localhost/postgres")
+    url = require_integration_upstream()
     try:
         import psycopg2
         conn = psycopg2.connect(url, connect_timeout=2)

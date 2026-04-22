@@ -58,6 +58,12 @@ jobs:
 
       - name: Run tests
         env:
+          # Standardized integration-test gate — both must be set for
+          # integration tests to run. See tests/_integration_gate.py.
+          GOLDLAPEL_INTEGRATION: "1"
+          GOLDLAPEL_TEST_UPSTREAM: postgresql://postgres:postgres@localhost:5432/postgres
+          # DATABASE_URL is still used by the SQLAlchemy/Django plugin tests
+          # (the plugins read DATABASE_URL as the app-level default).
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
           PGHOST: localhost
           PGUSER: postgres

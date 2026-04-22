@@ -9,20 +9,23 @@ Exercises the full flow:
 - Exercise stream_create_group → stream_read → stream_ack full round-trip.
 - Exercise stream_claim pending-reassignment path.
 
-Requires DATABASE_URL + goldlapel binary on path; skipped otherwise.
+Gated on GOLDLAPEL_INTEGRATION=1 + GOLDLAPEL_TEST_UPSTREAM — the
+standardized integration-test convention shared across all Gold Lapel
+wrappers. See tests/_integration_gate.py.
 """
 
-import os
 import time
 
 import pytest
+
+from _integration_gate import require_integration_upstream
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
 def pg_url():
-    url = os.environ.get("DATABASE_URL", "postgresql://sgibson@localhost/postgres")
+    url = require_integration_upstream()
     try:
         import psycopg2
         conn = psycopg2.connect(url, connect_timeout=2)

@@ -10,10 +10,11 @@ gl.using() transactional scope using a caller-supplied asyncpg
 connection + asyncpg transaction.
 """
 
-import os
 import time
 
 import pytest
+
+from _integration_gate import require_integration_upstream
 
 pytestmark = pytest.mark.integration
 
@@ -22,7 +23,7 @@ asyncpg = pytest.importorskip("asyncpg")
 
 @pytest.fixture(scope="module")
 def pg_url():
-    url = os.environ.get("DATABASE_URL", "postgresql://sgibson@localhost/postgres")
+    url = require_integration_upstream()
     try:
         import psycopg2
         conn = psycopg2.connect(url, connect_timeout=2)

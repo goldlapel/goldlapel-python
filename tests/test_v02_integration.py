@@ -1,25 +1,24 @@
 """End-to-end integration tests for the v0.2 factory API.
 
-Requires a real Postgres reachable via DATABASE_URL (default:
-postgresql://sgibson@localhost/postgres) and the goldlapel binary
-(path overridable via GOLDLAPEL_BINARY env var — the default
-shutil.which("goldlapel") may resolve to the wrapper's own CLI
-script in dev installs, so explicit GOLDLAPEL_BINARY is safer).
-
-Skipped automatically when prerequisites aren't met.
+Gated on GOLDLAPEL_INTEGRATION=1 + GOLDLAPEL_TEST_UPSTREAM (the
+standardized integration-test convention — see tests/conftest.py). The
+goldlapel binary is resolved from GOLDLAPEL_BINARY (preferred — the
+default shutil.which("goldlapel") may resolve to the wrapper's own CLI
+script in dev installs) or PATH.
 """
 
-import os
 import time
 
 import pytest
+
+from _integration_gate import require_integration_upstream
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
 def pg_url():
-    url = os.environ.get("DATABASE_URL", "postgresql://sgibson@localhost/postgres")
+    url = require_integration_upstream()
     # best-effort reachability probe
     try:
         import psycopg2
