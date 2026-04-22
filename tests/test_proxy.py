@@ -11,7 +11,7 @@ from goldlapel.proxy import (
     _find_binary,
     _make_proxy_url,
     _wait_for_port,
-    DEFAULT_PORT,
+    DEFAULT_PROXY_PORT,
     GoldLapel,
     config_keys,
     dashboard_url,
@@ -207,15 +207,15 @@ class TestWaitForPort:
 class TestGoldLapelClass:
     def test_default_port(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._port == 7932
+        assert gl._proxy_port == 7932
 
     def test_custom_port(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", port=9000)
-        assert gl._port == 9000
+        gl = GoldLapel("postgresql://localhost:5432/mydb", proxy_port=9000)
+        assert gl._proxy_port == 9000
 
     def test_port_zero(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", port=0)
-        assert gl._port == 0
+        gl = GoldLapel("postgresql://localhost:5432/mydb", proxy_port=0)
+        assert gl._proxy_port == 0
 
     def test_not_running_initially(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb")
@@ -229,11 +229,11 @@ class TestDashboardUrl:
         assert gl._dashboard_port == 7933
 
     def test_dashboard_url_custom_port(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"dashboard_port": 8080})
+        gl = GoldLapel("postgresql://localhost:5432/mydb", dashboard_port=8080)
         assert gl._dashboard_port == 8080
 
     def test_dashboard_url_disabled(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"dashboard_port": 0})
+        gl = GoldLapel("postgresql://localhost:5432/mydb", dashboard_port=0)
         assert gl._dashboard_port == 0
         assert gl.dashboard_url is None
 
@@ -241,26 +241,40 @@ class TestDashboardUrl:
         gl = GoldLapel("postgresql://localhost:5432/mydb")
         assert gl.dashboard_url is None
 
-    def test_dashboard_port_from_config(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"dashboard_port": "9090"})
-        assert gl._dashboard_port == 9090
+    def test_dashboard_port_in_config_map_rejected(self):
+        # Regression guard: dashboard_port was promoted to a top-level kwarg.
+        # Passing it inside the `config` dict must raise.
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            GoldLapel("postgresql://localhost:5432/mydb", config={"dashboard_port": 9090})
 
     def test_dashboard_port_derives_from_custom_proxy_port(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", port=17932)
+        gl = GoldLapel("postgresql://localhost:5432/mydb", proxy_port=17932)
         assert gl._dashboard_port == 17933
 
     def test_explicit_dashboard_port_overrides_derivation(self):
         gl = GoldLapel(
             "postgresql://localhost:5432/mydb",
-            port=17932,
-            config={"dashboard_port": 9999},
+            proxy_port=17932,
+            dashboard_port=9999,
         )
         assert gl._dashboard_port == 9999
+
+    def test_invalidation_port_derives_from_custom_proxy_port(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", proxy_port=17932)
+        assert gl.invalidation_port == 17934
+
+    def test_explicit_invalidation_port_overrides_derivation(self):
+        gl = GoldLapel(
+            "postgresql://localhost:5432/mydb",
+            proxy_port=17932,
+            invalidation_port=9999,
+        )
+        assert gl.invalidation_port == 9999
 
 
 class TestConfigToArgs:
     def test_string_value(self):
-        assert _config_to_args({"mode": "waiter"}) == ["--mode", "waiter"]
+        assert _config_to_args({"pool_mode": "transaction"}) == ["--pool-mode", "transaction"]
 
     def test_numeric_value(self):
         assert _config_to_args({"pool_size": 50}) == ["--pool-size", "50"]
@@ -284,9 +298,9 @@ class TestConfigToArgs:
             _config_to_args({"bogus": 1})
 
     def test_multiple_keys(self):
-        result = _config_to_args({"mode": "waiter", "pool_size": 10, "disable_pool": True})
-        assert "--mode" in result
-        assert "waiter" in result
+        result = _config_to_args({"pool_mode": "transaction", "pool_size": 10, "disable_pool": True})
+        assert "--pool-mode" in result
+        assert "transaction" in result
         assert "--pool-size" in result
         assert "10" in result
         assert "--disable-pool" in result
@@ -313,59 +327,65 @@ class TestConfigToArgs:
         with pytest.raises(TypeError, match="expects a list"):
             _config_to_args({"replica": 42})
 
-    def test_log_level_trace(self):
-        assert _config_to_args({"log_level": "trace"}) == ["-vvv"]
+    def test_log_level_in_config_map_rejected(self):
+        # Regression guard: log_level was promoted to a top-level option.
+        # Passing it through config must raise.
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"log_level": "info"})
 
-    def test_log_level_debug(self):
-        assert _config_to_args({"log_level": "debug"}) == ["-vv"]
+    def test_mode_in_config_map_rejected(self):
+        # Regression guard: mode was promoted to a top-level option.
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"mode": "waiter"})
 
-    def test_log_level_info(self):
-        assert _config_to_args({"log_level": "info"}) == ["-v"]
+    def test_silent_in_config_map_rejected(self):
+        # Regression guard: silent was promoted to a top-level option.
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"silent": True})
 
-    def test_log_level_warn_omitted(self):
-        assert _config_to_args({"log_level": "warn"}) == []
+    def test_log_level_to_verbose_flag(self):
+        from goldlapel.proxy import _log_level_to_verbose_flag
+        assert _log_level_to_verbose_flag("trace") == "-vvv"
+        assert _log_level_to_verbose_flag("debug") == "-vv"
+        assert _log_level_to_verbose_flag("info") == "-v"
+        assert _log_level_to_verbose_flag("warn") is None
+        assert _log_level_to_verbose_flag("error") is None
+        assert _log_level_to_verbose_flag(None) is None
+        assert _log_level_to_verbose_flag("DEBUG") == "-vv"
 
-    def test_log_level_warning_alias_omitted(self):
-        assert _config_to_args({"log_level": "warning"}) == []
-
-    def test_log_level_error_omitted(self):
-        assert _config_to_args({"log_level": "error"}) == []
-
-    def test_log_level_none_omitted(self):
-        assert _config_to_args({"log_level": None}) == []
-
-    def test_log_level_case_insensitive(self):
-        assert _config_to_args({"log_level": "DEBUG"}) == ["-vv"]
-
-    def test_log_level_invalid_raises(self):
-        with pytest.raises(ValueError, match="log_level must be one of"):
-            _config_to_args({"log_level": "verbose"})
-
-    def test_log_level_non_string_raises(self):
+    def test_log_level_to_verbose_flag_non_string_raises(self):
+        from goldlapel.proxy import _log_level_to_verbose_flag
         with pytest.raises(TypeError, match="expects a string"):
-            _config_to_args({"log_level": 2})
+            _log_level_to_verbose_flag(2)
 
-    def test_log_level_combined_with_other_args(self):
-        result = _config_to_args({"mode": "waiter", "log_level": "debug"})
-        assert "-vv" in result
-        assert "--mode" in result
-        assert "waiter" in result
-        assert "--log-level" not in result
+    def test_log_level_to_verbose_flag_invalid_raises(self):
+        from goldlapel.proxy import _log_level_to_verbose_flag
+        with pytest.raises(ValueError, match="log_level must be one of"):
+            _log_level_to_verbose_flag("verbose")
 
     def test_config_with_constructor(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"mode": "waiter"})
-        assert gl._config == {"mode": "waiter"}
+        gl = GoldLapel("postgresql://localhost:5432/mydb", config={"pool_mode": "transaction"})
+        assert gl._config == {"pool_mode": "transaction"}
 
 
 class TestConfigKeys:
     def test_config_keys_returns_all_keys(self):
+        # Tuning knobs still live in the structured config map.
         keys = config_keys()
         assert isinstance(keys, set)
-        assert "mode" in keys
         assert "pool_size" in keys
-        assert "log_level" in keys
-        assert "silent" in keys
-        assert len(keys) == 44
+        assert "disable_matviews" in keys
+        assert "replica" in keys
+
+    def test_config_keys_does_not_contain_promoted_top_level_keys(self):
+        # Top-level concepts (mode, log_level, dashboard_port, etc.) were
+        # promoted out of the structured config map on the canonical surface.
+        keys = config_keys()
+        for promoted in (
+            "mode", "log_level", "dashboard_port", "invalidation_port",
+            "config", "license", "client", "silent",
+        ):
+            assert promoted not in keys
 
 
 class TestModuleFunctions:
@@ -380,7 +400,7 @@ class TestModuleFunctions:
 
 def _reset_module_state():
     proxy_mod._instances.clear()
-    proxy_mod._next_port = DEFAULT_PORT
+    proxy_mod._next_port = DEFAULT_PROXY_PORT
 
 
 def _mock_popen():
@@ -419,7 +439,7 @@ class TestMultiInstance:
         start(url_b)
 
         assert len(proxy_mod._instances) == 2
-        ports = [inst._port for inst in proxy_mod._instances.values()]
+        ports = [inst._proxy_port for inst in proxy_mod._instances.values()]
         assert 7932 in ports
         assert 7933 in ports
 
@@ -538,11 +558,11 @@ class TestMultiInstance:
         url_a = "postgresql://host-a:5432/db_a"
         url_b = "postgresql://host-b:5432/db_b"
 
-        start(url_a, port=8000)
+        start(url_a, proxy_port=8000)
         start(url_b)  # Should auto-assign 8001, not 7932
 
         inst_b = proxy_mod._instances[url_b]
-        assert inst_b._port == 8001
+        assert inst_b._proxy_port == 8001
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
@@ -659,9 +679,9 @@ class TestMultiInstance:
         # *newly* allocated — no silent reuse of the stale entry.
         start("postgresql://other:5432/other_db")
         gl2 = start(url)
-        assert gl2._port != 7932, \
-            f"restart after stop silently reused stale port 7932: got {gl2._port}"
-        assert gl2._port == 7934  # two intermediate allocations advanced _next_port
+        assert gl2._proxy_port != 7932, \
+            f"restart after stop silently reused stale port 7932: got {gl2._proxy_port}"
+        assert gl2._proxy_port == 7934  # two intermediate allocations advanced _next_port
 
 
 class TestStartupBanner:
@@ -711,7 +731,7 @@ class TestStartupBanner:
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
-        start("postgresql://host:5432/mydb", config={"silent": True})
+        start("postgresql://host:5432/mydb", silent=True)
 
         captured = capsys.readouterr()
         assert "goldlapel →" not in captured.out, \
@@ -731,7 +751,7 @@ class TestStartupBanner:
         # on stderr, nothing on stdout.
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
-        start("postgresql://host:5432/mydb", config={"silent": False})
+        start("postgresql://host:5432/mydb", silent=False)
 
         captured = capsys.readouterr()
         assert "goldlapel →" not in captured.out
@@ -745,26 +765,22 @@ class TestStartupBanner:
     def test_silent_not_forwarded_to_binary(
         self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
     ):
-        # `silent` is a wrapper-side-only key — it must never appear in the
+        # `silent` is a wrapper-side-only kwarg — it must never appear in the
         # argv passed to the Rust binary.
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
-        start("postgresql://host:5432/mydb", config={"silent": True})
+        start("postgresql://host:5432/mydb", silent=True)
 
         # Popen is called as Popen(cmd, **popen_kwargs); first positional arg is the cmd list.
         call_args, _ = mock_popen.call_args
         cmd = call_args[0]
         assert "--silent" not in cmd, f"--silent leaked into binary argv: {cmd}"
 
-    def test_silent_non_bool_raises(self):
-        with pytest.raises(TypeError, match="expects a bool"):
-            _config_to_args({"silent": "yes"})
-
-    def test_silent_true_produces_no_args(self):
-        assert _config_to_args({"silent": True}) == []
-
-    def test_silent_false_produces_no_args(self):
-        assert _config_to_args({"silent": False}) == []
+    def test_silent_in_config_map_rejected(self):
+        # Regression guard: silent is a top-level wrapper kwarg; passing it
+        # through the config map is a user error.
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"silent": True})
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
@@ -780,7 +796,8 @@ class TestStartupBanner:
 
         start(
             "postgresql://host:5432/mydb",
-            config={"dashboard_port": 0, "silent": True},
+            dashboard_port=0,
+            silent=True,
         )
         captured = capsys.readouterr()
         assert captured.out == ""
@@ -798,7 +815,7 @@ class TestStartupBanner:
 
         start(
             "postgresql://host:5432/mydb",
-            config={"dashboard_port": 0},
+            dashboard_port=0,
         )
         captured = capsys.readouterr()
         assert "goldlapel →" not in captured.out

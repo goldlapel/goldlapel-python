@@ -35,25 +35,35 @@ def _build_upstream_url(settings):
 
 
 class DatabaseWrapper(PgDatabaseWrapper):
-    _gl_port = goldlapel.DEFAULT_PORT
+    _gl_proxy_port = goldlapel.DEFAULT_PROXY_PORT
     _gl_active = False
 
     def get_connection_params(self):
         params = super().get_connection_params()
 
         gl_opts = params.pop("goldlapel", {})
-        self._gl_port = gl_opts.get("port", goldlapel.DEFAULT_PORT)
-        gl_config = gl_opts.get("config")
-        gl_extra_args = gl_opts.get("extra_args")
+        # Django OPTIONS dict uses the canonical snake_case surface —
+        # `proxy_port`, `dashboard_port`, `invalidation_port`, `log_level`,
+        # `mode`, etc. — matching `goldlapel.start(**opts)`.
+        self._gl_proxy_port = gl_opts.get("proxy_port", goldlapel.DEFAULT_PROXY_PORT)
+        start_kwargs = {
+            "proxy_port": self._gl_proxy_port,
+            "client": "django",
+        }
+        for key in (
+            "dashboard_port", "invalidation_port", "log_level", "mode",
+            "license", "config_file", "config", "extra_args", "silent",
+        ):
+            if key in gl_opts:
+                start_kwargs[key] = gl_opts[key]
 
         upstream = _build_upstream_url(self.settings_dict)
-        os.environ["GOLDLAPEL_CLIENT"] = "django"
 
         try:
-            goldlapel.start(upstream, config=gl_config, port=self._gl_port, extra_args=gl_extra_args)
+            goldlapel.start(upstream, **start_kwargs)
             self._gl_active = True
             params["host"] = "127.0.0.1"
-            params["port"] = self._gl_port
+            params["port"] = self._gl_proxy_port
         except Exception as exc:
             logger.warning(
                 "Gold Lapel proxy failed to start, falling back to direct connection: %s",
@@ -68,5 +78,5 @@ class DatabaseWrapper(PgDatabaseWrapper):
         if not self._gl_active:
             return conn
         gl_opts = self.settings_dict.get("OPTIONS", {}).get("goldlapel", {})
-        inv_port = gl_opts.get("invalidation_port", self._gl_port + 2)
+        inv_port = gl_opts.get("invalidation_port", self._gl_proxy_port + 2)
         return goldlapel.wrap(conn, invalidation_port=inv_port)

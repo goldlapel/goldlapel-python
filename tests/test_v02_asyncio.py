@@ -203,7 +203,7 @@ class TestAsyncUsingScopeIsolation:
         # The internal _conn is a distinctive mock so we can assert B's
         # effective conn against it.
         inst = AsyncGoldLapel.__new__(AsyncGoldLapel)
-        inst._sync = GoldLapel("postgresql://fake/db", port=0)
+        inst._sync = GoldLapel("postgresql://fake/db", proxy_port=0)
         default_conn = MagicMock(name="default_internal_conn")
         inst._conn = default_conn
 
@@ -258,7 +258,7 @@ class TestAsyncUsingScopeIsolation:
         slip past.
         """
         inst = AsyncGoldLapel.__new__(AsyncGoldLapel)
-        inst._sync = GoldLapel("postgresql://fake/db", port=0)
+        inst._sync = GoldLapel("postgresql://fake/db", proxy_port=0)
         inst._conn = MagicMock(name="default_internal_conn")
 
         conn_a = MagicMock(name="conn_a")
@@ -398,9 +398,9 @@ class TestAllMethodsCount:
 
 def _reset_proxy_state():
     from goldlapel import proxy as proxy_mod
-    from goldlapel.proxy import DEFAULT_PORT
+    from goldlapel.proxy import DEFAULT_PROXY_PORT
     proxy_mod._instances.clear()
-    proxy_mod._next_port = DEFAULT_PORT
+    proxy_mod._next_port = DEFAULT_PROXY_PORT
 
 
 def _mock_popen_instance():
@@ -454,7 +454,7 @@ class TestAsyncStartupBanner:
                  patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
                  patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c), \
                  patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
-                await gl_async.start("postgresql://host:5432/mydb", config={"silent": True})
+                await gl_async.start("postgresql://host:5432/mydb", silent=True)
                 captured = capsys.readouterr()
                 assert "goldlapel →" not in captured.out
                 assert "goldlapel →" not in captured.err

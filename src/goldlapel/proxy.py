@@ -14,32 +14,29 @@ from contextvars import ContextVar
 from pathlib import Path
 
 
-DEFAULT_PORT = 7932
+DEFAULT_PROXY_PORT = 7932
 _STARTUP_TIMEOUT = 10.0
 _STARTUP_POLL_INTERVAL = 0.05
 
+# Keys that are valid inside the structured `config` map. Top-level concepts
+# (proxy_port, dashboard_port, invalidation_port, log_level, mode, license,
+# client, config_file) are exposed as top-level kwargs on `goldlapel.start`
+# and on the `GoldLapel` constructor, and are NOT valid keys here — passing
+# them through `config` raises.
 _VALID_CONFIG_KEYS = frozenset({
-    "mode", "min_pattern_count", "refresh_interval_secs", "pattern_ttl_secs",
+    "min_pattern_count", "refresh_interval_secs", "pattern_ttl_secs",
     "max_tables_per_view", "max_columns_per_view", "deep_pagination_threshold",
     "report_interval_secs", "result_cache_size", "batch_cache_size",
     "batch_cache_ttl_secs", "pool_size", "pool_timeout_secs",
     "pool_mode", "mgmt_idle_timeout", "fallback", "read_after_write_secs",
     "n1_threshold", "n1_window_ms", "n1_cross_threshold",
-    "tls_cert", "tls_key", "tls_client_ca", "config", "dashboard_port",
+    "tls_cert", "tls_key", "tls_client_ca",
     "disable_matviews", "disable_consolidation", "disable_btree_indexes",
     "disable_trigram_indexes", "disable_expression_indexes",
     "disable_partial_indexes", "disable_rewrite", "disable_prepared_cache",
     "disable_result_cache", "disable_pool",
     "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
     "enable_coalescing", "replica", "exclude_tables",
-    "invalidation_port", "log_level", "silent",
-})
-
-# Config keys consumed by the Python wrapper itself — not forwarded to the
-# Rust binary as CLI flags. Keep this list tight; each key here is a
-# wrapper-side behavior toggle.
-_WRAPPER_ONLY_KEYS = frozenset({
-    "silent",
 })
 
 _BOOLEAN_KEYS = frozenset({
@@ -48,7 +45,7 @@ _BOOLEAN_KEYS = frozenset({
     "disable_partial_indexes", "disable_rewrite", "disable_prepared_cache",
     "disable_result_cache", "disable_pool",
     "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
-    "enable_coalescing", "silent",
+    "enable_coalescing",
 })
 
 _LIST_KEYS = frozenset({
@@ -72,7 +69,7 @@ _LOG_LEVEL_TO_VERBOSE = {
 _instances = {}
 _cleanup_registered = False
 _lock = threading.Lock()
-_next_port = DEFAULT_PORT
+_next_port = DEFAULT_PROXY_PORT
 _utils_mod = None
 
 
@@ -94,33 +91,9 @@ def _config_to_args(config):
 
     args = []
     for key, value in config.items():
-        # Wrapper-side-only keys (e.g. `silent`) aren't forwarded to the Rust
-        # binary as CLI flags — they control Python wrapper behavior.
-        if key in _WRAPPER_ONLY_KEYS:
-            if key in _BOOLEAN_KEYS and not isinstance(value, bool):
-                raise TypeError(
-                    f"Config key '{key}' expects a bool, got {type(value).__name__}"
-                )
-            continue
-
         flag = "--" + key.replace("_", "-")
 
-        if key == "log_level":
-            if value is None:
-                continue
-            if not isinstance(value, str):
-                raise TypeError(
-                    f"Config key 'log_level' expects a string, got {type(value).__name__}"
-                )
-            normalized = value.lower()
-            if normalized not in _LOG_LEVEL_TO_VERBOSE:
-                raise ValueError(
-                    "log_level must be one of: trace, debug, info, warn, error"
-                )
-            verbose_flag = _LOG_LEVEL_TO_VERBOSE[normalized]
-            if verbose_flag is not None:
-                args.append(verbose_flag)
-        elif key in _BOOLEAN_KEYS:
+        if key in _BOOLEAN_KEYS:
             if not isinstance(value, bool):
                 raise TypeError(
                     f"Config key '{key}' expects a bool, got {type(value).__name__}"
@@ -140,6 +113,25 @@ def _config_to_args(config):
             args.extend([flag, str(value)])
 
     return args
+
+
+def _log_level_to_verbose_flag(level):
+    """Translate a log-level string into the proxy's count-based verbosity
+    flag (`-v`/`-vv`/`-vvv`). Returns None when no flag should be emitted
+    (warn/error map to the binary's default level). Raises on invalid input.
+    """
+    if level is None:
+        return None
+    if not isinstance(level, str):
+        raise TypeError(
+            f"log_level expects a string, got {type(level).__name__}"
+        )
+    normalized = level.lower()
+    if normalized not in _LOG_LEVEL_TO_VERBOSE:
+        raise ValueError(
+            "log_level must be one of: trace, debug, info, warn, error"
+        )
+    return _LOG_LEVEL_TO_VERBOSE[normalized]
 
 
 def _is_python_shim(path):
@@ -303,14 +295,55 @@ def _set_pdeathsig():
 
 
 class GoldLapel:
-    def __init__(self, upstream, config=None, port=None, extra_args=None):
+    def __init__(
+        self,
+        upstream,
+        *,
+        proxy_port=None,
+        dashboard_port=None,
+        invalidation_port=None,
+        log_level=None,
+        mode=None,
+        license=None,
+        client=None,
+        config_file=None,
+        config=None,
+        extra_args=None,
+        silent=False,
+    ):
         self._upstream = upstream
-        self._port = port if port is not None else DEFAULT_PORT
-        if config and "dashboard_port" in config:
-            self._dashboard_port = int(config["dashboard_port"])
-        else:
-            self._dashboard_port = self._port + 1
+        self._proxy_port = proxy_port if proxy_port is not None else DEFAULT_PROXY_PORT
+
+        # Dashboard / invalidation ports default to proxyPort + 1 / + 2 when
+        # unset. An explicit value (including 0 for "disable dashboard")
+        # overrides the derivation and is emitted as --dashboard-port /
+        # --invalidation-port at spawn time.
+        self._dashboard_port_explicit = dashboard_port is not None
+        self._dashboard_port = (
+            int(dashboard_port) if dashboard_port is not None else self._proxy_port + 1
+        )
+        self._invalidation_port_explicit = invalidation_port is not None
+        self._invalidation_port = (
+            int(invalidation_port) if invalidation_port is not None else self._proxy_port + 2
+        )
+
+        self._log_level = log_level
+        self._mode = mode
+        self._license = license
+        self._client = client
+        self._config_file = config_file
+        self._silent = bool(silent)
+
+        # Validate structured-config keys eagerly so a test that constructs
+        # without spawning still catches bad keys.
+        if config is not None:
+            unknown = set(config.keys()) - _VALID_CONFIG_KEYS
+            if unknown:
+                raise ValueError(
+                    f"Unknown config keys: {', '.join(sorted(unknown))}"
+                )
         self._config = config
+
         self._extra_args = extra_args or []
         self._process = None
         self._proxy_url = None
@@ -364,13 +397,37 @@ class GoldLapel:
         cmd = [
             binary,
             "--upstream", self._upstream,
-            "--proxy-port", str(self._port),
-        ] + _config_to_args(self._config) + self._extra_args
+            "--proxy-port", str(self._proxy_port),
+        ]
+        # Top-level options (promoted out of the config map) emit their own
+        # CLI flags before the tuning-knob config map. Each is suppressed
+        # when the user hasn't set it, so the Rust binary applies its own
+        # defaults.
+        if self._dashboard_port_explicit:
+            cmd += ["--dashboard-port", str(self._dashboard_port)]
+        if self._invalidation_port_explicit:
+            cmd += ["--invalidation-port", str(self._invalidation_port)]
+        verbose_flag = _log_level_to_verbose_flag(self._log_level)
+        if verbose_flag is not None:
+            cmd.append(verbose_flag)
+        if self._mode is not None:
+            cmd += ["--mode", self._mode]
+        if self._license is not None:
+            cmd += ["--license", self._license]
+        if self._client is not None:
+            cmd += ["--client", self._client]
+        if self._config_file is not None:
+            cmd += ["--config", self._config_file]
+        cmd += _config_to_args(self._config) + self._extra_args
 
-        _kill_orphan_on_port(self._port)
+        _kill_orphan_on_port(self._proxy_port)
 
         env = os.environ.copy()
-        env.setdefault("GOLDLAPEL_CLIENT", "python")
+        # GOLDLAPEL_CLIENT env var is only set when the user hasn't opted in
+        # via the top-level `client` kwarg (which emits --client and takes
+        # precedence over the env var).
+        if self._client is None:
+            env.setdefault("GOLDLAPEL_CLIENT", "python")
         # Provision a session-scoped dashboard token so the wrapper can call
         # /api/ddl/* without depending on ~/.goldlapel/dashboard-token. Pre-set
         # env wins (user may already have a token they want to use).
@@ -389,17 +446,17 @@ class GoldLapel:
             popen_kwargs["preexec_fn"] = _set_pdeathsig
         self._process = subprocess.Popen(cmd, **popen_kwargs)
 
-        if not _wait_for_port("127.0.0.1", self._port, _STARTUP_TIMEOUT):
+        if not _wait_for_port("127.0.0.1", self._proxy_port, _STARTUP_TIMEOUT):
             self._process.kill()
             stderr = self._process.stderr.read().decode(errors="replace")
             self._process.stderr.close()
             raise RuntimeError(
-                f"Gold Lapel failed to start on port {self._port} "
+                f"Gold Lapel failed to start on port {self._proxy_port} "
                 f"within {_STARTUP_TIMEOUT}s.\nstderr: {stderr}"
             )
 
         self._process.stderr.close()
-        self._proxy_url = _make_proxy_url(self._upstream, self._port)
+        self._proxy_url = _make_proxy_url(self._upstream, self._proxy_port)
 
         driver_name, driver = _detect_sync_driver()
         # The factory entry point `goldlapel.start(url)` raises ImportError if no
@@ -417,8 +474,9 @@ class GoldLapel:
                 else:
                     raw_conn = driver.connect(self._proxy_url)
                 from goldlapel.wrap import wrap
-                inv_port = int((self._config or {}).get("invalidation_port", self._port + 2))
-                self._conn = wrap(raw_conn, invalidation_port=inv_port)
+                # invalidation_port is resolved at construction: either the
+                # explicit kwarg or proxy_port + 2.
+                self._conn = wrap(raw_conn, invalidation_port=self._invalidation_port)
             except BaseException:
                 # Kill the subprocess we just spawned; leaked running processes = port
                 # collisions on retry + zombie resources. BaseException catches KeyboardInterrupt too.
@@ -437,15 +495,15 @@ class GoldLapel:
         # Startup banner: stderr, not stdout. Library code writing to stdout
         # pollutes app output, CI logs, and anything that captures stdout
         # (pytest -s, subprocess piping). Suppressed entirely when the caller
-        # passes `config={"silent": True}`.
-        if not (self._config or {}).get("silent", False):
+        # passes `silent=True`.
+        if not self._silent:
             if self._dashboard_port:
                 banner = (
-                    f"goldlapel → :{self._port} (proxy) | "
+                    f"goldlapel → :{self._proxy_port} (proxy) | "
                     f"http://127.0.0.1:{self._dashboard_port} (dashboard)"
                 )
             else:
-                banner = f"goldlapel → :{self._port} (proxy)"
+                banner = f"goldlapel → :{self._proxy_port} (proxy)"
             print(banner, file=sys.stderr)
 
         return self._proxy_url
@@ -500,9 +558,20 @@ class GoldLapel:
         return None
 
     @property
+    def proxy_port(self):
+        """Proxy listen port."""
+        return self._proxy_port
+
+    @property
     def dashboard_port(self):
-        """Dashboard port (None if disabled)."""
+        """Dashboard port (0 if disabled via setting to 0)."""
         return self._dashboard_port
+
+    @property
+    def invalidation_port(self):
+        """Cache-invalidation port (proxy_port + 2 by default, overridden
+        via the `invalidation_port` kwarg)."""
+        return self._invalidation_port
 
     @property
     def dashboard_token(self):
@@ -747,7 +816,21 @@ class GoldLapel:
         return _utils().explain_score(self._effective_conn(conn), *args, **kwargs)
 
 
-def _ensure_running(upstream, config=None, port=None, extra_args=None):
+def _ensure_running(
+    upstream,
+    *,
+    proxy_port=None,
+    dashboard_port=None,
+    invalidation_port=None,
+    log_level=None,
+    mode=None,
+    license=None,
+    client=None,
+    config_file=None,
+    config=None,
+    extra_args=None,
+    silent=False,
+):
     global _cleanup_registered, _next_port
     with _lock:
         if upstream in _instances:
@@ -756,12 +839,25 @@ def _ensure_running(upstream, config=None, port=None, extra_args=None):
                 return inst
             del _instances[upstream]
 
-        if port is None:
-            port = _next_port
-        if port >= _next_port:
-            _next_port = port + 1
+        if proxy_port is None:
+            proxy_port = _next_port
+        if proxy_port >= _next_port:
+            _next_port = proxy_port + 1
 
-        inst = GoldLapel(upstream, port=port, config=config, extra_args=extra_args)
+        inst = GoldLapel(
+            upstream,
+            proxy_port=proxy_port,
+            dashboard_port=dashboard_port,
+            invalidation_port=invalidation_port,
+            log_level=log_level,
+            mode=mode,
+            license=license,
+            client=client,
+            config_file=config_file,
+            config=config,
+            extra_args=extra_args,
+            silent=silent,
+        )
         _instances[upstream] = inst
         if not _cleanup_registered:
             atexit.register(_cleanup)
@@ -803,7 +899,21 @@ def _detect_async_driver():
     return None, None
 
 
-def start(upstream, config=None, port=None, extra_args=None):
+def start(
+    upstream,
+    *,
+    proxy_port=None,
+    dashboard_port=None,
+    invalidation_port=None,
+    log_level=None,
+    mode=None,
+    license=None,
+    client=None,
+    config_file=None,
+    config=None,
+    extra_args=None,
+    silent=False,
+):
     """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
     GoldLapel instance. Call wrapper methods on the returned instance
     (e.g. `gl.search(...)`), or use `gl.url` with your own Postgres driver.
@@ -811,6 +921,23 @@ def start(upstream, config=None, port=None, extra_args=None):
     Eager: opens the instance's internal DB connection before returning so the
     first wrapper method call is fast. Requires a sync Postgres driver
     installed (psycopg2 or psycopg3) — raises ImportError otherwise.
+
+    Top-level kwargs match the canonical config surface shared across every
+    Gold Lapel wrapper:
+
+    - proxy_port: proxy listen port (default 7932)
+    - dashboard_port: dashboard port (derived as proxy_port + 1 when unset; 0 disables)
+    - invalidation_port: cache-invalidation port (derived as proxy_port + 2)
+    - log_level: one of 'trace', 'debug', 'info', 'warn', 'error'
+    - mode: proxy operating mode ('waiter', 'bellhop', ...)
+    - license: path to the license file
+    - client: client identifier for telemetry tagging (sets GOLDLAPEL_CLIENT)
+    - config_file: path to a TOML config file (passed as --config to the binary)
+    - config: dict of tuning knobs (pool_size, disable_*, replica, ...)
+    - extra_args: raw CLI flags appended to the binary invocation
+    - silent: suppress the startup banner
+
+    Promoted top-level concepts are rejected inside the `config` dict.
 
     Usage:
         gl = goldlapel.start("postgresql://user:pass@db/mydb")
@@ -828,7 +955,20 @@ def start(upstream, config=None, port=None, extra_args=None):
             "Gold Lapel wrapper methods need a sync Postgres driver. "
             "Install one: `pip install psycopg2-binary` or `pip install psycopg`."
         )
-    inst = _ensure_running(upstream, config=config, port=port, extra_args=extra_args)
+    inst = _ensure_running(
+        upstream,
+        proxy_port=proxy_port,
+        dashboard_port=dashboard_port,
+        invalidation_port=invalidation_port,
+        log_level=log_level,
+        mode=mode,
+        license=license,
+        client=client,
+        config_file=config_file,
+        config=config,
+        extra_args=extra_args,
+        silent=silent,
+    )
     return inst
 
 
@@ -852,9 +992,7 @@ def connect(upstream=None):
     else:
         conn = driver.connect(inst.url)
     from goldlapel.wrap import wrap
-    config = inst._config or {}
-    inv_port = int(config.get("invalidation_port", inst._port + 2))
-    return wrap(conn, invalidation_port=inv_port)
+    return wrap(conn, invalidation_port=inst.invalidation_port)
 
 
 def stop(upstream=None):

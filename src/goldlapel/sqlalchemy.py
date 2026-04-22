@@ -28,21 +28,37 @@ def _restore_dialect(proxy_url, dialect):
 
 
 def _start_proxy(url, kwargs):
-    port = kwargs.pop("goldlapel_port", None)
+    proxy_port = kwargs.pop("goldlapel_proxy_port", None)
     config = kwargs.pop("goldlapel_config", None)
     extra_args = kwargs.pop("goldlapel_extra_args", None)
     invalidation_port = kwargs.pop("goldlapel_invalidation_port", None)
+    dashboard_port = kwargs.pop("goldlapel_dashboard_port", None)
+    log_level = kwargs.pop("goldlapel_log_level", None)
+    mode = kwargs.pop("goldlapel_mode", None)
     l1_cache = kwargs.pop("goldlapel_l1_cache", True)
     clean_url, dialect = _strip_dialect(_url_to_str(url))
-    os.environ.setdefault("GOLDLAPEL_CLIENT", "sqlalchemy")
-    goldlapel.start(clean_url, config=config, port=port, extra_args=extra_args)
+    inst = goldlapel.start(
+        clean_url,
+        proxy_port=proxy_port,
+        dashboard_port=dashboard_port,
+        invalidation_port=invalidation_port,
+        log_level=log_level,
+        mode=mode,
+        client="sqlalchemy",
+        config=config,
+        extra_args=extra_args,
+    )
     proxy_url = goldlapel.proxy_url() or clean_url
-
-    resolved_port = port or goldlapel.DEFAULT_PORT
-    if invalidation_port is None:
-        inv_port = int((config or {}).get("invalidation_port", resolved_port + 2))
+    # `inst` is a GoldLapel instance under the canonical surface; legacy mocks
+    # in tests may return a bare URL string — fall back to the resolved-at-
+    # caller kwarg or proxy_port + 2.
+    if hasattr(inst, "invalidation_port"):
+        inv_port = inst.invalidation_port
+    elif invalidation_port is not None:
+        inv_port = int(invalidation_port)
     else:
-        inv_port = invalidation_port
+        resolved_port = proxy_port if proxy_port is not None else goldlapel.DEFAULT_PROXY_PORT
+        inv_port = resolved_port + 2
 
     return _restore_dialect(proxy_url, dialect), inv_port, l1_cache
 
@@ -96,22 +112,45 @@ def create_async_engine(url, **kwargs):
     return _sa_create_async_engine(proxy, **kwargs)
 
 
-def init(url=None, *, config=None, port=None, extra_args=None, invalidation_port=None):
+def init(
+    url=None,
+    *,
+    config=None,
+    proxy_port=None,
+    dashboard_port=None,
+    invalidation_port=None,
+    log_level=None,
+    mode=None,
+    extra_args=None,
+):
     url = url or os.environ.get("DATABASE_URL")
     if not url:
         raise ValueError("Gold Lapel: DATABASE_URL not set. Pass a URL or set DATABASE_URL.")
     clean_url, dialect = _strip_dialect(_url_to_str(url))
-    os.environ.setdefault("GOLDLAPEL_CLIENT", "sqlalchemy")
-    proxy = goldlapel.start(clean_url, config=config, port=port, extra_args=extra_args)
+    inst = goldlapel.start(
+        clean_url,
+        proxy_port=proxy_port,
+        dashboard_port=dashboard_port,
+        invalidation_port=invalidation_port,
+        log_level=log_level,
+        mode=mode,
+        client="sqlalchemy",
+        config=config,
+        extra_args=extra_args,
+    )
+    if hasattr(inst, "url"):
+        proxy = inst.url
+    else:
+        proxy = inst  # legacy mock: returned a bare URL string
     proxy = _restore_dialect(proxy, dialect)
     os.environ["DATABASE_URL"] = proxy
-
-    resolved_port = port or goldlapel.DEFAULT_PORT
-    if invalidation_port is None:
-        inv_port = int((config or {}).get("invalidation_port", resolved_port + 2))
+    if hasattr(inst, "invalidation_port"):
+        os.environ["GOLDLAPEL_INVALIDATION_PORT"] = str(inst.invalidation_port)
+    elif invalidation_port is not None:
+        os.environ["GOLDLAPEL_INVALIDATION_PORT"] = str(invalidation_port)
     else:
-        inv_port = invalidation_port
-    os.environ["GOLDLAPEL_INVALIDATION_PORT"] = str(inv_port)
+        resolved_port = proxy_port if proxy_port is not None else goldlapel.DEFAULT_PROXY_PORT
+        os.environ["GOLDLAPEL_INVALIDATION_PORT"] = str(resolved_port + 2)
 
     return proxy
 
@@ -122,7 +161,7 @@ proxy_url = goldlapel.proxy_url
 GoldLapel = goldlapel.GoldLapel
 NativeCache = goldlapel.NativeCache
 wrap = goldlapel.wrap
-DEFAULT_PORT = goldlapel.DEFAULT_PORT
+DEFAULT_PROXY_PORT = goldlapel.DEFAULT_PROXY_PORT
 
 doc_insert = goldlapel.doc_insert
 doc_insert_many = goldlapel.doc_insert_many

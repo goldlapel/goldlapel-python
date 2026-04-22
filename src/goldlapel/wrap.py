@@ -5,13 +5,13 @@ _cache = None
 
 def _detect_invalidation_port():
     try:
-        from goldlapel.proxy import _instances, _lock, DEFAULT_PORT
+        from goldlapel.proxy import _instances, _lock, DEFAULT_PROXY_PORT
         with _lock:
             if _instances:
                 inst = next(iter(_instances.values()))
-                config = inst._config or {}
-                return int(config.get("invalidation_port", inst._port + 2))
-        return DEFAULT_PORT + 2
+                # invalidation_port is resolved at GoldLapel construction.
+                return inst.invalidation_port
+        return DEFAULT_PROXY_PORT + 2
     except Exception:
         return 7934
 

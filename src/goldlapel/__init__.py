@@ -1,6 +1,6 @@
 # v0.2.0 factory API — `goldlapel.start(url)` returns a GoldLapel instance.
 # For async, use `from goldlapel.asyncio import start`.
-from goldlapel.proxy import start, connect, stop, proxy_url, dashboard_url, config_keys, GoldLapel, DEFAULT_PORT
+from goldlapel.proxy import start, connect, stop, proxy_url, dashboard_url, config_keys, GoldLapel, DEFAULT_PROXY_PORT
 from goldlapel.wrap import wrap
 from goldlapel.cache import NativeCache
 

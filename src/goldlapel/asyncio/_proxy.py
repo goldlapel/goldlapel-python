@@ -26,6 +26,7 @@ from goldlapel.proxy import (
     _config_to_args,
     _find_binary,
     _kill_orphan_on_port,
+    _log_level_to_verbose_flag,
     _make_proxy_url,
     _set_pdeathsig,
     _wait_for_port,
@@ -103,10 +104,38 @@ class AsyncGoldLapel:
     AsyncCachedConnection used by user-supplied conns.
     """
 
-    def __init__(self, upstream, config=None, port=None, extra_args=None):
+    def __init__(
+        self,
+        upstream,
+        *,
+        proxy_port=None,
+        dashboard_port=None,
+        invalidation_port=None,
+        log_level=None,
+        mode=None,
+        license=None,
+        client=None,
+        config_file=None,
+        config=None,
+        extra_args=None,
+        silent=False,
+    ):
         # Piggyback on the sync GoldLapel for subprocess/lifecycle state so
         # `using(conn)` / ContextVar semantics and stop-on-exit are identical.
-        self._sync = GoldLapel(upstream, config=config, port=port, extra_args=extra_args)
+        self._sync = GoldLapel(
+            upstream,
+            proxy_port=proxy_port,
+            dashboard_port=dashboard_port,
+            invalidation_port=invalidation_port,
+            log_level=log_level,
+            mode=mode,
+            license=license,
+            client=client,
+            config_file=config_file,
+            config=config,
+            extra_args=extra_args,
+            silent=silent,
+        )
         self._conn = None  # AsyncCachedConnection (wraps asyncpg.Connection)
 
     # -- Properties (sync access, no await) ---------------------------------
@@ -150,16 +179,36 @@ class AsyncGoldLapel:
             import os
             import subprocess
             binary = _find_binary()
+            sync = self._sync
             cmd = [
                 binary,
-                "--upstream", self._sync._upstream,
-                "--proxy-port", str(self._sync._port),
-            ] + _config_to_args(self._sync._config) + self._sync._extra_args
+                "--upstream", sync._upstream,
+                "--proxy-port", str(sync._proxy_port),
+            ]
+            # Mirror sync GoldLapel.start: emit canonical top-level flags
+            # before the structured config map.
+            if sync._dashboard_port_explicit:
+                cmd += ["--dashboard-port", str(sync._dashboard_port)]
+            if sync._invalidation_port_explicit:
+                cmd += ["--invalidation-port", str(sync._invalidation_port)]
+            verbose_flag = _log_level_to_verbose_flag(sync._log_level)
+            if verbose_flag is not None:
+                cmd.append(verbose_flag)
+            if sync._mode is not None:
+                cmd += ["--mode", sync._mode]
+            if sync._license is not None:
+                cmd += ["--license", sync._license]
+            if sync._client is not None:
+                cmd += ["--client", sync._client]
+            if sync._config_file is not None:
+                cmd += ["--config", sync._config_file]
+            cmd += _config_to_args(sync._config) + sync._extra_args
 
-            _kill_orphan_on_port(self._sync._port)
+            _kill_orphan_on_port(sync._proxy_port)
 
             env = os.environ.copy()
-            env.setdefault("GOLDLAPEL_CLIENT", "python")
+            if sync._client is None:
+                env.setdefault("GOLDLAPEL_CLIENT", "python")
             # Provision a session-scoped dashboard token so ddl.py can
             # authenticate against /api/ddl/*. See GoldLapel.start in proxy.py
             # for the sync-side mirror of this logic.
@@ -178,17 +227,17 @@ class AsyncGoldLapel:
                 popen_kwargs["preexec_fn"] = _set_pdeathsig
             self._sync._process = subprocess.Popen(cmd, **popen_kwargs)
 
-            if not _wait_for_port("127.0.0.1", self._sync._port, _STARTUP_TIMEOUT):
+            if not _wait_for_port("127.0.0.1", self._sync._proxy_port, _STARTUP_TIMEOUT):
                 self._sync._process.kill()
                 stderr = self._sync._process.stderr.read().decode(errors="replace")
                 self._sync._process.stderr.close()
                 raise RuntimeError(
-                    f"Gold Lapel failed to start on port {self._sync._port} "
+                    f"Gold Lapel failed to start on port {self._sync._proxy_port} "
                     f"within {_STARTUP_TIMEOUT}s.\nstderr: {stderr}"
                 )
             self._sync._process.stderr.close()
             self._sync._proxy_url = _make_proxy_url(
-                self._sync._upstream, self._sync._port,
+                self._sync._upstream, self._sync._proxy_port,
             )
 
         # -- asyncpg connect + cache wrap, with cleanup on failure --
@@ -205,19 +254,18 @@ class AsyncGoldLapel:
         try:
             raw = await _open_asyncpg_conn(self._sync._proxy_url)
             from goldlapel.wrap import wrap
-            inv_port = int(
-                (self._sync._config or {}).get("invalidation_port", self._sync._port + 2),
-            )
-            self._conn = wrap(raw, invalidation_port=inv_port)
+            # invalidation_port is resolved at construction: either the
+            # explicit kwarg or proxy_port + 2.
+            self._conn = wrap(raw, invalidation_port=self._sync._invalidation_port)
         except BaseException:
             # Kill subprocess + close any half-open asyncpg conn before raising.
             await self._teardown_async()
             raise
 
         # Startup banner — matches the sync path's stderr banner.
-        if not (self._sync._config or {}).get("silent", False):
+        if not self._sync._silent:
             banner = (
-                f"goldlapel → :{self._sync._port} (proxy) | "
+                f"goldlapel → :{self._sync._proxy_port} (proxy) | "
                 f"http://127.0.0.1:{self._sync._dashboard_port} (dashboard)"
             )
             print(banner, file=sys.stderr)
@@ -425,11 +473,14 @@ def _register_cleanup():
         proxy_mod._cleanup_registered = True
 
 
-async def _actual_start(upstream, config=None, port=None, extra_args=None):
+async def _actual_start(upstream, **kwargs):
     """Spawn (or reuse) a proxy instance + open the internal asyncpg conn.
 
     Mirrors goldlapel.proxy._ensure_running but for AsyncGoldLapel and with
     async connect inlined so we don't block the loop via threadpool bounces.
+    `kwargs` carries the canonical-surface options (proxy_port,
+    dashboard_port, invalidation_port, log_level, mode, license, client,
+    config_file, config, extra_args, silent).
     """
     asyncpg = _detect_asyncpg()
     if asyncpg is None:
@@ -439,6 +490,7 @@ async def _actual_start(upstream, config=None, port=None, extra_args=None):
         )
 
     from goldlapel import proxy as proxy_mod
+    proxy_port = kwargs.get("proxy_port")
     with proxy_mod._lock:
         # If an instance already exists for this upstream and is running, reuse
         # its subprocess but still open a *new* asyncpg conn for this caller —
@@ -455,13 +507,11 @@ async def _actual_start(upstream, config=None, port=None, extra_args=None):
             # Fresh instance.
             if existing:
                 del proxy_mod._instances[existing._upstream]
-            if port is None:
-                port = proxy_mod._next_port
-            if port >= proxy_mod._next_port:
-                proxy_mod._next_port = port + 1
-            inst = AsyncGoldLapel(
-                upstream, port=port, config=config, extra_args=extra_args,
-            )
+            if proxy_port is None:
+                proxy_port = proxy_mod._next_port
+            if proxy_port >= proxy_mod._next_port:
+                proxy_mod._next_port = proxy_port + 1
+            inst = AsyncGoldLapel(upstream, **{**kwargs, "proxy_port": proxy_port})
             proxy_mod._instances[upstream] = inst._sync
             need_spawn = True
         _register_cleanup()
@@ -473,12 +523,8 @@ async def _actual_start(upstream, config=None, port=None, extra_args=None):
             # Reusing existing subprocess — just open the conn.
             raw = await _open_asyncpg_conn(inst._sync._proxy_url)
             from goldlapel.wrap import wrap
-            inv_port = int(
-                (inst._sync._config or {}).get(
-                    "invalidation_port", inst._sync._port + 2,
-                ),
-            )
-            inst._conn = wrap(raw, invalidation_port=inv_port)
+            # invalidation_port is resolved at sync construction.
+            inst._conn = wrap(raw, invalidation_port=inst._sync._invalidation_port)
         return inst
     except Exception:
         if need_spawn:
@@ -505,8 +551,9 @@ class _StartHandle:
         "call goldlapel.asyncio.start(...) again for a new handle"
     )
 
-    def __init__(self, upstream, config=None, port=None, extra_args=None):
-        self._args = (upstream, config, port, extra_args)
+    def __init__(self, upstream, **kwargs):
+        self._upstream = upstream
+        self._kwargs = kwargs
         self._inst = None
         self._consumed = False
 
@@ -515,14 +562,14 @@ class _StartHandle:
         if self._consumed:
             raise RuntimeError(self._CONSUMED_MSG)
         self._consumed = True
-        return _actual_start(*self._args).__await__()
+        return _actual_start(self._upstream, **self._kwargs).__await__()
 
     async def __aenter__(self):
         # Enable `async with start(url) as gl:`.
         if self._consumed:
             raise RuntimeError(self._CONSUMED_MSG)
         self._consumed = True
-        self._inst = await _actual_start(*self._args)
+        self._inst = await _actual_start(self._upstream, **self._kwargs)
         return self._inst
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -531,14 +578,28 @@ class _StartHandle:
         return False
 
 
-def start(upstream, config=None, port=None, extra_args=None):
+def start(
+    upstream,
+    *,
+    proxy_port=None,
+    dashboard_port=None,
+    invalidation_port=None,
+    log_level=None,
+    mode=None,
+    license=None,
+    client=None,
+    config_file=None,
+    config=None,
+    extra_args=None,
+    silent=False,
+):
     """Factory: spawn a Gold Lapel proxy and return an AsyncGoldLapel instance.
 
     Usable both as an awaitable and as an async context manager.
 
-    Requires `asyncpg` installed — raises ImportError otherwise. The public
-    API is identical to v0.2.0; only the underlying driver changed from
-    psycopg-via-thread to native asyncpg.
+    Requires `asyncpg` installed — raises ImportError otherwise. Canonical
+    top-level kwargs match the sync `goldlapel.start` factory — see its
+    docstring for the full list.
 
     Usage:
         from goldlapel.asyncio import start
@@ -552,4 +613,17 @@ def start(upstream, config=None, port=None, extra_args=None):
         async with start("postgresql://...") as gl:
             hits = await gl.search(...)
     """
-    return _StartHandle(upstream, config=config, port=port, extra_args=extra_args)
+    return _StartHandle(
+        upstream,
+        proxy_port=proxy_port,
+        dashboard_port=dashboard_port,
+        invalidation_port=invalidation_port,
+        log_level=log_level,
+        mode=mode,
+        license=license,
+        client=client,
+        config_file=config_file,
+        config=config,
+        extra_args=extra_args,
+        silent=silent,
+    )
