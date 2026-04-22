@@ -372,7 +372,7 @@ class GoldLapel:
         env = os.environ.copy()
         env.setdefault("GOLDLAPEL_CLIENT", "python")
         # Provision a session-scoped dashboard token so the wrapper can call
-        # /api/ddl/* without depending on ~/.goldlapel/dashboard_token. Pre-set
+        # /api/ddl/* without depending on ~/.goldlapel/dashboard-token. Pre-set
         # env wins (user may already have a token they want to use).
         if "GOLDLAPEL_DASHBOARD_TOKEN" in env and env["GOLDLAPEL_DASHBOARD_TOKEN"]:
             self._dashboard_token = env["GOLDLAPEL_DASHBOARD_TOKEN"]

@@ -87,7 +87,7 @@ class TestTokenResolution:
         # Write a file that should lose
         d = tmp_path / ".goldlapel"
         d.mkdir()
-        (d / "dashboard_token").write_text("file-token\n")
+        (d / "dashboard-token").write_text("file-token\n")
         monkeypatch.setenv("HOME", str(tmp_path))
         assert ddl.token_from_env_or_file() == "env-token"
 
@@ -95,7 +95,7 @@ class TestTokenResolution:
         monkeypatch.delenv("GOLDLAPEL_DASHBOARD_TOKEN", raising=False)
         d = tmp_path / ".goldlapel"
         d.mkdir()
-        (d / "dashboard_token").write_text("  file-token  \n")
+        (d / "dashboard-token").write_text("  file-token  \n")
         monkeypatch.setenv("HOME", str(tmp_path))
         assert ddl.token_from_env_or_file() == "file-token"
 

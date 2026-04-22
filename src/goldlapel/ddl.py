@@ -14,7 +14,7 @@ Token + port resolution:
 - `GoldLapel` passes `dashboard_port` + `dashboard_token` explicitly when it
   spawned the proxy subprocess (the happy path).
 - For externally-launched proxies, wrapper reads
-  `GOLDLAPEL_DASHBOARD_TOKEN` env or `~/.goldlapel/dashboard_token` file.
+  `GOLDLAPEL_DASHBOARD_TOKEN` env or `~/.goldlapel/dashboard-token` file.
 """
 
 import json
@@ -39,13 +39,13 @@ _CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 def token_from_env_or_file():
     """Resolve dashboard token for externally-launched proxies.
 
-    Priority: GOLDLAPEL_DASHBOARD_TOKEN env > ~/.goldlapel/dashboard_token file.
+    Priority: GOLDLAPEL_DASHBOARD_TOKEN env > ~/.goldlapel/dashboard-token file.
     Returns None if neither is set — caller should raise a clear error.
     """
     env = os.environ.get("GOLDLAPEL_DASHBOARD_TOKEN")
     if env:
         return env.strip()
-    home = Path.home() / ".goldlapel" / "dashboard_token"
+    home = Path.home() / ".goldlapel" / "dashboard-token"
     if home.exists():
         try:
             return home.read_text(encoding="utf-8").strip() or None
@@ -161,7 +161,7 @@ def fetch(owner, family, name, dashboard_port, dashboard_token):
             raise RuntimeError(
                 "Gold Lapel dashboard rejected the DDL request (403). "
                 "The dashboard token is missing or incorrect — check "
-                "GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard_token."
+                "GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard-token."
             )
         raise RuntimeError(
             f"Gold Lapel DDL API {family}/{name} failed with {status} {error}: {detail}"
