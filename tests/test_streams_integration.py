@@ -110,7 +110,7 @@ class TestStreamDdlOwnership:
         no extra HTTP round-trip to /api/ddl/*."""
         from goldlapel import ddl as _ddl
 
-        real_fetch = _ddl.fetch
+        real_fetch = _ddl.fetch_patterns
         counter = {"n": 0}
 
         def counting_fetch(*args, **kwargs):

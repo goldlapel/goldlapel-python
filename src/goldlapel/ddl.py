@@ -124,7 +124,7 @@ def _post(url, token, body, timeout=10.0):
     return status, parsed
 
 
-def fetch(owner, family, name, dashboard_port, dashboard_token):
+def fetch_patterns(owner, family, name, dashboard_port, dashboard_token):
     """Fetch (and cache) the canonical {tables, query_patterns} for a helper.
 
     Per-session cache: one HTTP call on the first call for a given (family, name);

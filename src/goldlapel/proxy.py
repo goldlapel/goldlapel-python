@@ -692,7 +692,7 @@ class GoldLapel:
         only returns the patterns the wrapper should run against the proxy."""
         from goldlapel import ddl as _ddl
         token = self._dashboard_token or _ddl.token_from_env_or_file()
-        return _ddl.fetch(self, "stream", stream, self._dashboard_port, token)
+        return _ddl.fetch_patterns(self, "stream", stream, self._dashboard_port, token)
 
     def stream_add(self, stream, payload, *, conn=None):
         patterns = self._stream_patterns(stream)

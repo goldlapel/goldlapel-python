@@ -135,7 +135,7 @@ class TestFetch:
             },
         )]
         owner = FakeOwner()
-        result = ddl.fetch(owner, "stream", "events", fake_server.port, "tok")
+        result = ddl.fetch_patterns(owner, "stream", "events", fake_server.port, "tok")
         assert result["tables"]["main"] == "_goldlapel.stream_events"
         assert result["query_patterns"]["insert"] == "INSERT ..."
 
@@ -157,8 +157,8 @@ class TestFetch:
             },
         )]
         owner = FakeOwner()
-        r1 = ddl.fetch(owner, "stream", "events", fake_server.port, "tok")
-        r2 = ddl.fetch(owner, "stream", "events", fake_server.port, "tok")
+        r1 = ddl.fetch_patterns(owner, "stream", "events", fake_server.port, "tok")
+        r2 = ddl.fetch_patterns(owner, "stream", "events", fake_server.port, "tok")
         assert r1 is r2
         # Only one HTTP request — second call served from cache.
         assert len(_FakeHandler.captured) == 1
@@ -176,8 +176,8 @@ class TestFetch:
                 },
             ))
         owner = FakeOwner()
-        ddl.fetch(owner, "stream", "events", fake_server.port, "tok")
-        ddl.fetch(owner, "stream", "orders", fake_server.port, "tok")
+        ddl.fetch_patterns(owner, "stream", "events", fake_server.port, "tok")
+        ddl.fetch_patterns(owner, "stream", "orders", fake_server.port, "tok")
         assert len(_FakeHandler.captured) == 2
 
     def test_different_owners_have_isolated_caches(self, fake_server):
@@ -191,8 +191,8 @@ class TestFetch:
             ))
         a = FakeOwner()
         b = FakeOwner()
-        ddl.fetch(a, "stream", "events", fake_server.port, "tok")
-        ddl.fetch(b, "stream", "events", fake_server.port, "tok")
+        ddl.fetch_patterns(a, "stream", "events", fake_server.port, "tok")
+        ddl.fetch_patterns(b, "stream", "events", fake_server.port, "tok")
         assert len(_FakeHandler.captured) == 2
 
     def test_version_mismatch_raises_actionable_error(self, fake_server):
@@ -207,29 +207,29 @@ class TestFetch:
         )]
         owner = FakeOwner()
         with pytest.raises(RuntimeError, match="schema version mismatch"):
-            ddl.fetch(owner, "stream", "events", fake_server.port, "tok")
+            ddl.fetch_patterns(owner, "stream", "events", fake_server.port, "tok")
 
     def test_403_raises_token_error(self, fake_server):
         _FakeHandler.responses = [(403, {"error": "forbidden"})]
         owner = FakeOwner()
         with pytest.raises(RuntimeError, match="dashboard token"):
-            ddl.fetch(owner, "stream", "events", fake_server.port, "tok")
+            ddl.fetch_patterns(owner, "stream", "events", fake_server.port, "tok")
 
     def test_missing_token_raises_before_http(self):
         owner = FakeOwner()
         with pytest.raises(RuntimeError, match="No dashboard token"):
-            ddl.fetch(owner, "stream", "events", 9999, None)
+            ddl.fetch_patterns(owner, "stream", "events", 9999, None)
 
     def test_missing_port_raises_before_http(self):
         owner = FakeOwner()
         with pytest.raises(RuntimeError, match="No dashboard port"):
-            ddl.fetch(owner, "stream", "events", None, "tok")
+            ddl.fetch_patterns(owner, "stream", "events", None, "tok")
 
     def test_server_unreachable_raises_actionable_error(self):
         owner = FakeOwner()
         # Bind nothing — port 1 is guaranteed-closed for this process.
         with pytest.raises(RuntimeError, match="Gold Lapel dashboard not reachable"):
-            ddl.fetch(owner, "stream", "events", 1, "tok")
+            ddl.fetch_patterns(owner, "stream", "events", 1, "tok")
 
     def test_invalidate_drops_cache(self, fake_server):
         for _ in range(2):
@@ -241,9 +241,9 @@ class TestFetch:
                 },
             ))
         owner = FakeOwner()
-        ddl.fetch(owner, "stream", "events", fake_server.port, "tok")
+        ddl.fetch_patterns(owner, "stream", "events", fake_server.port, "tok")
         ddl.invalidate(owner)
-        ddl.fetch(owner, "stream", "events", fake_server.port, "tok")
+        ddl.fetch_patterns(owner, "stream", "events", fake_server.port, "tok")
         # Two HTTP calls — cache was cleared between them.
         assert len(_FakeHandler.captured) == 2
 

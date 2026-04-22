@@ -332,7 +332,7 @@ class AsyncGoldLapel:
         loop = _asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
-            _ddl.fetch,
+            _ddl.fetch_patterns,
             self,  # owner for cache
             "stream",
             stream,

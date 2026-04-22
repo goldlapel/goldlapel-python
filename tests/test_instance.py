@@ -104,7 +104,7 @@ class TestInstanceMethodDelegation:
             self.fake_conn, "leaderboard", "player1", 100
         )
 
-    @patch("goldlapel.ddl.fetch")
+    @patch("goldlapel.ddl.fetch_patterns")
     @patch("goldlapel.proxy._utils")
     def test_stream_add(self, mock_utils, mock_ddl_fetch):
         # Stream DDL patterns now come from the proxy's /api/ddl/* endpoint.
