@@ -761,7 +761,7 @@ def start(upstream, config=None, port=None, extra_args=None):
             gl.search(...)
         # proxy stopped automatically on exit
     """
-    driver_name, driver = _detect_sync_driver()
+    _, driver = _detect_sync_driver()
     if driver is None:
         raise ImportError(
             "Gold Lapel wrapper methods need a sync Postgres driver. "
