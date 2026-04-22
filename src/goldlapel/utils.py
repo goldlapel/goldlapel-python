@@ -28,7 +28,11 @@ import threading
 
 
 def _validate_identifier(name):
-    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+    # Bound to 63 chars (Postgres NAMEDATALEN-1) so identifiers match the
+    # proxy's server-side regex exactly: `^[A-Za-z_][A-Za-z0-9_]{0,62}$`.
+    # Prevents client-side-only clients from slipping oversized names past
+    # the wrapper into queries that would only fail on the proxy.
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]{0,62}$', name):
         raise ValueError(f"Invalid identifier: {name}")
 
 
