@@ -36,7 +36,9 @@ dev = [
 
 [project.urls]
 Homepage = "https://goldlapel.com"
+Documentation = "https://goldlapel.com/docs/python"
 Repository = "https://github.com/goldlapel/goldlapel-python"
+Issues = "https://github.com/goldlapel/goldlapel-python/issues"
 
 [project.scripts]
 goldlapel = "goldlapel.cli:main"
