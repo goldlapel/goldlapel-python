@@ -1050,7 +1050,14 @@ class TestDocWatch:
         calls = [c[0][0] for c in cur.execute.call_args_list]
         assert any("CREATE OR REPLACE FUNCTION _gl_watch_events()" in c for c in calls)
         assert any("pg_notify" in c for c in calls)
-        assert any("CREATE TRIGGER _gl_watch_events_trigger" in c for c in calls)
+        # Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
+        # Avoids the race where a DROP + CREATE pair could have two concurrent
+        # doc_watch calls replace each other's triggers mid-flight.
+        assert any("CREATE OR REPLACE TRIGGER _gl_watch_events_trigger" in c for c in calls)
+        # Guard against the racy DROP + CREATE pair regressing.
+        assert not any(
+            "DROP TRIGGER IF EXISTS _gl_watch_events_trigger" in c for c in calls
+        )
 
     @pytest.fixture
     def mock_listen(self, monkeypatch):
@@ -1110,7 +1117,12 @@ class TestDocTTL:
         assert any("CREATE INDEX IF NOT EXISTS idx_sessions_ttl" in c for c in calls)
         assert any("CREATE OR REPLACE FUNCTION _gl_ttl_sessions()" in c for c in calls)
         assert any("INTERVAL '3600 seconds'" in c for c in calls)
-        assert any("CREATE TRIGGER _gl_ttl_sessions_trigger" in c for c in calls)
+        # Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
+        assert any("CREATE OR REPLACE TRIGGER _gl_ttl_sessions_trigger" in c for c in calls)
+        # Guard against the racy DROP + CREATE pair regressing.
+        assert not any(
+            "DROP TRIGGER IF EXISTS _gl_ttl_sessions_trigger" in c for c in calls
+        )
 
     def test_ttl_validates_seconds(self):
         conn, _ = capture_sql()
@@ -1138,7 +1150,12 @@ class TestDocCapped:
         assert any("CREATE OR REPLACE FUNCTION _gl_cap_logs()" in c for c in calls)
         assert any("COUNT(*) - 1000" in c for c in calls)
         assert any("DELETE" in c and "LIMIT excess" in c for c in calls)
-        assert any("CREATE TRIGGER _gl_cap_logs_trigger" in c for c in calls)
+        # Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
+        assert any("CREATE OR REPLACE TRIGGER _gl_cap_logs_trigger" in c for c in calls)
+        # Guard against the racy DROP + CREATE pair regressing.
+        assert not any(
+            "DROP TRIGGER IF EXISTS _gl_cap_logs_trigger" in c for c in calls
+        )
 
     def test_capped_ensures_collection(self):
         conn, cur = capture_sql()

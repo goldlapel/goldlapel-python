@@ -1813,13 +1813,15 @@ def doc_watch(conn, collection, callback, blocking=True):
         $$ LANGUAGE plpgsql
     """)
 
+    # CREATE OR REPLACE TRIGGER (Postgres 14+) is atomic — no window where
+    # the trigger is missing between drop and create, and a redefinition
+    # cleanly replaces the old one instead of being silently swallowed by
+    # `EXCEPTION WHEN duplicate_object`. GL targets PG14+ across the
+    # product, so this is safe and matches the Go wrapper.
     cur.execute(f"""
-        DO $$ BEGIN
-            CREATE TRIGGER _gl_watch_{collection}_trigger
-                AFTER INSERT OR UPDATE OR DELETE ON {collection}
-                FOR EACH ROW EXECUTE FUNCTION _gl_watch_{collection}();
-        EXCEPTION WHEN duplicate_object THEN NULL;
-        END $$
+        CREATE OR REPLACE TRIGGER _gl_watch_{collection}_trigger
+            AFTER INSERT OR UPDATE OR DELETE ON {collection}
+            FOR EACH ROW EXECUTE FUNCTION _gl_watch_{collection}()
     """)
     raw.commit()
     cur.close()
@@ -1882,13 +1884,12 @@ def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_
         $$ LANGUAGE plpgsql
     """)
 
+    # CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and redefinable.
+    # See doc_watch for rationale.
     cur.execute(f"""
-        DO $$ BEGIN
-            CREATE TRIGGER _gl_ttl_{collection}_trigger
-                BEFORE INSERT ON {collection}
-                FOR EACH STATEMENT EXECUTE FUNCTION _gl_ttl_{collection}();
-        EXCEPTION WHEN duplicate_object THEN NULL;
-        END $$
+        CREATE OR REPLACE TRIGGER _gl_ttl_{collection}_trigger
+            BEFORE INSERT ON {collection}
+            FOR EACH STATEMENT EXECUTE FUNCTION _gl_ttl_{collection}()
     """)
     raw.commit()
     cur.close()
@@ -1936,13 +1937,12 @@ def doc_create_capped(conn, collection, max_documents):
         $$ LANGUAGE plpgsql
     """)
 
+    # CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and redefinable.
+    # See doc_watch for rationale.
     cur.execute(f"""
-        DO $$ BEGIN
-            CREATE TRIGGER _gl_cap_{collection}_trigger
-                AFTER INSERT ON {collection}
-                FOR EACH STATEMENT EXECUTE FUNCTION _gl_cap_{collection}();
-        EXCEPTION WHEN duplicate_object THEN NULL;
-        END $$
+        CREATE OR REPLACE TRIGGER _gl_cap_{collection}_trigger
+            AFTER INSERT ON {collection}
+            FOR EACH STATEMENT EXECUTE FUNCTION _gl_cap_{collection}()
     """)
     raw.commit()
     cur.close()
