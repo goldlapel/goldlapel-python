@@ -468,19 +468,23 @@ def count_distinct(conn, table, column):
     return result
 
 
-def stream_add(conn, stream, payload):
+def _stream_sql(patterns, key):
+    """Translate the proxy's $N placeholders to psycopg's %s syntax."""
+    from goldlapel.ddl import to_psycopg
+    return to_psycopg(patterns["query_patterns"][key])
+
+
+def stream_add(conn, stream, payload, *, patterns=None):
+    if patterns is None:
+        raise RuntimeError(
+            "stream_add requires DDL patterns from the proxy — call via "
+            "`gl.stream_add(...)` rather than the utils function directly."
+        )
     _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {stream} (
-            id BIGSERIAL PRIMARY KEY,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
     cur.execute(
-        f"INSERT INTO {stream} (payload) VALUES (%s) RETURNING id",
+        _stream_sql(patterns, "insert"),
         (json.dumps(payload),),
     )
     msg_id = cur.fetchone()[0]
@@ -489,51 +493,36 @@ def stream_add(conn, stream, payload):
     return msg_id
 
 
-def stream_create_group(conn, stream, group):
+def stream_create_group(conn, stream, group, *, patterns=None):
+    if patterns is None:
+        raise RuntimeError(
+            "stream_create_group requires DDL patterns from the proxy — call via "
+            "`gl.stream_create_group(...)` rather than the utils function directly."
+        )
     _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {stream}_groups (
-            group_name TEXT PRIMARY KEY,
-            last_delivered_id BIGINT NOT NULL DEFAULT 0
-        )
-    """)
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {stream}_pending (
-            message_id BIGINT NOT NULL,
-            group_name TEXT NOT NULL,
-            consumer TEXT NOT NULL,
-            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            delivery_count INT NOT NULL DEFAULT 1,
-            PRIMARY KEY (group_name, message_id)
-        )
-    """)
-    cur.execute(
-        f"INSERT INTO {stream}_groups (group_name) VALUES (%s) ON CONFLICT DO NOTHING",
-        (group,),
-    )
+    cur.execute(_stream_sql(patterns, "create_group"), (group,))
     raw.commit()
     cur.close()
 
 
-def stream_read(conn, stream, group, consumer, count=1):
+def stream_read(conn, stream, group, consumer, count=1, *, patterns=None):
+    if patterns is None:
+        raise RuntimeError(
+            "stream_read requires DDL patterns from the proxy — call via "
+            "`gl.stream_read(...)` rather than the utils function directly."
+        )
     _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(
-        f"SELECT last_delivered_id FROM {stream}_groups WHERE group_name = %s FOR UPDATE",
-        (group,),
-    )
+    cur.execute(_stream_sql(patterns, "group_get_cursor"), (group,))
     row = cur.fetchone()
     if not row:
         cur.close()
         return []
     last_id = row[0]
-    cur.execute(
-        f"SELECT id, payload, created_at FROM {stream} WHERE id > %s ORDER BY id LIMIT %s",
-        (last_id, count),
-    )
+    cur.execute(_stream_sql(patterns, "read_since"), (last_id, count))
     messages = []
     for r in cur.fetchall():
         msg_id, payload, created_at = r
@@ -545,58 +534,59 @@ def stream_read(conn, stream, group, consumer, count=1):
     if messages:
         new_last = messages[-1]["id"]
         cur.execute(
-            f"UPDATE {stream}_groups SET last_delivered_id = %s WHERE group_name = %s",
+            _stream_sql(patterns, "group_advance_cursor"),
             (new_last, group),
         )
+        pending_insert = _stream_sql(patterns, "pending_insert")
         for msg in messages:
-            cur.execute(
-                f"""INSERT INTO {stream}_pending (message_id, group_name, consumer)
-                    VALUES (%s, %s, %s) ON CONFLICT (group_name, message_id) DO NOTHING""",
-                (msg["id"], group, consumer),
-            )
+            cur.execute(pending_insert, (msg["id"], group, consumer))
     raw.commit()
     cur.close()
     return messages
 
 
-def stream_ack(conn, stream, group, message_id):
+def stream_ack(conn, stream, group, message_id, *, patterns=None):
+    if patterns is None:
+        raise RuntimeError(
+            "stream_ack requires DDL patterns from the proxy — call via "
+            "`gl.stream_ack(...)` rather than the utils function directly."
+        )
     _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(
-        f"DELETE FROM {stream}_pending WHERE group_name = %s AND message_id = %s",
-        (group, message_id),
-    )
+    cur.execute(_stream_sql(patterns, "ack"), (group, message_id))
     removed = cur.rowcount > 0
     raw.commit()
     cur.close()
     return removed
 
 
-def stream_claim(conn, stream, group, consumer, min_idle_ms=60000):
+def stream_claim(conn, stream, group, consumer, min_idle_ms=60000, *, patterns=None):
+    if patterns is None:
+        raise RuntimeError(
+            "stream_claim requires DDL patterns from the proxy — call via "
+            "`gl.stream_claim(...)` rather than the utils function directly."
+        )
     _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"""
-        UPDATE {stream}_pending
-        SET consumer = %s, claimed_at = NOW(), delivery_count = delivery_count + 1
-        WHERE group_name = %s AND claimed_at < NOW() - INTERVAL '1 millisecond' * %s
-        RETURNING message_id
-    """, (consumer, group, min_idle_ms))
+    cur.execute(
+        _stream_sql(patterns, "claim"),
+        (consumer, group, min_idle_ms),
+    )
     claimed_ids = [r[0] for r in cur.fetchall()]
     messages = []
-    for msg_id in claimed_ids:
-        cur.execute(
-            f"SELECT id, payload, created_at FROM {stream} WHERE id = %s",
-            (msg_id,),
-        )
-        r = cur.fetchone()
-        if r:
-            messages.append({
-                "id": r[0],
-                "payload": r[1] if isinstance(r[1], dict) else json.loads(r[1]),
-                "created_at": str(r[2]),
-            })
+    if claimed_ids:
+        read_by_id = _stream_sql(patterns, "read_by_id")
+        for msg_id in claimed_ids:
+            cur.execute(read_by_id, (msg_id,))
+            r = cur.fetchone()
+            if r:
+                messages.append({
+                    "id": r[0],
+                    "payload": r[1] if isinstance(r[1], dict) else json.loads(r[1]),
+                    "created_at": str(r[2]),
+                })
     raw.commit()
     cur.close()
     return messages

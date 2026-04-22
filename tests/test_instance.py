@@ -104,12 +104,25 @@ class TestInstanceMethodDelegation:
             self.fake_conn, "leaderboard", "player1", 100
         )
 
+    @patch("goldlapel.ddl.fetch")
     @patch("goldlapel.proxy._utils")
-    def test_stream_add(self, mock_utils):
+    def test_stream_add(self, mock_utils, mock_ddl_fetch):
+        # Stream DDL patterns now come from the proxy's /api/ddl/* endpoint.
+        # The utils function gets the patterns via kwargs — tests mock both layers.
+        fake_patterns = {
+            "tables": {"main": "_goldlapel.stream_events"},
+            "query_patterns": {"insert": "INSERT ..."},
+        }
+        mock_ddl_fetch.return_value = fake_patterns
         mock_utils.return_value.stream_add.return_value = 1
+        # Provide a dashboard token so the ddl layer is willing to run.
+        self.gl._dashboard_token = "test-token"
         result = self.gl.stream_add("events", {"type": "click"})
+        mock_ddl_fetch.assert_called_once_with(
+            self.gl, "stream", "events", self.gl._dashboard_port, "test-token",
+        )
         mock_utils.return_value.stream_add.assert_called_once_with(
-            self.fake_conn, "events", {"type": "click"}
+            self.fake_conn, "events", {"type": "click"}, patterns=fake_patterns,
         )
         assert result == 1
 

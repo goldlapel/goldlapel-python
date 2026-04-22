@@ -459,67 +459,52 @@ async def count_distinct(conn, table, column):
 
 # -- Streams ----------------------------------------------------------------
 
-async def stream_add(conn, stream, payload):
-    _validate_identifier(stream)
-    await _execute(conn, f"""
-        CREATE TABLE IF NOT EXISTS {stream} (
-            id BIGSERIAL PRIMARY KEY,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+def _stream_pattern(patterns, key):
+    """The proxy hands us SQL with $1/$2 placeholders — asyncpg's native
+    binding style — so no translation is needed. Just look it up."""
+    return patterns["query_patterns"][key]
+
+
+async def stream_add(conn, stream, payload, *, patterns=None):
+    if patterns is None:
+        raise RuntimeError(
+            "stream_add requires DDL patterns from the proxy — call via "
+            "`gl.stream_add(...)` rather than the utils function directly."
         )
-    """)
-    row = await _fetchrow(
-        conn,
-        f"INSERT INTO {stream} (payload) VALUES (%s) RETURNING id",
-        (json.dumps(payload),),
-    )
+    _validate_identifier(stream)
+    raw = _get_raw_connection(conn)
+    sql = _stream_pattern(patterns, "insert")
+    row = await raw.fetchrow(sql, json.dumps(payload))
     return row[0]
 
 
-async def stream_create_group(conn, stream, group):
+async def stream_create_group(conn, stream, group, *, patterns=None):
+    if patterns is None:
+        raise RuntimeError(
+            "stream_create_group requires DDL patterns from the proxy — call via "
+            "`gl.stream_create_group(...)` rather than the utils function directly."
+        )
     _validate_identifier(stream)
-    await _execute(conn, f"""
-        CREATE TABLE IF NOT EXISTS {stream}_groups (
-            group_name TEXT PRIMARY KEY,
-            last_delivered_id BIGINT NOT NULL DEFAULT 0
-        )
-    """)
-    await _execute(conn, f"""
-        CREATE TABLE IF NOT EXISTS {stream}_pending (
-            message_id BIGINT NOT NULL,
-            group_name TEXT NOT NULL,
-            consumer TEXT NOT NULL,
-            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            delivery_count INT NOT NULL DEFAULT 1,
-            PRIMARY KEY (group_name, message_id)
-        )
-    """)
-    await _execute(
-        conn,
-        f"INSERT INTO {stream}_groups (group_name) VALUES (%s) ON CONFLICT DO NOTHING",
-        (group,),
-    )
+    raw = _get_raw_connection(conn)
+    await raw.execute(_stream_pattern(patterns, "create_group"), group)
 
 
-async def stream_read(conn, stream, group, consumer, count=1):
+async def stream_read(conn, stream, group, consumer, count=1, *, patterns=None):
     # Sync path uses `FOR UPDATE` inside an implicit txn; asyncpg needs an
     # explicit transaction for FOR UPDATE to be meaningful. We open a tx here.
+    if patterns is None:
+        raise RuntimeError(
+            "stream_read requires DDL patterns from the proxy — call via "
+            "`gl.stream_read(...)` rather than the utils function directly."
+        )
     _validate_identifier(stream)
     raw = _get_raw_connection(conn)
     async with raw.transaction():
-        sql1, p1 = _to_asyncpg(
-            f"SELECT last_delivered_id FROM {stream}_groups WHERE group_name = %s FOR UPDATE",
-            (group,),
-        )
-        row = await raw.fetchrow(sql1, *p1)
+        row = await raw.fetchrow(_stream_pattern(patterns, "group_get_cursor"), group)
         if not row:
             return []
         last_id = row[0]
-        sql2, p2 = _to_asyncpg(
-            f"SELECT id, payload, created_at FROM {stream} WHERE id > %s ORDER BY id LIMIT %s",
-            (last_id, count),
-        )
-        rows = await raw.fetch(sql2, *p2)
+        rows = await raw.fetch(_stream_pattern(patterns, "read_since"), last_id, count)
         messages = []
         for r in rows:
             msg_id, payload, created_at = r[0], r[1], r[2]
@@ -530,54 +515,53 @@ async def stream_read(conn, stream, group, consumer, count=1):
             })
         if messages:
             new_last = messages[-1]["id"]
-            sql3, p3 = _to_asyncpg(
-                f"UPDATE {stream}_groups SET last_delivered_id = %s WHERE group_name = %s",
-                (new_last, group),
+            await raw.execute(
+                _stream_pattern(patterns, "group_advance_cursor"),
+                new_last, group,
             )
-            await raw.execute(sql3, *p3)
+            pending_insert = _stream_pattern(patterns, "pending_insert")
             for msg in messages:
-                sql4, p4 = _to_asyncpg(
-                    f"""INSERT INTO {stream}_pending (message_id, group_name, consumer)
-                        VALUES (%s, %s, %s) ON CONFLICT (group_name, message_id) DO NOTHING""",
-                    (msg["id"], group, consumer),
-                )
-                await raw.execute(sql4, *p4)
+                await raw.execute(pending_insert, msg["id"], group, consumer)
         return messages
 
 
-async def stream_ack(conn, stream, group, message_id):
+async def stream_ack(conn, stream, group, message_id, *, patterns=None):
+    if patterns is None:
+        raise RuntimeError(
+            "stream_ack requires DDL patterns from the proxy — call via "
+            "`gl.stream_ack(...)` rather than the utils function directly."
+        )
     _validate_identifier(stream)
-    status = await _execute(
-        conn,
-        f"DELETE FROM {stream}_pending WHERE group_name = %s AND message_id = %s",
-        (group, message_id),
-    )
+    raw = _get_raw_connection(conn)
+    status = await raw.execute(_stream_pattern(patterns, "ack"), group, message_id)
     return _rowcount_from_status(status) > 0
 
 
-async def stream_claim(conn, stream, group, consumer, min_idle_ms=60000):
+async def stream_claim(conn, stream, group, consumer, min_idle_ms=60000, *, patterns=None):
+    if patterns is None:
+        raise RuntimeError(
+            "stream_claim requires DDL patterns from the proxy — call via "
+            "`gl.stream_claim(...)` rather than the utils function directly."
+        )
     _validate_identifier(stream)
-    rows = await _fetch(conn, f"""
-        UPDATE {stream}_pending
-        SET consumer = %s, claimed_at = NOW(), delivery_count = delivery_count + 1
-        WHERE group_name = %s AND claimed_at < NOW() - INTERVAL '1 millisecond' * %s
-        RETURNING message_id
-    """, (consumer, group, min_idle_ms))
+    raw = _get_raw_connection(conn)
+    rows = await raw.fetch(
+        _stream_pattern(patterns, "claim"),
+        consumer, group, min_idle_ms,
+    )
     claimed_ids = [r[0] for r in rows]
     messages = []
-    for msg_id in claimed_ids:
-        r = await _fetchrow(
-            conn,
-            f"SELECT id, payload, created_at FROM {stream} WHERE id = %s",
-            (msg_id,),
-        )
-        if r:
-            payload = r[1]
-            messages.append({
-                "id": r[0],
-                "payload": payload if isinstance(payload, (dict, list)) else json.loads(payload),
-                "created_at": str(r[2]),
-            })
+    if claimed_ids:
+        read_by_id = _stream_pattern(patterns, "read_by_id")
+        for msg_id in claimed_ids:
+            r = await raw.fetchrow(read_by_id, msg_id)
+            if r:
+                payload = r[1]
+                messages.append({
+                    "id": r[0],
+                    "payload": payload if isinstance(payload, (dict, list)) else json.loads(payload),
+                    "created_at": str(r[2]),
+                })
     return messages
 
 

@@ -59,9 +59,8 @@ _WRAPPED_METHODS = (
     "georadius", "geoadd", "geodist",
     # -- Misc --
     "count_distinct", "script",
-    # -- Streams --
-    "stream_add", "stream_create_group", "stream_read", "stream_ack",
-    "stream_claim",
+    # -- Streams are handled separately (they need DDL patterns from the proxy;
+    #    see the async def stream_* methods below). --
     # -- Percolator --
     "percolate_add", "percolate", "percolate_delete",
     # -- Analysis --
@@ -161,6 +160,15 @@ class AsyncGoldLapel:
 
             env = os.environ.copy()
             env.setdefault("GOLDLAPEL_CLIENT", "python")
+            # Provision a session-scoped dashboard token so ddl.py can
+            # authenticate against /api/ddl/*. See GoldLapel.start in proxy.py
+            # for the sync-side mirror of this logic.
+            if "GOLDLAPEL_DASHBOARD_TOKEN" in env and env["GOLDLAPEL_DASHBOARD_TOKEN"]:
+                self._sync._dashboard_token = env["GOLDLAPEL_DASHBOARD_TOKEN"]
+            else:
+                import secrets
+                self._sync._dashboard_token = secrets.token_hex(32)
+                env["GOLDLAPEL_DASHBOARD_TOKEN"] = self._sync._dashboard_token
             popen_kwargs = dict(
                 env=env,
                 stdout=subprocess.DEVNULL,
@@ -245,6 +253,12 @@ class AsyncGoldLapel:
         self._tear_down_subprocess()
 
     async def stop(self):
+        # Drop any cached DDL patterns tied to this instance (see sync stop).
+        try:
+            from goldlapel import ddl as _ddl
+            _ddl.invalidate(self)
+        except Exception:
+            pass
         if self._conn is not None:
             try:
                 await self._conn.close()
@@ -266,6 +280,7 @@ class AsyncGoldLapel:
                 pass
         self._sync._process = None
         self._sync._proxy_url = None
+        self._sync._dashboard_token = None
 
     # -- Async context manager ---------------------------------------------
 
@@ -302,6 +317,61 @@ class AsyncGoldLapel:
         if scoped is not None:
             return scoped
         return self.conn  # raises if not started
+
+    # -- Streams (explicit, not auto-generated — DDL patterns come from the proxy) --
+
+    async def _stream_patterns(self, stream):
+        """Fetch (and cache) canonical stream DDL + query patterns. Runs in
+        a threadpool executor because the proxy's /api/ddl/* uses blocking
+        urllib on the wrapper side (one HTTP round-trip per helper per session —
+        not on any hot path)."""
+        import asyncio as _asyncio
+        from goldlapel import ddl as _ddl
+        token = self._sync._dashboard_token or _ddl.token_from_env_or_file()
+        port = self._sync._dashboard_port
+        loop = _asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            _ddl.fetch,
+            self,  # owner for cache
+            "stream",
+            stream,
+            port,
+            token,
+        )
+
+    async def stream_add(self, stream, payload, *, conn=None):
+        patterns = await self._stream_patterns(stream)
+        return await autils.stream_add(
+            self._effective_conn(conn), stream, payload, patterns=patterns,
+        )
+
+    async def stream_create_group(self, stream, group, *, conn=None):
+        patterns = await self._stream_patterns(stream)
+        return await autils.stream_create_group(
+            self._effective_conn(conn), stream, group, patterns=patterns,
+        )
+
+    async def stream_read(self, stream, group, consumer, count=1, *, conn=None):
+        patterns = await self._stream_patterns(stream)
+        return await autils.stream_read(
+            self._effective_conn(conn), stream, group, consumer, count,
+            patterns=patterns,
+        )
+
+    async def stream_ack(self, stream, group, message_id, *, conn=None):
+        patterns = await self._stream_patterns(stream)
+        return await autils.stream_ack(
+            self._effective_conn(conn), stream, group, message_id,
+            patterns=patterns,
+        )
+
+    async def stream_claim(self, stream, group, consumer, min_idle_ms=60000, *, conn=None):
+        patterns = await self._stream_patterns(stream)
+        return await autils.stream_claim(
+            self._effective_conn(conn), stream, group, consumer, min_idle_ms,
+            patterns=patterns,
+        )
 
 
 # -- Auto-generate async wrappers for each utility function ---------------

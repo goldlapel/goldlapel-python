@@ -315,6 +315,11 @@ class GoldLapel:
         self._process = None
         self._proxy_url = None
         self._conn = None
+        # Dashboard token — resolved at start() time. When we spawn the proxy
+        # ourselves, we generate a random token per-session and pass it via
+        # env. When the proxy is externally launched, we read the token from
+        # env/file at DDL-call time (see goldlapel/ddl.py).
+        self._dashboard_token = None
         # Per-instance contextvar for `with gl.using(conn):` — async-safe, scoped override.
         self._using_conn = ContextVar(f"goldlapel_using_conn_{id(self)}", default=None)
 
@@ -366,6 +371,15 @@ class GoldLapel:
 
         env = os.environ.copy()
         env.setdefault("GOLDLAPEL_CLIENT", "python")
+        # Provision a session-scoped dashboard token so the wrapper can call
+        # /api/ddl/* without depending on ~/.goldlapel/dashboard_token. Pre-set
+        # env wins (user may already have a token they want to use).
+        if "GOLDLAPEL_DASHBOARD_TOKEN" in env and env["GOLDLAPEL_DASHBOARD_TOKEN"]:
+            self._dashboard_token = env["GOLDLAPEL_DASHBOARD_TOKEN"]
+        else:
+            import secrets
+            self._dashboard_token = secrets.token_hex(32)
+            env["GOLDLAPEL_DASHBOARD_TOKEN"] = self._dashboard_token
         popen_kwargs = dict(
             env=env,
             stdout=subprocess.DEVNULL,
@@ -437,6 +451,14 @@ class GoldLapel:
         return self._proxy_url
 
     def stop(self):
+        # Drop any cached DDL patterns — they are tied to the proxy
+        # instance we're about to kill, and they must not leak into the
+        # next start() of the same upstream URL.
+        try:
+            from goldlapel import ddl as _ddl
+            _ddl.invalidate(self)
+        except Exception:
+            pass
         if self._conn is not None:
             try:
                 self._conn.close()
@@ -452,6 +474,7 @@ class GoldLapel:
                 self._process.wait()
         self._process = None
         self._proxy_url = None
+        self._dashboard_token = None
         # Drop ourselves from the registry so the next start(same_url) gets a
         # fresh allocation instead of silently drifting to a new port because
         # _next_port has advanced. Option A from the v0.2 review findings —
@@ -475,6 +498,18 @@ class GoldLapel:
         if self._dashboard_port and self._process and self._process.poll() is None:
             return f"http://127.0.0.1:{self._dashboard_port}"
         return None
+
+    @property
+    def dashboard_port(self):
+        """Dashboard port (None if disabled)."""
+        return self._dashboard_port
+
+    @property
+    def dashboard_token(self):
+        """Dashboard token used by the DDL API. Resolved on start() when the
+        wrapper spawns the proxy itself; None when the proxy is external —
+        in that case goldlapel/ddl.py falls back to env/file."""
+        return self._dashboard_token
 
     @property
     def running(self):
@@ -651,20 +686,46 @@ class GoldLapel:
 
     # -- Streams ---------------------------------------------------------------
 
-    def stream_add(self, *args, conn=None, **kwargs):
-        return _utils().stream_add(self._effective_conn(conn), *args, **kwargs)
+    def _stream_patterns(self, stream):
+        """Fetch (and cache) canonical stream DDL + query patterns from the
+        proxy's DDL API. The DDL is executed on the proxy side — this call
+        only returns the patterns the wrapper should run against the proxy."""
+        from goldlapel import ddl as _ddl
+        token = self._dashboard_token or _ddl.token_from_env_or_file()
+        return _ddl.fetch(self, "stream", stream, self._dashboard_port, token)
 
-    def stream_create_group(self, *args, conn=None, **kwargs):
-        return _utils().stream_create_group(self._effective_conn(conn), *args, **kwargs)
+    def stream_add(self, stream, payload, *, conn=None):
+        patterns = self._stream_patterns(stream)
+        return _utils().stream_add(self._effective_conn(conn), stream, payload, patterns=patterns)
 
-    def stream_read(self, *args, conn=None, **kwargs):
-        return _utils().stream_read(self._effective_conn(conn), *args, **kwargs)
+    def stream_create_group(self, stream, group, *, conn=None):
+        patterns = self._stream_patterns(stream)
+        return _utils().stream_create_group(
+            self._effective_conn(conn), stream, group, patterns=patterns
+        )
 
-    def stream_ack(self, *args, conn=None, **kwargs):
-        return _utils().stream_ack(self._effective_conn(conn), *args, **kwargs)
+    def stream_read(self, stream, group, consumer, count=1, *, conn=None):
+        patterns = self._stream_patterns(stream)
+        return _utils().stream_read(
+            self._effective_conn(conn), stream, group, consumer, count, patterns=patterns
+        )
 
-    def stream_claim(self, *args, conn=None, **kwargs):
-        return _utils().stream_claim(self._effective_conn(conn), *args, **kwargs)
+    def stream_ack(self, stream, group, message_id, *, conn=None):
+        patterns = self._stream_patterns(stream)
+        return _utils().stream_ack(
+            self._effective_conn(conn), stream, group, message_id, patterns=patterns
+        )
+
+    def stream_claim(self, stream, group, consumer, min_idle_ms=60000, *, conn=None):
+        patterns = self._stream_patterns(stream)
+        return _utils().stream_claim(
+            self._effective_conn(conn),
+            stream,
+            group,
+            consumer,
+            min_idle_ms,
+            patterns=patterns,
+        )
 
     # -- Percolator ------------------------------------------------------------
 

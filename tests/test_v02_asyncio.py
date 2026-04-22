@@ -377,12 +377,18 @@ class TestAsyncMethodDelegation:
 class TestAllMethodsCount:
     def test_async_class_has_same_surface_as_sync(self):
         from goldlapel.proxy import GoldLapel
+        from goldlapel.asyncio._proxy import AsyncGoldLapel
         sync_methods = {
             name for name in dir(GoldLapel)
             if not name.startswith("_") and callable(getattr(GoldLapel, name))
             and name not in {"start", "stop", "using"}
         }
-        async_wrapped = set(_WRAPPED_METHODS)
+        # Streams are defined directly on AsyncGoldLapel (they need the DDL
+        # fetch; they aren't auto-generated from _WRAPPED_METHODS).
+        async_wrapped = set(_WRAPPED_METHODS) | {
+            name for name in dir(AsyncGoldLapel)
+            if name.startswith("stream_")
+        }
         missing = sync_methods - async_wrapped
         # any sync method not wrapped asynchronously is a gap worth surfacing
         assert not missing, f"async wrapper missing: {missing}"
