@@ -310,6 +310,8 @@ class GoldLapel:
         config=None,
         extra_args=None,
         silent=False,
+        mesh=False,
+        mesh_tag=None,
     ):
         self._upstream = upstream
         self._proxy_port = proxy_port if proxy_port is not None else DEFAULT_PROXY_PORT
@@ -333,6 +335,9 @@ class GoldLapel:
         self._client = client
         self._config_file = config_file
         self._silent = bool(silent)
+        # Mesh membership (startup intent — HQ enforces license).
+        self._mesh = bool(mesh)
+        self._mesh_tag = mesh_tag if mesh_tag else None
 
         # Validate structured-config keys eagerly so a test that constructs
         # without spawning still catches bad keys.
@@ -418,6 +423,10 @@ class GoldLapel:
             cmd += ["--client", self._client]
         if self._config_file is not None:
             cmd += ["--config", self._config_file]
+        if self._mesh:
+            cmd.append("--mesh")
+        if self._mesh_tag is not None:
+            cmd += ["--mesh-tag", self._mesh_tag]
         cmd += _config_to_args(self._config) + self._extra_args
 
         _kill_orphan_on_port(self._proxy_port)
@@ -832,6 +841,8 @@ def _ensure_running(
     config=None,
     extra_args=None,
     silent=False,
+    mesh=False,
+    mesh_tag=None,
 ):
     global _cleanup_registered, _next_port
     with _lock:
@@ -859,6 +870,8 @@ def _ensure_running(
             config=config,
             extra_args=extra_args,
             silent=silent,
+            mesh=mesh,
+            mesh_tag=mesh_tag,
         )
         _instances[upstream] = inst
         if not _cleanup_registered:
@@ -915,6 +928,8 @@ def start(
     config=None,
     extra_args=None,
     silent=False,
+    mesh=False,
+    mesh_tag=None,
 ):
     """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
     GoldLapel instance. Call wrapper methods on the returned instance
@@ -938,6 +953,8 @@ def start(
     - config: dict of tuning knobs (pool_size, disable_*, replica, ...)
     - extra_args: raw CLI flags appended to the binary invocation
     - silent: suppress the startup banner
+    - mesh: opt into the mesh at startup (HQ enforces license; denial is non-fatal)
+    - mesh_tag: optional tag — instances sharing a tag cluster together
 
     Promoted top-level concepts are rejected inside the `config` dict.
 
@@ -970,6 +987,8 @@ def start(
         config=config,
         extra_args=extra_args,
         silent=silent,
+        mesh=mesh,
+        mesh_tag=mesh_tag,
     )
     return inst
 

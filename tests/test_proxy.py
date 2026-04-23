@@ -823,3 +823,99 @@ class TestStartupBanner:
         assert "(proxy)" in captured.err
         # No-dashboard branch — banner should not include the dashboard URL.
         assert "dashboard" not in captured.err
+
+
+class TestMeshKwargs:
+    """Mesh startup kwargs: `mesh` (bool) + `mesh_tag` (optional str).
+
+    Canonical surface — top-level, not inside the structured `config` map.
+    Translate to `--mesh` / `--mesh-tag` CLI flags when spawning the binary.
+    """
+
+    def setup_method(self):
+        _reset_module_state()
+
+    def teardown_method(self):
+        _reset_module_state()
+
+    def test_mesh_defaults_false(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert gl._mesh is False
+        assert gl._mesh_tag is None
+
+    def test_mesh_true_stored(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", mesh=True)
+        assert gl._mesh is True
+
+    def test_mesh_tag_stored(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", mesh=True, mesh_tag="prod-east")
+        assert gl._mesh_tag == "prod-east"
+
+    def test_mesh_tag_empty_string_normalized_to_none(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", mesh=True, mesh_tag="")
+        assert gl._mesh_tag is None
+
+    def test_mesh_in_config_map_rejected(self):
+        # Regression guard: mesh/mesh_tag are top-level kwargs, not config keys.
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"mesh": True})
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"mesh_tag": "prod"})
+
+    def test_mesh_not_in_config_keys(self):
+        keys = config_keys()
+        assert "mesh" not in keys
+        assert "mesh_tag" not in keys
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_mesh_flag_forwarded_to_binary(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", mesh=True, mesh_tag="prod-east", silent=True)
+
+        call_args, _ = mock_popen.call_args
+        cmd = call_args[0]
+        assert "--mesh" in cmd, f"--mesh missing from argv: {cmd}"
+        assert "--mesh-tag" in cmd
+        idx = cmd.index("--mesh-tag")
+        assert cmd[idx + 1] == "prod-east"
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_mesh_false_no_flag(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", silent=True)
+
+        call_args, _ = mock_popen.call_args
+        cmd = call_args[0]
+        assert "--mesh" not in cmd
+        assert "--mesh-tag" not in cmd
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_mesh_without_tag_forwards_only_bool_flag(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", mesh=True, silent=True)
+
+        call_args, _ = mock_popen.call_args
+        cmd = call_args[0]
+        assert "--mesh" in cmd
+        assert "--mesh-tag" not in cmd
