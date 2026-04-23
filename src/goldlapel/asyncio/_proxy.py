@@ -373,6 +373,7 @@ class AsyncGoldLapel:
         a threadpool executor because the proxy's /api/ddl/* uses blocking
         urllib on the wrapper side (one HTTP round-trip per helper per session —
         not on any hot path)."""
+        autils._validate_identifier(stream)
         import asyncio as _asyncio
         from goldlapel import ddl as _ddl
         token = self._sync._dashboard_token or _ddl.token_from_env_or_file()

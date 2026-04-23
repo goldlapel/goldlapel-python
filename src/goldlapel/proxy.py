@@ -759,6 +759,8 @@ class GoldLapel:
         """Fetch (and cache) canonical stream DDL + query patterns from the
         proxy's DDL API. The DDL is executed on the proxy side — this call
         only returns the patterns the wrapper should run against the proxy."""
+        from goldlapel.utils import _validate_identifier
+        _validate_identifier(stream)
         from goldlapel import ddl as _ddl
         token = self._dashboard_token or _ddl.token_from_env_or_file()
         return _ddl.fetch_patterns(self, "stream", stream, self._dashboard_port, token)
