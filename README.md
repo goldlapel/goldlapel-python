@@ -36,6 +36,23 @@ Point your Postgres driver at `gl.url`. Gold Lapel sits between your app and you
 
 Async usage (`goldlapel.asyncio.start`), context managers, transactional coordination via `gl.using(conn)`, and framework integrations are in the docs.
 
+## Authentication
+
+For paid customers, paste your API key once and Gold Lapel handles the rest — fetching and auto-renewing the underlying license against entitlement changes:
+
+```python
+gl = goldlapel.start(
+    "postgresql://user:pass@localhost:5432/mydb",
+    api_key="gl_live_...",   # from https://manor.goldlapel.com/account
+)
+```
+
+You can also set the env var `GOLDLAPEL_API_KEY` and skip the kwarg.
+
+If you'd rather hand-place a license PEM (e.g., for fully offline hosts), `license="/path/to/license.key"` still works and serves as the offline fallback when both are set.
+
+Trial customers don't need anything — Gold Lapel registers an anonymous trial automatically on first run.
+
 ## Dashboard
 
 Gold Lapel exposes a live dashboard at `gl.dashboard_url`:

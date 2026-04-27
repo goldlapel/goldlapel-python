@@ -305,6 +305,7 @@ class GoldLapel:
         log_level=None,
         mode=None,
         license=None,
+        api_key=None,
         client=None,
         config_file=None,
         config=None,
@@ -332,6 +333,18 @@ class GoldLapel:
         self._log_level = log_level
         self._mode = mode
         self._license = license
+        # api_key (Wave 1 of api-key-model rollout): the new primary
+        # license credential. When set, the proxy fetches and auto-
+        # renews its PEM from HQ. The Rust binary's precedence: api_key
+        # > license file > anonymous trial.  If both are passed, log a
+        # warning and let api_key win (it's the recommended path).
+        if api_key is not None and license is not None:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Both api_key and license were passed to GoldLapel; "
+                "api_key takes precedence (license file becomes the offline fallback)."
+            )
+        self._api_key = api_key
         self._client = client
         self._config_file = config_file
         self._silent = bool(silent)
@@ -437,6 +450,13 @@ class GoldLapel:
         # precedence over the env var).
         if self._client is None:
             env.setdefault("GOLDLAPEL_CLIENT", "python")
+        # Pass api_key to the binary as an env var rather than CLI flag so
+        # it doesn't show up in `ps` output (credentials hygiene). The
+        # Rust binary reads `GOLDLAPEL_API_KEY` at startup and uses it
+        # to fetch + auto-renew the license from HQ. Pre-set env wins
+        # (caller may already have it set deliberately).
+        if self._api_key is not None:
+            env["GOLDLAPEL_API_KEY"] = self._api_key
         # Provision a session-scoped dashboard token so the wrapper can call
         # /api/ddl/* without depending on ~/.goldlapel/dashboard-token. Pre-set
         # env wins (user may already have a token they want to use).
@@ -836,6 +856,7 @@ def _ensure_running(
     log_level=None,
     mode=None,
     license=None,
+    api_key=None,
     client=None,
     config_file=None,
     config=None,
@@ -865,6 +886,7 @@ def _ensure_running(
             log_level=log_level,
             mode=mode,
             license=license,
+            api_key=api_key,
             client=client,
             config_file=config_file,
             config=config,
@@ -923,6 +945,7 @@ def start(
     log_level=None,
     mode=None,
     license=None,
+    api_key=None,
     client=None,
     config_file=None,
     config=None,
@@ -947,7 +970,10 @@ def start(
     - invalidation_port: cache-invalidation port (derived as proxy_port + 2)
     - log_level: one of 'trace', 'debug', 'info', 'warn', 'error'
     - mode: proxy operating mode ('waiter', 'bellhop', ...)
-    - license: path to the license file
+    - api_key: stable customer credential (`gl_live_*` / `gl_test_*`).
+        The proxy fetches and auto-renews its license from HQ — recommended.
+    - license: path to a license PEM file. Backup / offline path; api_key
+        takes precedence when both are passed.
     - client: client identifier for telemetry tagging (sets GOLDLAPEL_CLIENT)
     - config_file: path to a TOML config file (passed as --config to the binary)
     - config: dict of tuning knobs (pool_size, disable_*, replica, ...)
@@ -982,6 +1008,7 @@ def start(
         log_level=log_level,
         mode=mode,
         license=license,
+        api_key=api_key,
         client=client,
         config_file=config_file,
         config=config,
