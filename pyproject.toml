@@ -10,8 +10,8 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "THIRD-PARTY-NOTICES.md"]
 requires-python = ">=3.9"
-authors = [{name = "Stephen Gibson"}]
-keywords = ["postgres", "proxy", "optimization", "materialized-views", "database"]
+authors = [{name = "The Waiter of Gold Lapel", email = "thewaiter@goldlapel.com"}]
+keywords = ["postgres", "proxy", "optimization", "materialized-views", "database", "cache", "redis-compat", "mongo-compat", "query-optimization"]
 classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Database",
