@@ -1,9 +1,15 @@
 """AsyncGoldLapel — native-asyncpg async façade over the Gold Lapel proxy.
 
 Spawns the proxy subprocess (via the sync helpers in goldlapel.proxy), opens
-an asyncpg.Connection wrapped with AsyncCachedConnection, and exposes the same
-54 wrapper methods as sync GoldLapel, implemented as native `async def` that
-calls into goldlapel.asyncio._utils.
+an asyncpg.Connection wrapped with AsyncCachedConnection, and exposes the
+same wrapper-method surface as sync GoldLapel, implemented as native
+`async def` that calls into goldlapel.asyncio._utils.
+
+The wrapper-method surface is auto-derived at import time by walking the
+public methods on GoldLapel — see _derive_async_methods at the bottom of
+this module. Hand-written async-native methods (start, stop, using,
+stream_*) win over auto-derive; everything else falls through to a
+generated wrapper that dispatches to goldlapel.asyncio._utils.<name>.
 
 Public API (unchanged from v0.2.0):
   - goldlapel.asyncio.start(url) → AsyncGoldLapel (awaitable or async CM)
@@ -19,8 +25,10 @@ install hint. The sync fallback (psycopg3 async) is not implemented here —
 asyncpg is the canonical async driver and is declared a dev dependency.
 """
 
+import inspect
 import sys
 from contextlib import asynccontextmanager
+from functools import wraps
 
 from goldlapel.proxy import (
     _config_to_args,
@@ -36,40 +44,21 @@ from goldlapel.proxy import (
 from goldlapel.asyncio import _utils as autils
 
 
-# All 54 wrapper-method names that exist on the sync GoldLapel class.
-_WRAPPED_METHODS = (
-    # -- Document store --
-    "doc_create_collection", "doc_insert", "doc_insert_many", "doc_find",
-    "doc_find_one", "doc_update", "doc_update_one", "doc_delete",
-    "doc_delete_one", "doc_find_one_and_update", "doc_find_one_and_delete",
-    "doc_distinct", "doc_find_cursor", "doc_count", "doc_create_index",
-    "doc_aggregate", "doc_watch", "doc_unwatch", "doc_create_ttl_index",
-    "doc_remove_ttl_index", "doc_create_capped", "doc_remove_cap",
-    # -- Search --
-    "search", "search_fuzzy", "search_phonetic", "similar", "suggest",
-    "facets", "aggregate", "create_search_config",
-    # -- Pub/sub & queues --
-    "publish", "subscribe", "enqueue", "dequeue",
-    # -- Counters --
-    "incr", "get_counter",
-    # -- Hashes --
-    "hset", "hget", "hgetall", "hdel",
-    # -- Sorted sets --
-    "zadd", "zincrby", "zrange", "zrank", "zscore", "zrem",
-    # -- Geo --
-    "georadius", "geoadd", "geodist",
-    # -- Misc --
-    "count_distinct", "script",
-    # -- Streams are handled separately (they need DDL patterns from the proxy;
-    #    see the async def stream_* methods below). --
-    # -- Percolator --
-    "percolate_add", "percolate", "percolate_delete",
-    # -- Analysis --
-    "analyze", "explain_score",
-)
-
-# Methods that return async generators (can't be `await`ed, only `async for`).
-_GENERATOR_METHODS = frozenset({"doc_find_cursor"})
+# Sync-class methods that intentionally do NOT belong on AsyncGoldLapel as
+# auto-derived wrappers. Empty today — every public sync method has an async
+# equivalent (either auto-derived from goldlapel.asyncio._utils, or an
+# async-native method defined directly on AsyncGoldLapel below, e.g. `start`,
+# `stop`, `using`, `stream_*`).
+#
+# Note: methods already defined on AsyncGoldLapel win over auto-derive (the
+# loop at the bottom of this module checks `name in target_cls.__dict__`).
+# That's how lifecycle and stream methods stay async-native without needing
+# entries here. This skip list exists for the case where a sync method should
+# NOT appear on the async surface at all — add an entry with a comment
+# explaining why if that ever happens.
+_ASYNC_SKIPPED = frozenset({
+    # (none)
+})
 
 
 def _detect_asyncpg():
@@ -433,44 +422,93 @@ class AsyncGoldLapel:
         )
 
 
-# -- Auto-generate async wrappers for each utility function ---------------
+# -- Auto-derive async wrappers from the sync GoldLapel surface ----------
+#
+# Pattern modeled on Motor (PyMongo's async driver) and aioboto3: introspect
+# the sync class at import time, attach an async wrapper to AsyncGoldLapel
+# for every public sync method that doesn't already have a hand-written
+# async-native version. Adding a new method to GoldLapel automatically
+# exposes it on AsyncGoldLapel — no second list to maintain, no drift.
+#
+# A parity test (tests/test_async_parity.py) asserts that every public sync
+# method has an async counterpart (modulo _ASYNC_SKIPPED), so a future change
+# that breaks this invariant fails CI loudly.
 
-def _make_async_wrapper(name):
+
+def _make_async_wrapper(name, sync_method):
+    """Build an async wrapper that dispatches to goldlapel.asyncio._utils.<name>.
+
+    The util is looked up lazily on the module so test-time patches like
+    `patch("goldlapel.asyncio._utils.search", ...)` replace it for us.
+    """
+    @wraps(sync_method)
     async def method(self, *args, conn=None, **kwargs):
-        # Look up the util fn lazily on the module, so test-time `patch(
-        # "goldlapel.asyncio._utils.search", ...)` replaces it for us.
         util_fn = getattr(autils, name)
         return await util_fn(self._effective_conn(conn), *args, **kwargs)
 
-    method.__name__ = name
+    # @wraps copies __doc__ from the sync method (typically None for these
+    # thin dispatch methods); fall back to a hand-written line so help() and
+    # IDEs show something useful.
+    if not method.__doc__:
+        method.__doc__ = (
+            f"Async wrapper for {name}. See goldlapel.utils.{name} for signature "
+            f"(native asyncpg impl in goldlapel.asyncio._utils)."
+        )
     method.__qualname__ = f"AsyncGoldLapel.{name}"
-    method.__doc__ = (
-        f"Async wrapper for {name}. See goldlapel.utils.{name} for signature "
-        f"(native asyncpg impl in goldlapel.asyncio._utils)."
-    )
     return method
 
 
-def _make_async_gen_wrapper(name):
+def _make_async_gen_wrapper(name, sync_method):
+    @wraps(sync_method)
     async def method(self, *args, conn=None, **kwargs):
         util_fn = getattr(autils, name)
         async for row in util_fn(self._effective_conn(conn), *args, **kwargs):
             yield row
 
-    method.__name__ = name
+    if not method.__doc__:
+        method.__doc__ = (
+            f"Async generator wrapper for {name}. See goldlapel.utils.{name}. "
+            f"Use `async for row in gl.{name}(...)` — not `await`."
+        )
     method.__qualname__ = f"AsyncGoldLapel.{name}"
-    method.__doc__ = (
-        f"Async generator wrapper for {name}. See goldlapel.utils.{name}. "
-        f"Use `async for row in gl.{name}(...)` — not `await`."
-    )
     return method
 
 
-for _name in _WRAPPED_METHODS:
-    if _name in _GENERATOR_METHODS:
-        setattr(AsyncGoldLapel, _name, _make_async_gen_wrapper(_name))
-    else:
-        setattr(AsyncGoldLapel, _name, _make_async_wrapper(_name))
+def _is_async_generator_util(name):
+    """True if goldlapel.asyncio._utils.<name> is `async def ... yield`.
+
+    Used to pick async-generator wrapper vs coroutine wrapper at import
+    time. Falls back to False (coroutine wrapper) when the util doesn't
+    exist — that case will fail loudly at first invocation, which is more
+    useful than silently picking the wrong wrapper.
+    """
+    fn = getattr(autils, name, None)
+    return fn is not None and inspect.isasyncgenfunction(fn)
+
+
+def _derive_async_methods(target_cls, sync_cls):
+    """Walk sync_cls's public methods; attach an async wrapper to target_cls
+    for each one. Hand-written methods on target_cls win — they're skipped.
+    Methods listed in _ASYNC_SKIPPED are also skipped."""
+    for name, sync_method in inspect.getmembers(sync_cls, predicate=inspect.isfunction):
+        if name.startswith("_"):
+            continue
+        if name in _ASYNC_SKIPPED:
+            continue
+        if name in target_cls.__dict__:
+            # Already hand-written on the async class (e.g. start, stop,
+            # using, stream_*). Don't overwrite. Use __dict__ rather than
+            # hasattr() so we only check methods defined on this class
+            # itself, not anything inherited from object.
+            continue
+        if _is_async_generator_util(name):
+            wrapper = _make_async_gen_wrapper(name, sync_method)
+        else:
+            wrapper = _make_async_wrapper(name, sync_method)
+        setattr(target_cls, name, wrapper)
+
+
+_derive_async_methods(AsyncGoldLapel, GoldLapel)
 
 
 # -- Module-level factory -------------------------------------------------
