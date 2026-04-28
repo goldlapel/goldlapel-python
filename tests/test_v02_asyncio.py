@@ -14,8 +14,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import goldlapel.asyncio as gl_async
-from goldlapel.asyncio._proxy import AsyncGoldLapel, _WRAPPED_METHODS, _GENERATOR_METHODS
+from goldlapel.asyncio._proxy import AsyncGoldLapel, _ASYNC_SKIPPED
 from goldlapel.proxy import GoldLapel
+
+
+# Auto-derived public method surface on AsyncGoldLapel — names of methods
+# attached by _derive_async_methods at module load. Identified by the
+# `__wrapped__` attribute set by functools.wraps inside _make_async_wrapper /
+# _make_async_gen_wrapper. Hand-written async-native methods (start/stop/
+# using/stream_*) don't have __wrapped__ pointing at a sync GoldLapel method,
+# so they're excluded — they have their own coverage in this file.
+_AUTO_DERIVED_NAMES = tuple(sorted(
+    name for name in vars(AsyncGoldLapel)
+    if not name.startswith("_")
+    and getattr(getattr(AsyncGoldLapel, name), "__wrapped__", None)
+       is getattr(GoldLapel, name, None)
+    and getattr(GoldLapel, name, None) is not None
+))
 
 
 class TestAsyncStart:
@@ -319,11 +334,15 @@ class TestEffectiveConn:
 
 
 class TestAllMethodsAreAsync:
-    """Every wrapper method on AsyncGoldLapel should be async (coroutine or async gen)."""
-    @pytest.mark.parametrize("method_name", _WRAPPED_METHODS)
+    """Every auto-derived wrapper method on AsyncGoldLapel should be async
+    (coroutine or async gen). Generator-vs-coroutine is auto-detected from
+    the underlying util — see _is_async_generator_util in _proxy.py."""
+    @pytest.mark.parametrize("method_name", _AUTO_DERIVED_NAMES)
     def test_method_is_async(self, method_name):
+        from goldlapel.asyncio import _utils as autils
         method = getattr(AsyncGoldLapel, method_name)
-        if method_name in _GENERATOR_METHODS:
+        util_fn = getattr(autils, method_name, None)
+        if util_fn is not None and inspect.isasyncgenfunction(util_fn):
             # Async generators like doc_find_cursor aren't coroutine functions;
             # they're async generator functions. Either is acceptable "async".
             assert inspect.isasyncgenfunction(method), \
@@ -376,21 +395,21 @@ class TestAsyncMethodDelegation:
 
 class TestAllMethodsCount:
     def test_async_class_has_same_surface_as_sync(self):
-        from goldlapel.proxy import GoldLapel
-        from goldlapel.asyncio._proxy import AsyncGoldLapel
+        # Strict parity check (sync vs async public methods, modulo skip list)
+        # lives in tests/test_async_parity.py — that's the single source of
+        # truth for surface drift detection. This test is kept as a coarse
+        # smoke check that the auto-derive at module load actually populated
+        # AsyncGoldLapel with the expected method count.
         sync_methods = {
             name for name in dir(GoldLapel)
             if not name.startswith("_") and callable(getattr(GoldLapel, name))
-            and name not in {"start", "stop", "using"}
         }
-        # Streams are defined directly on AsyncGoldLapel (they need the DDL
-        # fetch; they aren't auto-generated from _WRAPPED_METHODS).
-        async_wrapped = set(_WRAPPED_METHODS) | {
+        async_methods = {
             name for name in dir(AsyncGoldLapel)
-            if name.startswith("stream_")
+            if not name.startswith("_") and callable(getattr(AsyncGoldLapel, name))
         }
-        missing = sync_methods - async_wrapped
-        # any sync method not wrapped asynchronously is a gap worth surfacing
+        expected = sync_methods - _ASYNC_SKIPPED
+        missing = expected - async_methods
         assert not missing, f"async wrapper missing: {missing}"
 
 
