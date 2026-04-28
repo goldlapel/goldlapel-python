@@ -66,6 +66,24 @@ print(gl.dashboard_url)
 
 Full API reference, async usage, configuration, framework integrations (Django, SQLAlchemy, FastAPI), upgrading from v0.1, and production deployment: https://goldlapel.com/docs/python
 
+## Uninstalling
+
+Before removing the package, drop Gold Lapel's helper schema and cached matviews from your Postgres:
+
+```bash
+goldlapel clean
+```
+
+Then remove the package and any local state:
+
+```bash
+pip uninstall goldlapel
+rm -rf ~/.goldlapel
+rm -f goldlapel.toml     # only if you wrote one
+```
+
+Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and cached matviews go away.
+
 ## License
 
 MIT. See `LICENSE`.
