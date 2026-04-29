@@ -554,10 +554,10 @@ async def geo_radius_by_member(conn, name, member, radius, unit="m", limit=50, *
     """Members within `radius` of `member`'s location.
 
     Proxy contract: $1 and $2 are both the anchor member name (one for the
-    join, one for the self-exclusion); $3=radius_m, $4=limit. asyncpg binds
-    each $N positionally, so we pass `(member, member, radius_m, limit)`
-    matching the $N order (NOT the source-text order — that distinction
-    matters here because $1 and $2 reference the same value).
+    join, one for the self-exclusion); $3=radius_m, $4=limit. The proxy
+    emits the WHERE clauses in source-text order matching $N indices, so
+    `(member, member, radius_m, limit)` works for both native-$N (asyncpg
+    here) AND psycopg %s translation in the sync path.
     """
     _validate_identifier(name)
     sql = _family_pattern(patterns, "geosearch_member", "geo")

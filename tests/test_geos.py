@@ -41,7 +41,7 @@ def fake_patterns():
             "geodist": f"SELECT ST_Distance(a.location, b.location) AS distance_m FROM {main} a, {main} b WHERE a.member = $1 AND b.member = $2",
             "georadius": f"SELECT member, ST_X(location::geometry) AS lon, ST_Y(location::geometry) AS lat FROM {main} WHERE ST_DWithin(location, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography, $2) ORDER BY ST_Distance(location, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography) LIMIT $5",
             "georadius_with_dist": f"SELECT member, ST_X(location::geometry) AS lon, ST_Y(location::geometry) AS lat, ST_Distance(location, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography) AS distance_m FROM {main} WHERE ST_DWithin(location, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography, $2) ORDER BY distance_m LIMIT $5",
-            "geosearch_member": f"SELECT b.member, ST_X(b.location::geometry) AS lon, ST_Y(b.location::geometry) AS lat, ST_Distance(b.location, a.location) AS distance_m FROM {main} a, {main} b WHERE a.member = $1 AND ST_DWithin(b.location, a.location, $2) AND b.member <> $1 ORDER BY distance_m LIMIT $3",
+            "geosearch_member": f"SELECT b.member, ST_X(b.location::geometry) AS lon, ST_Y(b.location::geometry) AS lat, ST_Distance(b.location, a.location) AS distance_m FROM {main} a, {main} b WHERE a.member = $1 AND b.member <> $2 AND ST_DWithin(b.location, a.location, $3) ORDER BY distance_m LIMIT $4",
             "geo_remove": f"DELETE FROM {main} WHERE member = $1",
             "geo_count": f"SELECT COUNT(*) FROM {main}",
             "delete_all": f"DELETE FROM {main}",
@@ -158,10 +158,11 @@ class TestSqlBuilders:
         raw = _FakeConn(cur)
         real_utils.geo_radius_by_member(raw, "riders", "alice", 1000, patterns=fake_patterns)
         params = cur.execute.call_args[0][1]
-        # Proxy `geosearch_member` after `$N → %s` (psycopg) keeps source
-        # order: a.member=$1 → %s, ST_DWithin(...,$3) → %s, b.member<>$2 → %s,
-        # LIMIT $4 → %s. Params bind in that source-order sequence.
-        assert params == ("alice", 1000.0, "alice", 50)
+        # Proxy contract: $1=anchor, $2=anchor, $3=radius_m, $4=limit. SQL
+        # emits WHERE clauses in source-text $N order, so a single tuple
+        # `(member, member, radius_m, limit)` works for both psycopg %s
+        # translation and native-$N drivers.
+        assert params == ("alice", "alice", 1000.0, 50)
 
     def test_geo_remove_returns_true_when_deleted(self, fake_patterns):
         cur = _cursor(rowcount=1)

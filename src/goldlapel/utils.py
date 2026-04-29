@@ -503,19 +503,17 @@ def queue_extend(conn, name, message_id, additional_ms, *, patterns=None):
     milliseconds. Returns the new `visible_at`, or None if the id wasn't
     a claimed message.
 
-    Note: the proxy's `extend` SQL has `$2` (ms) appearing first in source
-    order (`SET visible_at = ... * $2`) before `$1` (id, in WHERE). After
-    psycopg's `$N → %s` translation, `%s` markers appear in source-text
-    order, so we must pass `(additional_ms, message_id)` for the sync
-    path. The async path (asyncpg native `$N`) takes them in `$N` order,
-    `(message_id, additional_ms)` — see `goldlapel/asyncio/_utils.py`.
+    Proxy contract: $1=id, $2=additional_ms. The proxy emits the SQL with
+    $N in source-text order (CTE pulls $1 + $2 into the SELECT clause
+    first), so wrappers using $N → %s/?$ regex translation bind to the
+    same `(id, ms)` tuple as native-$N drivers.
     """
     _validate_identifier(name)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(
         _pattern_sql(patterns, "extend", "queue"),
-        (int(additional_ms), int(message_id)),
+        (int(message_id), int(additional_ms)),
     )
     row = cur.fetchone()
     raw.commit()
@@ -643,10 +641,11 @@ def geo_radius_by_member(conn, name, member, radius, unit="m", limit=50, *, patt
     """Members within `radius` of `member`'s location.
 
     Proxy contract: $1 and $2 are both the anchor member name (one for the
-    join, one for the self-exclusion); $3=radius_m, $4=limit. After psycopg's
-    $N → %s translation the markers appear in source order, so we pass
-    `(member, radius_m, member, limit)` to match the in-SQL order
-    `a.member=$1 ... ST_DWithin(..., $3) ... b.member<>$2 ... LIMIT $4`.
+    join, one for the self-exclusion); $3=radius_m, $4=limit. The proxy
+    emits the WHERE clauses in source-text order matching the $N indices
+    (`a.member=$1 AND b.member<>$2 AND ST_DWithin(...,$3) ... LIMIT $4`),
+    so this single tuple works for psycopg %s translation AND native-$N
+    drivers.
     """
     _validate_identifier(name)
     raw = _get_raw_connection(conn)
@@ -654,7 +653,7 @@ def geo_radius_by_member(conn, name, member, radius, unit="m", limit=50, *, patt
     radius_m = _to_meters(radius, unit)
     cur.execute(
         _pattern_sql(patterns, "geosearch_member", "geo"),
-        (str(member), float(radius_m), str(member), int(limit)),
+        (str(member), str(member), float(radius_m), int(limit)),
     )
     cols = [desc[0] for desc in cur.description]
     results = [dict(zip(cols, row)) for row in cur.fetchall()]
