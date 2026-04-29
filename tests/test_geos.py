@@ -149,13 +149,18 @@ class TestSqlBuilders:
         raw = _FakeConn(cur)
         real_utils.geo_radius(raw, "riders", 13.4, 52.5, 5, unit="km", patterns=fake_patterns)
         params = cur.execute.call_args[0][1]
-        assert params == (5000.0, 13.4, 52.5, 50)
+        # Proxy contract: $1=lon, $2=lat, $3=radius_m, $4=limit. CTE anchor
+        # means each $N appears exactly once in the rendered SQL.
+        assert params == (13.4, 52.5, 5000.0, 50)
 
     def test_geo_radius_by_member_passes_member_twice(self, fake_patterns):
         cur = _cursor(fetchall=[], description=[("member",), ("lon",), ("lat",), ("distance_m",)])
         raw = _FakeConn(cur)
         real_utils.geo_radius_by_member(raw, "riders", "alice", 1000, patterns=fake_patterns)
         params = cur.execute.call_args[0][1]
+        # Proxy `geosearch_member` after `$N → %s` (psycopg) keeps source
+        # order: a.member=$1 → %s, ST_DWithin(...,$3) → %s, b.member<>$2 → %s,
+        # LIMIT $4 → %s. Params bind in that source-order sequence.
         assert params == ("alice", 1000.0, "alice", 50)
 
     def test_geo_remove_returns_true_when_deleted(self, fake_patterns):

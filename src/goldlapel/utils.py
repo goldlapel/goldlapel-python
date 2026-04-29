@@ -612,11 +612,10 @@ def geo_radius(conn, name, lon, lat, radius, unit="m", limit=50, *, patterns=Non
     """Members within `radius` of (lon, lat). Returns a list of dicts with
     `member`, `lon`, `lat`, `distance_m`.
 
-    The proxy's pattern numbers placeholders as `$2..$5` (skipping `$1`) so
-    that `georadius` and `georadius_with_dist` share identical binding
-    positions across drivers; psycopg's `%s` translation collapses to four
-    sequential binds — no leading None. See the `_pattern_sql` translation
-    in goldlapel/ddl.py.
+    Proxy contract: $1=lon, $2=lat, $3=radius_m, $4=limit. The proxy
+    computes the anchor geography once via CTE so each $N appears exactly
+    once — same param tuple works for both psycopg %s translation and
+    native-$N drivers.
     """
     _validate_identifier(name)
     raw = _get_raw_connection(conn)
@@ -624,7 +623,7 @@ def geo_radius(conn, name, lon, lat, radius, unit="m", limit=50, *, patterns=Non
     radius_m = _to_meters(radius, unit)
     cur.execute(
         _pattern_sql(patterns, "georadius_with_dist", "geo"),
-        (float(radius_m), float(lon), float(lat), int(limit)),
+        (float(lon), float(lat), float(radius_m), int(limit)),
     )
     cols = [desc[0] for desc in cur.description]
     results = [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -635,17 +634,16 @@ def geo_radius(conn, name, lon, lat, radius, unit="m", limit=50, *, patterns=Non
 def geo_radius_by_member(conn, name, member, radius, unit="m", limit=50, *, patterns=None):
     """Members within `radius` of `member`'s location.
 
-    The proxy's `geosearch_member` pattern references `$1` twice (the seed
-    member, used in both the join and an exclusion clause), so after the
-    `$N → %s` translation we pass `member` twice to psycopg.
+    Proxy contract: $1 and $2 are both the anchor member name (one for the
+    join, one for the self-exclusion); $3=radius_m, $4=limit. After psycopg's
+    $N → %s translation the markers appear in source order, so we pass
+    `(member, radius_m, member, limit)` to match the in-SQL order
+    `a.member=$1 ... ST_DWithin(..., $3) ... b.member<>$2 ... LIMIT $4`.
     """
     _validate_identifier(name)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     radius_m = _to_meters(radius, unit)
-    # Pattern body has `$1 ... $2 ... $1 ... $3`; translation produces 4 `%s`
-    # markers in that order, so the python params must mirror the literal
-    # placeholder sequence.
     cur.execute(
         _pattern_sql(patterns, "geosearch_member", "geo"),
         (str(member), float(radius_m), str(member), int(limit)),

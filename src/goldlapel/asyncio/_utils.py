@@ -537,17 +537,15 @@ async def geo_dist(conn, name, member_a, member_b, unit="m", *, patterns=None):
 async def geo_radius(conn, name, lon, lat, radius, unit="m", limit=50, *, patterns=None):
     """Members within `radius` of (lon, lat) with per-row distance.
 
-    The proxy's `georadius_with_dist` pattern numbers placeholders `$2..$5`
-    (skipping `$1` so wrappers can share parameter positions across the
-    radius variants). PG's bind protocol requires contiguous `$1..$N`, so
-    we renumber by routing the SQL through `_to_asyncpg` (`$N → %s → $N`).
+    Proxy contract: $1=lon, $2=lat, $3=radius_m, $4=limit. The proxy
+    computes the anchor geography once via CTE so each $N appears exactly
+    once — asyncpg binds the 4-tuple positionally, no translation needed.
     """
     _validate_identifier(name)
     sql = _family_pattern(patterns, "georadius_with_dist", "geo")
     radius_m = _to_meters(radius, unit)
-    sql_psy = _gap_safe_renumber(sql)
-    rows = await _fetch(
-        conn, sql_psy, (float(radius_m), float(lon), float(lat), int(limit)),
+    rows = await _family_fetch(
+        conn, sql, float(lon), float(lat), float(radius_m), int(limit),
     )
     return [dict(r) for r in rows]
 
@@ -555,34 +553,19 @@ async def geo_radius(conn, name, lon, lat, radius, unit="m", limit=50, *, patter
 async def geo_radius_by_member(conn, name, member, radius, unit="m", limit=50, *, patterns=None):
     """Members within `radius` of `member`'s location.
 
-    `geosearch_member` references `$1` twice (the seed member, used in both
-    the join and an exclusion clause). `_gap_safe_renumber` collapses
-    placeholders to contiguous `$1..$N` and `_fetch` then re-numbers via
-    psycopg's `%s → $N` machinery — net effect: the duplicate-`$1` becomes
-    two distinct binds, so we pass `member` twice.
+    Proxy contract: $1 and $2 are both the anchor member name (one for the
+    join, one for the self-exclusion); $3=radius_m, $4=limit. asyncpg binds
+    each $N positionally, so we pass `(member, member, radius_m, limit)`
+    matching the $N order (NOT the source-text order — that distinction
+    matters here because $1 and $2 reference the same value).
     """
     _validate_identifier(name)
     sql = _family_pattern(patterns, "geosearch_member", "geo")
     radius_m = _to_meters(radius, unit)
-    sql_psy = _gap_safe_renumber(sql)
-    rows = await _fetch(
-        conn, sql_psy,
-        (str(member), float(radius_m), str(member), int(limit)),
+    rows = await _family_fetch(
+        conn, sql, str(member), str(member), float(radius_m), int(limit),
     )
     return [dict(r) for r in rows]
-
-
-def _gap_safe_renumber(sql):
-    """Convert `$N` placeholders to `%s` so the downstream `_to_asyncpg`
-    helper renumbers them contiguously when going back to `$N`. The
-    proxy's geo patterns reference placeholders non-contiguously (e.g.
-    skipping `$1`) and reuse them (e.g. `$1` twice in `geosearch_member`);
-    PG's bind protocol can't accept either shape directly.
-
-    Encoding via `%s → $1, $2, …` makes asyncpg see one bind per
-    placeholder in source-order, which is what we want.
-    """
-    return re.sub(r"\$\d+", "%s", sql)
 
 
 async def geo_remove(conn, name, member, *, patterns=None):
