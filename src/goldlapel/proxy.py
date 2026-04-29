@@ -969,7 +969,7 @@ def start(
     - dashboard_port: dashboard port (derived as proxy_port + 1 when unset; 0 disables)
     - invalidation_port: cache-invalidation port (derived as proxy_port + 2)
     - log_level: one of 'trace', 'debug', 'info', 'warn', 'error'
-    - mode: proxy operating mode ('waiter', 'bellhop', ...)
+    - mode: proxy operating mode ('waiter', 'consideration', ...)
     - api_key: stable customer credential (`gl_live_*` / `gl_test_*`).
         The proxy fetches and auto-renews its license from HQ — recommended.
     - license: path to a license PEM file. Backup / offline path; api_key
