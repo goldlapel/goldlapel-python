@@ -106,28 +106,62 @@ class TestInstanceMethodDelegation:
             self.fake_conn, "orders", "new order"
         )
 
-    @patch("goldlapel.proxy._utils")
-    def test_incr(self, mock_utils):
-        mock_utils.return_value.incr.return_value = 42
-        result = self.gl.incr("counters", "page_views")
-        mock_utils.return_value.incr.assert_called_once_with(
-            self.fake_conn, "counters", "page_views"
-        )
-        assert result == 42
+    @patch("goldlapel.ddl.fetch_patterns")
+    def test_counter_incr_via_namespace(self, mock_ddl_fetch):
+        # Phase 5: counter DDL is proxy-owned; helper methods live on
+        # gl.counters and dispatch through goldlapel.utils.counter_*.
+        from goldlapel import utils as real_utils
+        fake_patterns = {
+            "tables": {"main": "_goldlapel.counter_pageviews"},
+            "query_patterns": {
+                "incr": "INSERT INTO _goldlapel.counter_pageviews ... RETURNING value",
+            },
+        }
+        mock_ddl_fetch.return_value = fake_patterns
+        with patch.object(real_utils, "counter_incr", return_value=42) as m:
+            self.gl._dashboard_token = "test-token"
+            result = self.gl.counters.incr("pageviews", "home")
+            mock_ddl_fetch.assert_called_once_with(
+                self.gl, "counter", "pageviews", self.gl._dashboard_port, "test-token",
+            )
+            m.assert_called_once_with(
+                self.fake_conn, "pageviews", "home", 1, patterns=fake_patterns,
+            )
+            assert result == 42
 
-    @patch("goldlapel.proxy._utils")
-    def test_hset(self, mock_utils):
-        self.gl.hset("cache", "user:1", "name", "alice")
-        mock_utils.return_value.hset.assert_called_once_with(
-            self.fake_conn, "cache", "user:1", "name", "alice"
-        )
+    @patch("goldlapel.ddl.fetch_patterns")
+    def test_hash_set_via_namespace(self, mock_ddl_fetch):
+        from goldlapel import utils as real_utils
+        fake_patterns = {
+            "tables": {"main": "_goldlapel.hash_sessions"},
+            "query_patterns": {"hset": "..."},
+        }
+        mock_ddl_fetch.return_value = fake_patterns
+        with patch.object(real_utils, "hash_set", return_value="alice") as m:
+            self.gl._dashboard_token = "test-token"
+            self.gl.hashes.set("sessions", "user:1", "name", "alice")
+            m.assert_called_once_with(
+                self.fake_conn, "sessions", "user:1", "name", "alice",
+                patterns=fake_patterns,
+            )
 
-    @patch("goldlapel.proxy._utils")
-    def test_zadd(self, mock_utils):
-        self.gl.zadd("leaderboard", "player1", 100)
-        mock_utils.return_value.zadd.assert_called_once_with(
-            self.fake_conn, "leaderboard", "player1", 100
-        )
+    @patch("goldlapel.ddl.fetch_patterns")
+    def test_zset_add_via_namespace(self, mock_ddl_fetch):
+        from goldlapel import utils as real_utils
+        fake_patterns = {
+            "tables": {"main": "_goldlapel.zset_leaderboard"},
+            "query_patterns": {"zadd": "..."},
+        }
+        mock_ddl_fetch.return_value = fake_patterns
+        with patch.object(real_utils, "zset_add", return_value=100.0) as m:
+            self.gl._dashboard_token = "test-token"
+            # Phase 5: zset_key is the new first positional after the
+            # namespace name (matches Redis ZADD semantics).
+            self.gl.zsets.add("leaderboard", "global", "player1", 100)
+            m.assert_called_once_with(
+                self.fake_conn, "leaderboard", "global", "player1", 100,
+                patterns=fake_patterns,
+            )
 
     @patch("goldlapel.ddl.fetch_patterns")
     def test_stream_add(self, mock_ddl_fetch):
@@ -188,18 +222,15 @@ class TestMethodNotConnected:
 
 class TestAllMethodsExist:
     def test_all_flat_util_methods_present(self):
-        # Flat namespaces (everything except documents and streams) stay as
+        # Flat namespaces (search / pub-sub / percolator / analysis) stay as
         # direct methods on GoldLapel until their own schema-to-core phase
-        # nests them too.
+        # nests them too. Phase 5 (counter / zset / hash / queue / geo) is
+        # nested — see TestPhase5Namespaces below.
         gl = GoldLapel("postgresql://localhost:5432/mydb")
         expected = [
             "search", "search_fuzzy", "search_phonetic", "similar", "suggest",
             "facets", "aggregate", "create_search_config",
-            "publish", "subscribe", "enqueue", "dequeue",
-            "incr", "get_counter",
-            "hset", "hget", "hgetall", "hdel",
-            "zadd", "zincrby", "zrange", "zrank", "zscore", "zrem",
-            "georadius", "geoadd", "geodist",
+            "publish", "subscribe",
             "count_distinct", "script",
             "percolate_add", "percolate", "percolate_delete",
             "analyze", "explain_score",
@@ -207,6 +238,24 @@ class TestAllMethodsExist:
         for method_name in expected:
             assert hasattr(gl, method_name), f"Missing method: {method_name}"
             assert callable(getattr(gl, method_name)), f"Not callable: {method_name}"
+
+    def test_legacy_phase5_flat_methods_are_gone(self):
+        # Phase 5 (2026-04-30) removed every flat counter/zset/hash/queue/geo
+        # method on the GoldLapel class. Hard cut, no aliases — callers
+        # migrate once and use the namespaced sub-APIs from now on.
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        for legacy in [
+            "incr", "get_counter",
+            "hset", "hget", "hgetall", "hdel",
+            "zadd", "zincrby", "zrange", "zrank", "zscore", "zrem",
+            "geoadd", "geodist", "georadius",
+            "enqueue", "dequeue",
+        ]:
+            assert not hasattr(gl, legacy), (
+                f"Phase 5 removed flat method {legacy} — use the namespaced "
+                f"sub-API (gl.counters / gl.zsets / gl.hashes / gl.queues / "
+                f"gl.geos) instead."
+            )
 
     def test_documents_namespace_is_nested(self):
         # gl.documents replaces gl.doc_*. See goldlapel/documents.py.
@@ -246,3 +295,63 @@ class TestAllMethodsExist:
                 f"Legacy flat method {legacy} should have been removed; "
                 f"use gl.streams.<verb> instead."
             )
+
+
+class TestPhase5Namespaces:
+    """Phase 5 (2026-04-30): counter / zset / hash / queue / geo each get
+    their own nested namespace. Verbs match the proxy's canonical handler
+    surface; method shapes are documented in each module under
+    src/goldlapel/{counters,zsets,hashes,queues,geos}.py.
+    """
+
+    def test_counters_namespace(self):
+        from goldlapel.counters import CountersAPI
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert isinstance(gl.counters, CountersAPI)
+        for verb in ["create", "incr", "decr", "set", "get", "delete", "count_keys"]:
+            assert hasattr(gl.counters, verb), f"Missing gl.counters.{verb}"
+            assert callable(getattr(gl.counters, verb))
+
+    def test_zsets_namespace(self):
+        from goldlapel.zsets import ZsetsAPI
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert isinstance(gl.zsets, ZsetsAPI)
+        for verb in [
+            "create", "add", "incr_by", "score", "rank", "range",
+            "range_by_score", "remove", "card",
+        ]:
+            assert hasattr(gl.zsets, verb), f"Missing gl.zsets.{verb}"
+            assert callable(getattr(gl.zsets, verb))
+
+    def test_hashes_namespace(self):
+        from goldlapel.hashes import HashesAPI
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert isinstance(gl.hashes, HashesAPI)
+        for verb in [
+            "create", "set", "get", "get_all", "keys", "values",
+            "exists", "delete", "len",
+        ]:
+            assert hasattr(gl.hashes, verb), f"Missing gl.hashes.{verb}"
+            assert callable(getattr(gl.hashes, verb))
+
+    def test_queues_namespace(self):
+        from goldlapel.queues import QueuesAPI
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert isinstance(gl.queues, QueuesAPI)
+        for verb in [
+            "create", "enqueue", "claim", "ack", "abandon", "extend",
+            "peek", "count_ready", "count_claimed",
+        ]:
+            assert hasattr(gl.queues, verb), f"Missing gl.queues.{verb}"
+            assert callable(getattr(gl.queues, verb))
+
+    def test_geos_namespace(self):
+        from goldlapel.geos import GeosAPI
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert isinstance(gl.geos, GeosAPI)
+        for verb in [
+            "create", "add", "pos", "dist", "radius", "radius_by_member",
+            "remove", "count",
+        ]:
+            assert hasattr(gl.geos, verb), f"Missing gl.geos.{verb}"
+            assert callable(getattr(gl.geos, verb))

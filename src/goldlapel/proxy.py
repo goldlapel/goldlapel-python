@@ -374,17 +374,28 @@ class GoldLapel:
         # Per-instance contextvar for `with gl.using(conn):` — async-safe, scoped override.
         self._using_conn = ContextVar(f"goldlapel_using_conn_{id(self)}", default=None)
 
-        # Nested namespaces — see goldlapel/documents.py and goldlapel/streams.py.
-        # These are the canonical schema-to-core sub-API instances. Each holds
-        # a back-reference to this client for shared state (license, dashboard
-        # token, http session, conn, DDL pattern cache). Other namespaces (cache,
-        # search, queues, counters, hashes, zsets, geo, auth, …) stay flat for
-        # now; they migrate to nested form one-at-a-time as their own
-        # schema-to-core phase fires.
+        # Nested namespaces — canonical schema-to-core sub-API instances. Each
+        # holds a back-reference to this client for shared state (license,
+        # dashboard token, http session, conn, DDL pattern cache).
+        #
+        # As of Phase 5 the Redis-compat helper families (counter / zset /
+        # hash / queue / geo) are nested too, alongside streams (Phase 1+2)
+        # and documents (Phase 4). Search / cache / auth remain flat —
+        # they'll migrate when their own schema-to-core phase fires.
         from goldlapel.documents import DocumentsAPI
         from goldlapel.streams import StreamsAPI
+        from goldlapel.counters import CountersAPI
+        from goldlapel.zsets import ZsetsAPI
+        from goldlapel.hashes import HashesAPI
+        from goldlapel.queues import QueuesAPI
+        from goldlapel.geos import GeosAPI
         self.documents = DocumentsAPI(self)
         self.streams = StreamsAPI(self)
+        self.counters = CountersAPI(self)
+        self.zsets = ZsetsAPI(self)
+        self.hashes = HashesAPI(self)
+        self.queues = QueuesAPI(self)
+        self.geos = GeosAPI(self)
 
     # Context manager support: `with goldlapel.start(...) as gl:` auto-stops on exit.
     def __enter__(self):
@@ -653,7 +664,7 @@ class GoldLapel:
     def create_search_config(self, *args, conn=None, **kwargs):
         return _utils().create_search_config(self._effective_conn(conn), *args, **kwargs)
 
-    # -- Pub/sub & queues ------------------------------------------------------
+    # -- Pub/sub ---------------------------------------------------------------
 
     def publish(self, *args, conn=None, **kwargs):
         return _utils().publish(self._effective_conn(conn), *args, **kwargs)
@@ -661,64 +672,10 @@ class GoldLapel:
     def subscribe(self, *args, conn=None, **kwargs):
         return _utils().subscribe(self._effective_conn(conn), *args, **kwargs)
 
-    def enqueue(self, *args, conn=None, **kwargs):
-        return _utils().enqueue(self._effective_conn(conn), *args, **kwargs)
-
-    def dequeue(self, *args, conn=None, **kwargs):
-        return _utils().dequeue(self._effective_conn(conn), *args, **kwargs)
-
-    # -- Counters --------------------------------------------------------------
-
-    def incr(self, *args, conn=None, **kwargs):
-        return _utils().incr(self._effective_conn(conn), *args, **kwargs)
-
-    def get_counter(self, *args, conn=None, **kwargs):
-        return _utils().get_counter(self._effective_conn(conn), *args, **kwargs)
-
-    # -- Hashes ----------------------------------------------------------------
-
-    def hset(self, *args, conn=None, **kwargs):
-        return _utils().hset(self._effective_conn(conn), *args, **kwargs)
-
-    def hget(self, *args, conn=None, **kwargs):
-        return _utils().hget(self._effective_conn(conn), *args, **kwargs)
-
-    def hgetall(self, *args, conn=None, **kwargs):
-        return _utils().hgetall(self._effective_conn(conn), *args, **kwargs)
-
-    def hdel(self, *args, conn=None, **kwargs):
-        return _utils().hdel(self._effective_conn(conn), *args, **kwargs)
-
-    # -- Sorted sets -----------------------------------------------------------
-
-    def zadd(self, *args, conn=None, **kwargs):
-        return _utils().zadd(self._effective_conn(conn), *args, **kwargs)
-
-    def zincrby(self, *args, conn=None, **kwargs):
-        return _utils().zincrby(self._effective_conn(conn), *args, **kwargs)
-
-    def zrange(self, *args, conn=None, **kwargs):
-        return _utils().zrange(self._effective_conn(conn), *args, **kwargs)
-
-    def zrank(self, *args, conn=None, **kwargs):
-        return _utils().zrank(self._effective_conn(conn), *args, **kwargs)
-
-    def zscore(self, *args, conn=None, **kwargs):
-        return _utils().zscore(self._effective_conn(conn), *args, **kwargs)
-
-    def zrem(self, *args, conn=None, **kwargs):
-        return _utils().zrem(self._effective_conn(conn), *args, **kwargs)
-
-    # -- Geo -------------------------------------------------------------------
-
-    def georadius(self, *args, conn=None, **kwargs):
-        return _utils().georadius(self._effective_conn(conn), *args, **kwargs)
-
-    def geoadd(self, *args, conn=None, **kwargs):
-        return _utils().geoadd(self._effective_conn(conn), *args, **kwargs)
-
-    def geodist(self, *args, conn=None, **kwargs):
-        return _utils().geodist(self._effective_conn(conn), *args, **kwargs)
+    # -- Phase 5 Redis-compat families: gl.counters / gl.zsets / gl.hashes /
+    #    gl.queues / gl.geos. The legacy flat methods (incr, hset, zadd,
+    #    enqueue, geoadd, …) are gone — see the per-family modules under
+    #    src/goldlapel/{counters,zsets,hashes,queues,geos}.py.
 
     # -- Misc ------------------------------------------------------------------
 

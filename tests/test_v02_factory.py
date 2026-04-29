@@ -143,13 +143,19 @@ class TestConnKwargOnMethods:
             call_conn = mock_fn.call_args[0][0]
             assert call_conn is override
 
-    def test_zadd_uses_scoped_using_conn(self):
+    def test_zsets_add_uses_scoped_using_conn(self):
         gl = GoldLapel("postgresql://host/db")
         gl._conn = MagicMock(name="internal_conn")
+        gl._dashboard_token = "test-token"
         scoped = MagicMock(name="scoped_conn")
-        with patch("goldlapel.utils.zadd") as mock_fn:
+        fake_patterns = {
+            "tables": {"main": "_goldlapel.zset_leaderboard"},
+            "query_patterns": {"zadd": "..."},
+        }
+        with patch("goldlapel.ddl.fetch_patterns", return_value=fake_patterns), \
+             patch("goldlapel.utils.zset_add") as mock_fn:
             with gl.using(scoped):
-                gl.zadd("leaderboard", "stephen", 100)
+                gl.zsets.add("leaderboard", "global", "stephen", 100)
             call_conn = mock_fn.call_args[0][0]
             assert call_conn is scoped
 

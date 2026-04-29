@@ -183,248 +183,403 @@ async def subscribe(conn, channel, callback, blocking=True):
         await listen_conn.close()
 
 
-async def enqueue(conn, queue_table, payload):
-    _validate_identifier(queue_table)
-    await _execute(conn, f"""
-        CREATE TABLE IF NOT EXISTS {queue_table} (
-            id BIGSERIAL PRIMARY KEY,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+# --
+# Phase 5 Redis-compat families: counter, zset, hash, queue, geo.
+#
+# Each family's helpers consume `patterns` returned from the proxy's
+# `/api/ddl/<family>/create` endpoint. The proxy emits SQL with `$N`
+# placeholders — asyncpg's native bind style — so we use them as-is
+# (no `_to_asyncpg` translation needed for these utils).
+# --
+
+
+def _family_pattern(patterns, key, family):
+    """Pull a query pattern from the proxy's response (asyncpg-native $N)."""
+    if patterns is None:
+        raise RuntimeError(
+            f"{family} utils require DDL patterns from the proxy — call via "
+            f"`gl.{family}s.<verb>(...)` rather than the utils function directly."
         )
-    """)
-    await _execute(
-        conn,
-        f"INSERT INTO {queue_table} (payload) VALUES (%s)",
-        (json.dumps(payload),),
-    )
+    return patterns["query_patterns"][key]
 
 
-async def dequeue(conn, queue_table):
-    # KNOWN ISSUE: this specific query shape (DELETE WHERE id = (SELECT …
-    # FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING payload) hits the Gold Lapel
-    # proxy's CloseComplete-framing interaction with asyncpg's extended query
-    # protocol when it follows an INSERT-with-parameter on the same conn.
-    # asyncpg caches a bogus parameter descriptor from the proxy and fails
-    # the no-param fetchrow with "server expects 1 argument". See the main
-    # repo's docs/wrapper-v0.2/03-proxy-closecomplete-framing.md. Tracking
-    # the proxy-side fix separately. For now enqueue/dequeue work when used
-    # on a fresh conn per call; the AsyncGoldLapel internal conn reuse is
-    # where the issue surfaces. Integration tests for the doc_*/search
-    # methods do not exercise this shape.
-    _validate_identifier(queue_table)
-    row = await _fetchrow(conn, f"""
-        DELETE FROM {queue_table}
-        WHERE id = (
-            SELECT id FROM {queue_table}
-            ORDER BY id
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-        )
-        RETURNING payload
-    """)
-    if row is None:
-        return None
-    val = row[0]
-    # JSONB codec registered → already dict. Defensive decode for raw text.
-    if isinstance(val, (dict, list)):
-        return val
-    return json.loads(val)
+async def _family_execute(conn, sql, *params):
+    """Execute SQL with native `$N` placeholders, no `%s → $N` translation."""
+    raw = _get_raw_connection(conn)
+    return await raw.execute(sql, *params)
 
 
-# -- Counters ---------------------------------------------------------------
+async def _family_fetchrow(conn, sql, *params):
+    raw = _get_raw_connection(conn)
+    return await raw.fetchrow(sql, *params)
 
-async def incr(conn, table, key, amount=1):
-    _validate_identifier(table)
-    await _execute(conn, f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            key TEXT PRIMARY KEY,
-            value BIGINT NOT NULL DEFAULT 0
-        )
-    """)
-    row = await _fetchrow(conn, f"""
-        INSERT INTO {table} (key, value) VALUES (%s, %s)
-        ON CONFLICT (key) DO UPDATE SET value = {table}.value + %s
-        RETURNING value
-    """, (key, amount, amount))
+
+async def _family_fetch(conn, sql, *params):
+    raw = _get_raw_connection(conn)
+    return await raw.fetch(sql, *params)
+
+
+# ---------------------------------------------------------------------------
+# Counter family
+# ---------------------------------------------------------------------------
+
+
+async def counter_incr(conn, name, key, amount=1, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "incr", "counter")
+    row = await _family_fetchrow(conn, sql, key, int(amount))
     return row[0]
 
 
-async def get_counter(conn, table, key):
-    _validate_identifier(table)
-    row = await _fetchrow(conn, f"SELECT value FROM {table} WHERE key = %s", (key,))
+async def counter_decr(conn, name, key, amount=1, *, patterns=None):
+    return await counter_incr(conn, name, key, -int(amount), patterns=patterns)
+
+
+async def counter_set(conn, name, key, value, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "set", "counter")
+    row = await _family_fetchrow(conn, sql, key, int(value))
+    return row[0]
+
+
+async def counter_get(conn, name, key, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "get", "counter")
+    row = await _family_fetchrow(conn, sql, key)
     return row[0] if row else 0
 
 
-# -- Hashes -----------------------------------------------------------------
-
-async def hset(conn, table, key, field, value):
-    _validate_identifier(table)
-    await _execute(conn, f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            key TEXT PRIMARY KEY,
-            data JSONB NOT NULL DEFAULT '{{}}'::jsonb
-        )
-    """)
-    await _execute(conn, f"""
-        INSERT INTO {table} (key, data) VALUES (%s, jsonb_build_object(%s, %s::jsonb))
-        ON CONFLICT (key) DO UPDATE SET data = {table}.data || jsonb_build_object(%s, %s::jsonb)
-    """, (key, field, json.dumps(value), field, json.dumps(value)))
-
-
-async def hget(conn, table, key, field):
-    _validate_identifier(table)
-    row = await _fetchrow(
-        conn, f"SELECT data->>%s FROM {table} WHERE key = %s", (field, key),
-    )
-    if row and row[0] is not None:
-        try:
-            return json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            return row[0]
-    return None
-
-
-async def hgetall(conn, table, key):
-    _validate_identifier(table)
-    row = await _fetchrow(conn, f"SELECT data FROM {table} WHERE key = %s", (key,))
-    if row and row[0]:
-        val = row[0]
-        return val if isinstance(val, dict) else json.loads(val)
-    return {}
-
-
-async def hdel(conn, table, key, field):
-    _validate_identifier(table)
-    row = await _fetchrow(
-        conn, f"SELECT data ? %s FROM {table} WHERE key = %s", (field, key),
-    )
-    existed = bool(row and row[0])
-    if existed:
-        await _execute(conn, f"UPDATE {table} SET data = data - %s WHERE key = %s", (field, key))
-    return existed
-
-
-# -- Sorted sets ------------------------------------------------------------
-
-async def zadd(conn, table, member, score):
-    _validate_identifier(table)
-    await _execute(conn, f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            member TEXT PRIMARY KEY,
-            score DOUBLE PRECISION NOT NULL
-        )
-    """)
-    await _execute(conn, f"""
-        INSERT INTO {table} (member, score) VALUES (%s, %s)
-        ON CONFLICT (member) DO UPDATE SET score = EXCLUDED.score
-    """, (str(member), float(score)))
-
-
-async def zincrby(conn, table, member, amount=1):
-    _validate_identifier(table)
-    await _execute(conn, f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            member TEXT PRIMARY KEY,
-            score DOUBLE PRECISION NOT NULL
-        )
-    """)
-    row = await _fetchrow(conn, f"""
-        INSERT INTO {table} (member, score) VALUES (%s, %s)
-        ON CONFLICT (member) DO UPDATE SET score = {table}.score + %s
-        RETURNING score
-    """, (str(member), float(amount), float(amount)))
-    return row[0]
-
-
-async def zrange(conn, table, start=0, stop=10, desc=True):
-    _validate_identifier(table)
-    order = "DESC" if desc else "ASC"
-    limit = stop - start
-    rows = await _fetch(conn, f"""
-        SELECT member, score FROM {table}
-        ORDER BY score {order}
-        LIMIT %s OFFSET %s
-    """, (limit, start))
-    return [(r[0], r[1]) for r in rows]
-
-
-async def zrank(conn, table, member, desc=True):
-    _validate_identifier(table)
-    order = "DESC" if desc else "ASC"
-    row = await _fetchrow(conn, f"""
-        SELECT rank FROM (
-            SELECT member, ROW_NUMBER() OVER (ORDER BY score {order}) - 1 AS rank
-            FROM {table}
-        ) ranked
-        WHERE member = %s
-    """, (str(member),))
-    return row[0] if row else None
-
-
-async def zscore(conn, table, member):
-    _validate_identifier(table)
-    row = await _fetchrow(
-        conn, f"SELECT score FROM {table} WHERE member = %s", (str(member),),
-    )
-    return row[0] if row else None
-
-
-async def zrem(conn, table, member):
-    _validate_identifier(table)
-    status = await _execute(conn, f"DELETE FROM {table} WHERE member = %s", (str(member),))
+async def counter_delete(conn, name, key, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "delete", "counter")
+    status = await _family_execute(conn, sql, key)
     return _rowcount_from_status(status) > 0
 
 
-# -- Geo --------------------------------------------------------------------
-
-async def georadius(conn, table, geom_column, lon, lat, radius_meters, limit=50):
-    _validate_identifier(table)
-    _validate_identifier(geom_column)
-    rows = await _fetch(conn, f"""
-        SELECT *, ST_Distance(
-            {geom_column}::geography,
-            ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography
-        ) AS distance_m
-        FROM {table}
-        WHERE ST_DWithin(
-            {geom_column}::geography,
-            ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
-            %s
-        )
-        ORDER BY distance_m
-        LIMIT %s
-    """, (lon, lat, lon, lat, radius_meters, limit))
-    return _rows_to_dicts(rows)
+async def counter_count_keys(conn, name, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "count_keys", "counter")
+    row = await _family_fetchrow(conn, sql)
+    return row[0] if row else 0
 
 
-async def geoadd(conn, table, name_column, geom_column, name, lon, lat):
-    _validate_identifier(table)
-    _validate_identifier(name_column)
-    _validate_identifier(geom_column)
-    await _execute(conn, "CREATE EXTENSION IF NOT EXISTS postgis")
-    await _execute(conn, f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            id BIGSERIAL PRIMARY KEY,
-            {name_column} TEXT NOT NULL,
-            {geom_column} GEOMETRY(Point, 4326) NOT NULL
-        )
-    """)
-    await _execute(conn, f"""
-        INSERT INTO {table} ({name_column}, {geom_column})
-        VALUES (%s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-    """, (name, lon, lat))
+# ---------------------------------------------------------------------------
+# Sorted-set (zset) family
+# ---------------------------------------------------------------------------
 
 
-async def geodist(conn, table, geom_column, name_column, name_a, name_b):
-    _validate_identifier(table)
-    _validate_identifier(geom_column)
-    _validate_identifier(name_column)
-    row = await _fetchrow(conn, f"""
-        SELECT ST_Distance(a.{geom_column}::geography, b.{geom_column}::geography)
-        FROM {table} a, {table} b
-        WHERE a.{name_column} = %s AND b.{name_column} = %s
-    """, (name_a, name_b))
+async def zset_add(conn, name, zset_key, member, score, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "zadd", "zset")
+    row = await _family_fetchrow(
+        conn, sql, str(zset_key), str(member), float(score),
+    )
+    return row[0]
+
+
+async def zset_incr_by(conn, name, zset_key, member, delta=1, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "zincrby", "zset")
+    row = await _family_fetchrow(
+        conn, sql, str(zset_key), str(member), float(delta),
+    )
+    return row[0]
+
+
+async def zset_score(conn, name, zset_key, member, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "zscore", "zset")
+    row = await _family_fetchrow(conn, sql, str(zset_key), str(member))
     return row[0] if row else None
+
+
+async def zset_remove(conn, name, zset_key, member, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "zrem", "zset")
+    status = await _family_execute(conn, sql, str(zset_key), str(member))
+    return _rowcount_from_status(status) > 0
+
+
+async def zset_range(conn, name, zset_key, start=0, stop=10, desc=True, *, patterns=None):
+    _validate_identifier(name)
+    key = "zrange_desc" if desc else "zrange_asc"
+    sql = _family_pattern(patterns, key, "zset")
+    limit = max(0, int(stop) - int(start) + 1)
+    rows = await _family_fetch(conn, sql, str(zset_key), limit, int(start))
+    return [(r[0], r[1]) for r in rows]
+
+
+async def zset_range_by_score(conn, name, zset_key, min_score, max_score, limit=100, offset=0, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "zrangebyscore", "zset")
+    rows = await _family_fetch(
+        conn, sql, str(zset_key), float(min_score), float(max_score),
+        int(limit), int(offset),
+    )
+    return [(r[0], r[1]) for r in rows]
+
+
+async def zset_rank(conn, name, zset_key, member, desc=True, *, patterns=None):
+    _validate_identifier(name)
+    key = "zrank_desc" if desc else "zrank_asc"
+    sql = _family_pattern(patterns, key, "zset")
+    row = await _family_fetchrow(conn, sql, str(zset_key), str(member))
+    return row[0] if row else None
+
+
+async def zset_card(conn, name, zset_key, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "zcard", "zset")
+    row = await _family_fetchrow(conn, sql, str(zset_key))
+    return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Hash family
+# ---------------------------------------------------------------------------
+
+
+def _decode_jsonb(value):
+    """Best-effort decode for JSONB payloads. asyncpg's default codec hands
+    us decoded objects; if a config returned the raw text, decode it.
+    Tolerate non-JSON strings (might be pre-existing data)."""
+    if not isinstance(value, (str, bytes)):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+
+
+async def hash_set(conn, name, hash_key, field, value, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "hset", "hash")
+    row = await _family_fetchrow(
+        conn, sql, str(hash_key), str(field), json.dumps(value),
+    )
+    if row and row[0] is not None:
+        return _decode_jsonb(row[0])
+    return None
+
+
+async def hash_get(conn, name, hash_key, field, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "hget", "hash")
+    row = await _family_fetchrow(conn, sql, str(hash_key), str(field))
+    if row and row[0] is not None:
+        return _decode_jsonb(row[0])
+    return None
+
+
+async def hash_get_all(conn, name, hash_key, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "hgetall", "hash")
+    rows = await _family_fetch(conn, sql, str(hash_key))
+    return {r[0]: _decode_jsonb(r[1]) for r in rows}
+
+
+async def hash_keys(conn, name, hash_key, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "hkeys", "hash")
+    rows = await _family_fetch(conn, sql, str(hash_key))
+    return [r[0] for r in rows]
+
+
+async def hash_values(conn, name, hash_key, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "hvals", "hash")
+    rows = await _family_fetch(conn, sql, str(hash_key))
+    return [_decode_jsonb(r[0]) for r in rows]
+
+
+async def hash_exists(conn, name, hash_key, field, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "hexists", "hash")
+    row = await _family_fetchrow(conn, sql, str(hash_key), str(field))
+    return bool(row[0]) if row else False
+
+
+async def hash_delete(conn, name, hash_key, field, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "hdel", "hash")
+    status = await _family_execute(conn, sql, str(hash_key), str(field))
+    return _rowcount_from_status(status) > 0
+
+
+async def hash_len(conn, name, hash_key, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "hlen", "hash")
+    row = await _family_fetchrow(conn, sql, str(hash_key))
+    return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Queue family (at-least-once with visibility timeout)
+# ---------------------------------------------------------------------------
+
+
+async def queue_enqueue(conn, name, payload, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "enqueue", "queue")
+    row = await _family_fetchrow(conn, sql, json.dumps(payload))
+    return row[0] if row else None
+
+
+async def queue_claim(conn, name, visibility_timeout_ms=30000, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "claim", "queue")
+    row = await _family_fetchrow(conn, sql, int(visibility_timeout_ms))
+    if not row:
+        return None
+    return (row[0], _decode_jsonb(row[1]))
+
+
+async def queue_ack(conn, name, message_id, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "ack", "queue")
+    status = await _family_execute(conn, sql, int(message_id))
+    return _rowcount_from_status(status) > 0
+
+
+async def queue_abandon(conn, name, message_id, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "nack", "queue")
+    row = await _family_fetchrow(conn, sql, int(message_id))
+    return row is not None
+
+
+async def queue_extend(conn, name, message_id, additional_ms, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "extend", "queue")
+    row = await _family_fetchrow(
+        conn, sql, int(message_id), int(additional_ms),
+    )
+    return row[0] if row else None
+
+
+async def queue_peek(conn, name, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "peek", "queue")
+    row = await _family_fetchrow(conn, sql)
+    if not row:
+        return None
+    msg_id, payload, visible_at, status, created_at = row
+    return {
+        "id": msg_id,
+        "payload": _decode_jsonb(payload),
+        "visible_at": visible_at,
+        "status": status,
+        "created_at": created_at,
+    }
+
+
+async def queue_count_ready(conn, name, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "count_ready", "queue")
+    row = await _family_fetchrow(conn, sql)
+    return row[0] if row else 0
+
+
+async def queue_count_claimed(conn, name, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "count_claimed", "queue")
+    row = await _family_fetchrow(conn, sql)
+    return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Geo family (PostGIS GEOGRAPHY-native)
+# ---------------------------------------------------------------------------
+
+# Distance unit conversion (meters-native — matches the proxy column type).
+_GEO_UNITS = {"m": 1.0, "km": 1000.0, "mi": 1609.344, "ft": 0.3048}
+
+
+def _to_meters(value, unit):
+    factor = _GEO_UNITS.get(unit)
+    if factor is None:
+        raise ValueError(f"Unknown distance unit: {unit!r} (choose m/km/mi/ft)")
+    return float(value) * factor
+
+
+def _convert_distance_meters(meters, unit):
+    factor = _GEO_UNITS.get(unit)
+    if factor is None:
+        raise ValueError(f"Unknown distance unit: {unit!r} (choose m/km/mi/ft)")
+    return float(meters) / factor
+
+
+async def geo_add(conn, name, member, lon, lat, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "geoadd", "geo")
+    row = await _family_fetchrow(
+        conn, sql, str(member), float(lon), float(lat),
+    )
+    return (row[0], row[1]) if row else None
+
+
+async def geo_pos(conn, name, member, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "geopos", "geo")
+    row = await _family_fetchrow(conn, sql, str(member))
+    return (row[0], row[1]) if row else None
+
+
+async def geo_dist(conn, name, member_a, member_b, unit="m", *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "geodist", "geo")
+    row = await _family_fetchrow(conn, sql, str(member_a), str(member_b))
+    if not row or row[0] is None:
+        return None
+    return _convert_distance_meters(row[0], unit)
+
+
+async def geo_radius(conn, name, lon, lat, radius, unit="m", limit=50, *, patterns=None):
+    """Members within `radius` of (lon, lat) with per-row distance.
+
+    Proxy contract: $1=lon, $2=lat, $3=radius_m, $4=limit. The proxy
+    computes the anchor geography once via CTE so each $N appears exactly
+    once — asyncpg binds the 4-tuple positionally, no translation needed.
+    """
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "georadius_with_dist", "geo")
+    radius_m = _to_meters(radius, unit)
+    rows = await _family_fetch(
+        conn, sql, float(lon), float(lat), float(radius_m), int(limit),
+    )
+    return [dict(r) for r in rows]
+
+
+async def geo_radius_by_member(conn, name, member, radius, unit="m", limit=50, *, patterns=None):
+    """Members within `radius` of `member`'s location.
+
+    Proxy contract: $1 and $2 are both the anchor member name (one for the
+    join, one for the self-exclusion); $3=radius_m, $4=limit. asyncpg binds
+    each $N positionally, so we pass `(member, member, radius_m, limit)`
+    matching the $N order (NOT the source-text order — that distinction
+    matters here because $1 and $2 reference the same value).
+    """
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "geosearch_member", "geo")
+    radius_m = _to_meters(radius, unit)
+    rows = await _family_fetch(
+        conn, sql, str(member), str(member), float(radius_m), int(limit),
+    )
+    return [dict(r) for r in rows]
+
+
+async def geo_remove(conn, name, member, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "geo_remove", "geo")
+    status = await _family_execute(conn, sql, str(member))
+    return _rowcount_from_status(status) > 0
+
+
+async def geo_count(conn, name, *, patterns=None):
+    _validate_identifier(name)
+    sql = _family_pattern(patterns, "geo_count", "geo")
+    row = await _family_fetchrow(conn, sql)
+    return row[0] if row else 0
 
 
 # -- Misc -------------------------------------------------------------------

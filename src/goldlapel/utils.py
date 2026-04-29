@@ -76,364 +76,624 @@ def subscribe(conn, channel, callback, blocking=True):
         return t
 
 
-def enqueue(conn, queue_table, payload):
-    """Add a job to a queue table. Like redis.lpush().
+# --
+# Phase 5 Redis-compat families: counter, zset, hash, queue, geo.
+#
+# Each family's helpers consume `patterns` returned from the proxy's
+# `/api/ddl/<family>/create` endpoint and translate `$1`-style placeholders
+# to psycopg's `%s` via `_pattern_sql`. The proxy owns DDL — these helpers
+# never CREATE TABLE.
+# --
 
-    Creates the queue table if it doesn't exist.
-    Payload is stored as JSONB.
+
+def _pattern_sql(patterns, key, family):
+    """Pull a query pattern from the proxy's response and convert $N → %s.
+
+    Family is only used to make the error message helpful when callers
+    forget to pass `patterns=` (i.e. they invoked the util directly rather
+    than via the namespaced API).
     """
-    _validate_identifier(queue_table)
+    if patterns is None:
+        raise RuntimeError(
+            f"{family} utils require DDL patterns from the proxy — call via "
+            f"`gl.{family}s.<verb>(...)` rather than the utils function directly."
+        )
+    from goldlapel.ddl import to_psycopg
+    return to_psycopg(patterns["query_patterns"][key])
+
+
+# ---------------------------------------------------------------------------
+# Counter family
+# ---------------------------------------------------------------------------
+
+
+def counter_incr(conn, name, key, amount=1, *, patterns=None):
+    """Increment-or-insert a counter; returns the new value."""
+    _validate_identifier(name)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {queue_table} (
-            id BIGSERIAL PRIMARY KEY,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-    cur.execute(
-        f"INSERT INTO {queue_table} (payload) VALUES (%s)",
-        (json.dumps(payload),),
-    )
-    raw.commit()
-    cur.close()
-
-
-def dequeue(conn, queue_table):
-    """Pop the next job from a queue table. Like redis.brpop() (non-blocking).
-
-    Uses FOR UPDATE SKIP LOCKED for safe concurrent access.
-    Returns the payload dict, or None if the queue is empty.
-    """
-    _validate_identifier(queue_table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    cur.execute(f"""
-        DELETE FROM {queue_table}
-        WHERE id = (
-            SELECT id FROM {queue_table}
-            ORDER BY id
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-        )
-        RETURNING payload
-    """)
-    row = cur.fetchone()
-    raw.commit()
-    cur.close()
-    if row:
-        return row[0] if isinstance(row[0], dict) else json.loads(row[0])
-    return None
-
-
-def incr(conn, table, key, amount=1):
-    """Increment a counter. Like redis.incr().
-
-    Creates the counter table if it doesn't exist.
-    Returns the new value.
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            key TEXT PRIMARY KEY,
-            value BIGINT NOT NULL DEFAULT 0
-        )
-    """)
-    cur.execute(f"""
-        INSERT INTO {table} (key, value) VALUES (%s, %s)
-        ON CONFLICT (key) DO UPDATE SET value = {table}.value + %s
-        RETURNING value
-    """, (key, amount, amount))
+    cur.execute(_pattern_sql(patterns, "incr", "counter"), (key, int(amount)))
     result = cur.fetchone()[0]
     raw.commit()
     cur.close()
     return result
 
 
-def get_counter(conn, table, key):
-    """Get a counter value. Like redis.get() for a counter."""
-    _validate_identifier(table)
+def counter_decr(conn, name, key, amount=1, *, patterns=None):
+    """Decrement is incr with a negative amount. Provided as a separate
+    method so callers don't need to remember the sign convention."""
+    return counter_incr(conn, name, key, -int(amount), patterns=patterns)
+
+
+def counter_set(conn, name, key, value, *, patterns=None):
+    """Idempotent set-key; returns the value just stored."""
+    _validate_identifier(name)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"SELECT value FROM {table} WHERE key = %s", (key,))
+    cur.execute(_pattern_sql(patterns, "set", "counter"), (key, int(value)))
+    result = cur.fetchone()[0]
+    raw.commit()
+    cur.close()
+    return result
+
+
+def counter_get(conn, name, key, *, patterns=None):
+    """Get a counter's current value. Returns 0 for unknown keys (matches
+    the Redis convention — no NULL surprise on cold cache)."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "get", "counter"), (key,))
     row = cur.fetchone()
     cur.close()
     return row[0] if row else 0
 
 
-def hset(conn, table, key, field, value):
-    """Set a field in a hash. Like redis.hset().
-
-    Creates the hash table if it doesn't exist. Uses JSONB for storage.
-    """
-    _validate_identifier(table)
+def counter_delete(conn, name, key, *, patterns=None):
+    """Delete a counter row. Returns True if a row was deleted, False if
+    the key was already absent."""
+    _validate_identifier(name)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            key TEXT PRIMARY KEY,
-            data JSONB NOT NULL DEFAULT '{{}}'::jsonb
-        )
-    """)
-    cur.execute(f"""
-        INSERT INTO {table} (key, data) VALUES (%s, jsonb_build_object(%s, %s::jsonb))
-        ON CONFLICT (key) DO UPDATE SET data = {table}.data || jsonb_build_object(%s, %s::jsonb)
-    """, (key, field, json.dumps(value), field, json.dumps(value)))
-    raw.commit()
-    cur.close()
-
-
-def hget(conn, table, key, field):
-    """Get a field from a hash. Like redis.hget().
-
-    Returns the value, or None if key or field doesn't exist.
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    cur.execute(f"SELECT data->>%s FROM {table} WHERE key = %s", (field, key))
-    row = cur.fetchone()
-    cur.close()
-    if row and row[0] is not None:
-        try:
-            return json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            return row[0]
-    return None
-
-
-def hgetall(conn, table, key):
-    """Get all fields from a hash. Like redis.hgetall().
-
-    Returns a dict, or empty dict if key doesn't exist.
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    cur.execute(f"SELECT data FROM {table} WHERE key = %s", (key,))
-    row = cur.fetchone()
-    cur.close()
-    if row and row[0]:
-        return row[0] if isinstance(row[0], dict) else json.loads(row[0])
-    return {}
-
-
-def hdel(conn, table, key, field):
-    """Remove a field from a hash. Like redis.hdel().
-
-    Returns True if the field existed, False otherwise.
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    cur.execute(f"SELECT data ? %s FROM {table} WHERE key = %s", (field, key))
-    row = cur.fetchone()
-    existed = row and row[0]
-    if existed:
-        cur.execute(f"UPDATE {table} SET data = data - %s WHERE key = %s", (field, key))
-        raw.commit()
-    cur.close()
-    return bool(existed)
-
-
-def zadd(conn, table, member, score):
-    """Add a member with a score to a sorted set. Like redis.zadd().
-
-    Creates the sorted set table if it doesn't exist.
-    If the member already exists, updates the score.
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            member TEXT PRIMARY KEY,
-            score DOUBLE PRECISION NOT NULL
-        )
-    """)
-    cur.execute(f"""
-        INSERT INTO {table} (member, score) VALUES (%s, %s)
-        ON CONFLICT (member) DO UPDATE SET score = EXCLUDED.score
-    """, (str(member), float(score)))
-    raw.commit()
-    cur.close()
-
-
-def zincrby(conn, table, member, amount=1):
-    """Increment a member's score. Like redis.zincrby().
-
-    Creates the member with the given amount if it doesn't exist.
-    Returns the new score.
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            member TEXT PRIMARY KEY,
-            score DOUBLE PRECISION NOT NULL
-        )
-    """)
-    cur.execute(f"""
-        INSERT INTO {table} (member, score) VALUES (%s, %s)
-        ON CONFLICT (member) DO UPDATE SET score = {table}.score + %s
-        RETURNING score
-    """, (str(member), float(amount), float(amount)))
-    result = cur.fetchone()[0]
-    raw.commit()
-    cur.close()
-    return result
-
-
-def zrange(conn, table, start=0, stop=10, desc=True):
-    """Get members by score rank. Like redis.zrange().
-
-    Returns a list of (member, score) tuples.
-    desc=True returns highest scores first (leaderboard order).
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    order = "DESC" if desc else "ASC"
-    limit = stop - start
-    cur.execute(f"""
-        SELECT member, score FROM {table}
-        ORDER BY score {order}
-        LIMIT %s OFFSET %s
-    """, (limit, start))
-    results = [(row[0], row[1]) for row in cur.fetchall()]
-    cur.close()
-    return results
-
-
-def zrank(conn, table, member, desc=True):
-    """Get the rank of a member. Like redis.zrank().
-
-    Returns 0-based rank, or None if member doesn't exist.
-    desc=True ranks by highest score first.
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    order = "DESC" if desc else "ASC"
-    cur.execute(f"""
-        SELECT rank FROM (
-            SELECT member, ROW_NUMBER() OVER (ORDER BY score {order}) - 1 AS rank
-            FROM {table}
-        ) ranked
-        WHERE member = %s
-    """, (str(member),))
-    row = cur.fetchone()
-    cur.close()
-    return row[0] if row else None
-
-
-def zscore(conn, table, member):
-    """Get the score of a member. Like redis.zscore().
-
-    Returns the score, or None if member doesn't exist.
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    cur.execute(f"SELECT score FROM {table} WHERE member = %s", (str(member),))
-    row = cur.fetchone()
-    cur.close()
-    return row[0] if row else None
-
-
-def zrem(conn, table, member):
-    """Remove a member from a sorted set. Like redis.zrem().
-
-    Returns True if the member was removed, False if it didn't exist.
-    """
-    _validate_identifier(table)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    cur.execute(f"DELETE FROM {table} WHERE member = %s", (str(member),))
+    cur.execute(_pattern_sql(patterns, "delete", "counter"), (key,))
     removed = cur.rowcount > 0
     raw.commit()
     cur.close()
     return removed
 
 
-def georadius(conn, table, geom_column, lon, lat, radius_meters, limit=50):
-    """Find rows within a radius of a point. Like redis.georadius().
-
-    Requires PostGIS extension. Uses ST_DWithin with geography type
-    for accurate distance on the Earth's surface.
-
-    Returns a list of dicts with all columns plus a 'distance_m' field.
-    """
-    _validate_identifier(table)
-    _validate_identifier(geom_column)
+def counter_count_keys(conn, name, *, patterns=None):
+    """Total distinct keys in the counter namespace."""
+    _validate_identifier(name)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"""
-        SELECT *, ST_Distance(
-            {geom_column}::geography,
-            ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography
-        ) AS distance_m
-        FROM {table}
-        WHERE ST_DWithin(
-            {geom_column}::geography,
-            ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
-            %s
-        )
-        ORDER BY distance_m
-        LIMIT %s
-    """, (lon, lat, lon, lat, radius_meters, limit))
-    columns = [desc[0] for desc in cur.description]
-    results = [dict(zip(columns, row)) for row in cur.fetchall()]
+    cur.execute(_pattern_sql(patterns, "count_keys", "counter"))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Sorted-set (zset) family
+# ---------------------------------------------------------------------------
+
+
+def zset_add(conn, name, zset_key, member, score, *, patterns=None):
+    """Set-or-update a member's score under `zset_key`; returns the new score."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "zadd", "zset"),
+        (str(zset_key), str(member), float(score)),
+    )
+    result = cur.fetchone()[0]
+    raw.commit()
+    cur.close()
+    return result
+
+
+def zset_incr_by(conn, name, zset_key, member, delta=1, *, patterns=None):
+    """Atomic increment-or-insert; returns the new score."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "zincrby", "zset"),
+        (str(zset_key), str(member), float(delta)),
+    )
+    result = cur.fetchone()[0]
+    raw.commit()
+    cur.close()
+    return result
+
+
+def zset_score(conn, name, zset_key, member, *, patterns=None):
+    """Get a member's score, or None if absent."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "zscore", "zset"),
+        (str(zset_key), str(member)),
+    )
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else None
+
+
+def zset_remove(conn, name, zset_key, member, *, patterns=None):
+    """Remove a member; True if removed, False if absent."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "zrem", "zset"),
+        (str(zset_key), str(member)),
+    )
+    removed = cur.rowcount > 0
+    raw.commit()
+    cur.close()
+    return removed
+
+
+def zset_range(conn, name, zset_key, start=0, stop=10, desc=True, *, patterns=None):
+    """Get members by rank within `zset_key`.
+
+    Returns a list of (member, score) tuples. `desc=True` orders highest
+    score first (leaderboard order). `start`/`stop` are 0-based inclusive
+    bounds Redis-style; the SQL converts to LIMIT/OFFSET.
+    """
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    key = "zrange_desc" if desc else "zrange_asc"
+    limit = max(0, int(stop) - int(start) + 1)
+    cur.execute(
+        _pattern_sql(patterns, key, "zset"),
+        (str(zset_key), limit, int(start)),
+    )
+    results = [(row[0], row[1]) for row in cur.fetchall()]
     cur.close()
     return results
 
 
-def geoadd(conn, table, name_column, geom_column, name, lon, lat):
-    """Add a location to a geo table. Like redis.geoadd().
-
-    Creates the table with PostGIS geometry column if it doesn't exist.
-    Requires PostGIS extension.
-    """
-    _validate_identifier(table)
-    _validate_identifier(name_column)
-    _validate_identifier(geom_column)
+def zset_range_by_score(conn, name, zset_key, min_score, max_score, limit=100, offset=0, *, patterns=None):
+    """Get members whose score is between min and max (inclusive)."""
+    _validate_identifier(name)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            id BIGSERIAL PRIMARY KEY,
-            {name_column} TEXT NOT NULL,
-            {geom_column} GEOMETRY(Point, 4326) NOT NULL
-        )
-    """)
-    cur.execute(f"""
-        INSERT INTO {table} ({name_column}, {geom_column})
-        VALUES (%s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-    """, (name, lon, lat))
-    raw.commit()
+    cur.execute(
+        _pattern_sql(patterns, "zrangebyscore", "zset"),
+        (str(zset_key), float(min_score), float(max_score), int(limit), int(offset)),
+    )
+    results = [(row[0], row[1]) for row in cur.fetchall()]
     cur.close()
+    return results
 
 
-def geodist(conn, table, geom_column, name_column, name_a, name_b):
-    """Get distance between two members in meters. Like redis.geodist()."""
-    _validate_identifier(table)
-    _validate_identifier(geom_column)
-    _validate_identifier(name_column)
+def zset_rank(conn, name, zset_key, member, desc=True, *, patterns=None):
+    """0-based rank within `zset_key`, or None if member absent."""
+    _validate_identifier(name)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"""
-        SELECT ST_Distance(a.{geom_column}::geography, b.{geom_column}::geography)
-        FROM {table} a, {table} b
-        WHERE a.{name_column} = %s AND b.{name_column} = %s
-    """, (name_a, name_b))
+    key = "zrank_desc" if desc else "zrank_asc"
+    cur.execute(
+        _pattern_sql(patterns, key, "zset"),
+        (str(zset_key), str(member)),
+    )
     row = cur.fetchone()
     cur.close()
     return row[0] if row else None
+
+
+def zset_card(conn, name, zset_key, *, patterns=None):
+    """Cardinality of one zset_key namespace."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "zcard", "zset"), (str(zset_key),))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Hash family
+# ---------------------------------------------------------------------------
+
+
+def _decode_jsonb(value):
+    """Coerce a JSONB column value into the user's Python object.
+
+    psycopg/asyncpg with the default JSONB codec hand us dicts/lists/scalars
+    already decoded. Other configurations hand back the raw text of the
+    JSON document (str or bytes). Decode only in the second case; if the
+    text isn't valid JSON, return it as-is rather than raising — the
+    underlying column may have been written by something other than this
+    helper, and surfacing a JSONDecodeError on `hash_get` would be
+    user-hostile.
+    """
+    if not isinstance(value, (str, bytes)):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+
+
+def hash_set(conn, name, hash_key, field, value, *, patterns=None):
+    """Set a field's value (single-row UPSERT). Value is JSON-encoded."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "hset", "hash"),
+        (str(hash_key), str(field), json.dumps(value)),
+    )
+    row = cur.fetchone()
+    raw.commit()
+    cur.close()
+    if row and row[0] is not None:
+        return _decode_jsonb(row[0])
+    return None
+
+
+def hash_get(conn, name, hash_key, field, *, patterns=None):
+    """Get a field's value, or None if (key, field) absent."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "hget", "hash"),
+        (str(hash_key), str(field)),
+    )
+    row = cur.fetchone()
+    cur.close()
+    if row and row[0] is not None:
+        return _decode_jsonb(row[0])
+    return None
+
+
+def hash_get_all(conn, name, hash_key, *, patterns=None):
+    """Reassemble every (field, value) under `hash_key` into a Python dict.
+    Empty dict if the key has no fields."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "hgetall", "hash"), (str(hash_key),))
+    out = {}
+    for row in cur.fetchall():
+        out[row[0]] = _decode_jsonb(row[1])
+    cur.close()
+    return out
+
+
+def hash_keys(conn, name, hash_key, *, patterns=None):
+    """List every field name under `hash_key`."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "hkeys", "hash"), (str(hash_key),))
+    result = [row[0] for row in cur.fetchall()]
+    cur.close()
+    return result
+
+
+def hash_values(conn, name, hash_key, *, patterns=None):
+    """List every value under `hash_key` (in field-name order)."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "hvals", "hash"), (str(hash_key),))
+    result = [_decode_jsonb(row[0]) for row in cur.fetchall()]
+    cur.close()
+    return result
+
+
+def hash_exists(conn, name, hash_key, field, *, patterns=None):
+    """Does (hash_key, field) exist?"""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "hexists", "hash"),
+        (str(hash_key), str(field)),
+    )
+    row = cur.fetchone()
+    cur.close()
+    return bool(row[0]) if row else False
+
+
+def hash_delete(conn, name, hash_key, field, *, patterns=None):
+    """Delete a field; True if deleted, False if absent."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "hdel", "hash"),
+        (str(hash_key), str(field)),
+    )
+    removed = cur.rowcount > 0
+    raw.commit()
+    cur.close()
+    return removed
+
+
+def hash_len(conn, name, hash_key, *, patterns=None):
+    """Number of fields under `hash_key`."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "hlen", "hash"), (str(hash_key),))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Queue family (at-least-once with visibility timeout)
+# ---------------------------------------------------------------------------
+
+
+def queue_enqueue(conn, name, payload, *, patterns=None):
+    """Add a message; returns its assigned `id`."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "enqueue", "queue"),
+        (json.dumps(payload),),
+    )
+    row = cur.fetchone()
+    raw.commit()
+    cur.close()
+    return row[0] if row else None
+
+
+def queue_claim(conn, name, visibility_timeout_ms=30000, *, patterns=None):
+    """Lease the next ready message. Returns `(id, payload)` or None if the
+    queue is empty. Caller MUST `ack` or `abandon` (alias for `nack`) the id
+    or the message becomes visible again after `visibility_timeout_ms`."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "claim", "queue"),
+        (int(visibility_timeout_ms),),
+    )
+    row = cur.fetchone()
+    raw.commit()
+    cur.close()
+    if not row:
+        return None
+    return (row[0], _decode_jsonb(row[1]))
+
+
+def queue_ack(conn, name, message_id, *, patterns=None):
+    """Mark a claimed message done (DELETEs the row). Returns True if the
+    message existed and was removed."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "ack", "queue"), (int(message_id),))
+    removed = cur.rowcount > 0
+    raw.commit()
+    cur.close()
+    return removed
+
+
+def queue_abandon(conn, name, message_id, *, patterns=None):
+    """Release a claimed message back to ready immediately. Returns True if
+    the message existed and was a claim. Equivalent to a NACK in queue
+    parlance — the message stays in the queue and is redelivered to the
+    next claim."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "nack", "queue"), (int(message_id),))
+    row = cur.fetchone()
+    raw.commit()
+    cur.close()
+    return row is not None
+
+
+def queue_extend(conn, name, message_id, additional_ms, *, patterns=None):
+    """Extend a claimed message's visibility deadline by `additional_ms`
+    milliseconds. Returns the new `visible_at`, or None if the id wasn't
+    a claimed message."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "extend", "queue"),
+        (int(message_id), int(additional_ms)),
+    )
+    row = cur.fetchone()
+    raw.commit()
+    cur.close()
+    return row[0] if row else None
+
+
+def queue_peek(conn, name, *, patterns=None):
+    """Look at the next-visible message without claiming it. Returns a dict
+    with `id`, `payload`, `visible_at`, `status`, `created_at`, or None
+    when nothing is ready."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "peek", "queue"))
+    row = cur.fetchone()
+    cur.close()
+    if not row:
+        return None
+    msg_id, payload, visible_at, status, created_at = row
+    return {
+        "id": msg_id,
+        "payload": _decode_jsonb(payload),
+        "visible_at": visible_at,
+        "status": status,
+        "created_at": created_at,
+    }
+
+
+def queue_count_ready(conn, name, *, patterns=None):
+    """Count of messages currently ready (status='ready' and visible)."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "count_ready", "queue"))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else 0
+
+
+def queue_count_claimed(conn, name, *, patterns=None):
+    """Count of currently-claimed messages (in flight)."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "count_claimed", "queue"))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Geo family (PostGIS GEOGRAPHY-native)
+# ---------------------------------------------------------------------------
+
+
+def geo_add(conn, name, member, lon, lat, *, patterns=None):
+    """Set-or-update a member's lon/lat. Idempotent on the member name (PK).
+    Returns the just-stored (lon, lat) tuple."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "geoadd", "geo"),
+        (str(member), float(lon), float(lat)),
+    )
+    row = cur.fetchone()
+    raw.commit()
+    cur.close()
+    return (row[0], row[1]) if row else None
+
+
+def geo_pos(conn, name, member, *, patterns=None):
+    """Fetch a member's (lon, lat) tuple, or None if absent."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "geopos", "geo"), (str(member),))
+    row = cur.fetchone()
+    cur.close()
+    return (row[0], row[1]) if row else None
+
+
+def geo_dist(conn, name, member_a, member_b, unit="m", *, patterns=None):
+    """Distance between two members. `unit` accepts m / km / mi / ft.
+    Returns float in the requested unit, or None if either member is absent."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(
+        _pattern_sql(patterns, "geodist", "geo"),
+        (str(member_a), str(member_b)),
+    )
+    row = cur.fetchone()
+    cur.close()
+    if not row or row[0] is None:
+        return None
+    return _convert_distance_meters(row[0], unit)
+
+
+def geo_radius(conn, name, lon, lat, radius, unit="m", limit=50, *, patterns=None):
+    """Members within `radius` of (lon, lat). Returns a list of dicts with
+    `member`, `lon`, `lat`, `distance_m`.
+
+    Proxy contract: $1=lon, $2=lat, $3=radius_m, $4=limit. The proxy
+    computes the anchor geography once via CTE so each $N appears exactly
+    once — same param tuple works for both psycopg %s translation and
+    native-$N drivers.
+    """
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    radius_m = _to_meters(radius, unit)
+    cur.execute(
+        _pattern_sql(patterns, "georadius_with_dist", "geo"),
+        (float(lon), float(lat), float(radius_m), int(limit)),
+    )
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def geo_radius_by_member(conn, name, member, radius, unit="m", limit=50, *, patterns=None):
+    """Members within `radius` of `member`'s location.
+
+    Proxy contract: $1 and $2 are both the anchor member name (one for the
+    join, one for the self-exclusion); $3=radius_m, $4=limit. After psycopg's
+    $N → %s translation the markers appear in source order, so we pass
+    `(member, radius_m, member, limit)` to match the in-SQL order
+    `a.member=$1 ... ST_DWithin(..., $3) ... b.member<>$2 ... LIMIT $4`.
+    """
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    radius_m = _to_meters(radius, unit)
+    cur.execute(
+        _pattern_sql(patterns, "geosearch_member", "geo"),
+        (str(member), float(radius_m), str(member), int(limit)),
+    )
+    cols = [desc[0] for desc in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    return results
+
+
+def geo_remove(conn, name, member, *, patterns=None):
+    """Delete a member; True if removed, False if absent."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "geo_remove", "geo"), (str(member),))
+    removed = cur.rowcount > 0
+    raw.commit()
+    cur.close()
+    return removed
+
+
+def geo_count(conn, name, *, patterns=None):
+    """Total members in the namespace."""
+    _validate_identifier(name)
+    raw = _get_raw_connection(conn)
+    cur = raw.cursor()
+    cur.execute(_pattern_sql(patterns, "geo_count", "geo"))
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else 0
+
+
+# Distance unit conversion helpers — proxy returns meters always (GEOGRAPHY
+# default); wrappers translate at the edge so callers can ask in km/mi/ft.
+_GEO_UNITS = {"m": 1.0, "km": 1000.0, "mi": 1609.344, "ft": 0.3048}
+
+
+def _to_meters(value, unit):
+    factor = _GEO_UNITS.get(unit)
+    if factor is None:
+        raise ValueError(f"Unknown distance unit: {unit!r} (choose m/km/mi/ft)")
+    return float(value) * factor
+
+
+def _convert_distance_meters(meters, unit):
+    factor = _GEO_UNITS.get(unit)
+    if factor is None:
+        raise ValueError(f"Unknown distance unit: {unit!r} (choose m/km/mi/ft)")
+    return float(meters) / factor
 
 
 def script(conn, lua_code, *args):
