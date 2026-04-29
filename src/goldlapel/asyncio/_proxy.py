@@ -136,14 +136,24 @@ class AsyncGoldLapel:
         # Nested namespaces — mirror the sync GoldLapel but with async sub-API
         # classes. State is shared via the parent reference held in each
         # sub-API's `self._gl`. The sync GoldLapel also constructed a
-        # DocumentsAPI / StreamsAPI bound to itself, but we never call those —
-        # users access the async surface via `gl.documents` / `gl.streams`
-        # below, where `gl` is the AsyncGoldLapel. This avoids accidentally
-        # calling sync code through an async client.
+        # DocumentsAPI / StreamsAPI / etc. bound to itself, but we never call
+        # those — users access the async surface via `gl.<family>` below,
+        # where `gl` is the AsyncGoldLapel. This avoids accidentally calling
+        # sync code through an async client.
         from goldlapel.asyncio._documents import AsyncDocumentsAPI
         from goldlapel.asyncio._streams import AsyncStreamsAPI
+        from goldlapel.asyncio._counters import AsyncCountersAPI
+        from goldlapel.asyncio._zsets import AsyncZsetsAPI
+        from goldlapel.asyncio._hashes import AsyncHashesAPI
+        from goldlapel.asyncio._queues import AsyncQueuesAPI
+        from goldlapel.asyncio._geos import AsyncGeosAPI
         self.documents = AsyncDocumentsAPI(self)
         self.streams = AsyncStreamsAPI(self)
+        self.counters = AsyncCountersAPI(self)
+        self.zsets = AsyncZsetsAPI(self)
+        self.hashes = AsyncHashesAPI(self)
+        self.queues = AsyncQueuesAPI(self)
+        self.geos = AsyncGeosAPI(self)
 
     # -- Properties (sync access, no await) ---------------------------------
 
