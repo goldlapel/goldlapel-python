@@ -162,7 +162,12 @@ class TestSqlBuilders:
         raw = _FakeConn(cur)
         result = real_utils.queue_extend(raw, "jobs", 42, 5000, patterns=fake_patterns)
         assert result == "2026-05-01T00:00"
-        assert cur.execute.call_args[0][1] == (42, 5000)
+        # Proxy SQL has `$2` (ms) before `$1` (id) in source order:
+        #   `UPDATE ... SET visible_at = ... * $2 WHERE id = $1 ...`
+        # After psycopg `$N → %s` source-order rewrite, the first `%s` is
+        # `additional_ms`, the second is `message_id`. Sync params must
+        # match source order: (additional_ms, message_id) = (5000, 42).
+        assert cur.execute.call_args[0][1] == (5000, 42)
 
     def test_peek_returns_dict(self, fake_patterns):
         cur = _cursor(fetchone=(42, {"work": "foo"}, "vat", "ready", "cat"))

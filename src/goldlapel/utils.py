@@ -501,13 +501,21 @@ def queue_abandon(conn, name, message_id, *, patterns=None):
 def queue_extend(conn, name, message_id, additional_ms, *, patterns=None):
     """Extend a claimed message's visibility deadline by `additional_ms`
     milliseconds. Returns the new `visible_at`, or None if the id wasn't
-    a claimed message."""
+    a claimed message.
+
+    Note: the proxy's `extend` SQL has `$2` (ms) appearing first in source
+    order (`SET visible_at = ... * $2`) before `$1` (id, in WHERE). After
+    psycopg's `$N → %s` translation, `%s` markers appear in source-text
+    order, so we must pass `(additional_ms, message_id)` for the sync
+    path. The async path (asyncpg native `$N`) takes them in `$N` order,
+    `(message_id, additional_ms)` — see `goldlapel/asyncio/_utils.py`.
+    """
     _validate_identifier(name)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     cur.execute(
         _pattern_sql(patterns, "extend", "queue"),
-        (int(message_id), int(additional_ms)),
+        (int(additional_ms), int(message_id)),
     )
     row = cur.fetchone()
     raw.commit()
