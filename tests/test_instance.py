@@ -47,23 +47,48 @@ class TestInstanceMethodDelegation:
         self.fake_conn = MagicMock()
         self.gl._conn = self.fake_conn
 
-    @patch("goldlapel.proxy._utils")
-    def test_doc_insert(self, mock_utils):
-        mock_utils.return_value.doc_insert.return_value = {"_id": "abc"}
-        result = self.gl.doc_insert("users", {"name": "alice"})
-        mock_utils.return_value.doc_insert.assert_called_once_with(
-            self.fake_conn, "users", {"name": "alice"}
-        )
-        assert result == {"_id": "abc"}
+    @patch("goldlapel.ddl.fetch_patterns")
+    @patch("goldlapel.documents.utils", create=True)  # _u in documents.py is a per-call import
+    def test_doc_insert(self, mock_utils, mock_ddl_fetch):
+        # Doc DDL patterns now come from the proxy's /api/ddl/doc_store/* endpoint.
+        from goldlapel import utils as real_utils
+        fake_patterns = {
+            "tables": {"main": "_goldlapel.doc_users"},
+            "query_patterns": {"insert": "INSERT ..."},
+        }
+        mock_ddl_fetch.return_value = fake_patterns
+        # Patch the lazy `from goldlapel import utils as _u` inside DocumentsAPI
+        # by replacing the function on the actual utils module instead.
+        with patch.object(real_utils, "doc_insert", return_value={"_id": "abc"}) as m:
+            self.gl._dashboard_token = "test-token"
+            result = self.gl.documents.insert("users", {"name": "alice"})
+            mock_ddl_fetch.assert_called_once_with(
+                self.gl, "doc_store", "users", self.gl._dashboard_port, "test-token",
+                options=None,
+            )
+            m.assert_called_once_with(
+                self.fake_conn, "users", {"name": "alice"}, patterns=fake_patterns,
+            )
+            assert result == {"_id": "abc"}
 
-    @patch("goldlapel.proxy._utils")
-    def test_doc_insert_many(self, mock_utils):
-        mock_utils.return_value.doc_insert_many.return_value = [{"_id": "1"}, {"_id": "2"}]
-        result = self.gl.doc_insert_many("items", [{"a": 1}, {"b": 2}])
-        mock_utils.return_value.doc_insert_many.assert_called_once_with(
-            self.fake_conn, "items", [{"a": 1}, {"b": 2}]
-        )
-        assert len(result) == 2
+    @patch("goldlapel.ddl.fetch_patterns")
+    def test_doc_insert_many(self, mock_ddl_fetch):
+        from goldlapel import utils as real_utils
+        fake_patterns = {
+            "tables": {"main": "_goldlapel.doc_items"},
+            "query_patterns": {"insert": "INSERT ..."},
+        }
+        mock_ddl_fetch.return_value = fake_patterns
+        with patch.object(
+            real_utils, "doc_insert_many",
+            return_value=[{"_id": "1"}, {"_id": "2"}],
+        ) as m:
+            self.gl._dashboard_token = "test-token"
+            result = self.gl.documents.insert_many("items", [{"a": 1}, {"b": 2}])
+            m.assert_called_once_with(
+                self.fake_conn, "items", [{"a": 1}, {"b": 2}], patterns=fake_patterns,
+            )
+            assert len(result) == 2
 
     @patch("goldlapel.proxy._utils")
     def test_search(self, mock_utils):
@@ -105,8 +130,8 @@ class TestInstanceMethodDelegation:
         )
 
     @patch("goldlapel.ddl.fetch_patterns")
-    @patch("goldlapel.proxy._utils")
-    def test_stream_add(self, mock_utils, mock_ddl_fetch):
+    def test_stream_add(self, mock_ddl_fetch):
+        from goldlapel import utils as real_utils
         # Stream DDL patterns now come from the proxy's /api/ddl/* endpoint.
         # The utils function gets the patterns via kwargs — tests mock both layers.
         fake_patterns = {
@@ -114,17 +139,17 @@ class TestInstanceMethodDelegation:
             "query_patterns": {"insert": "INSERT ..."},
         }
         mock_ddl_fetch.return_value = fake_patterns
-        mock_utils.return_value.stream_add.return_value = 1
-        # Provide a dashboard token so the ddl layer is willing to run.
-        self.gl._dashboard_token = "test-token"
-        result = self.gl.stream_add("events", {"type": "click"})
-        mock_ddl_fetch.assert_called_once_with(
-            self.gl, "stream", "events", self.gl._dashboard_port, "test-token",
-        )
-        mock_utils.return_value.stream_add.assert_called_once_with(
-            self.fake_conn, "events", {"type": "click"}, patterns=fake_patterns,
-        )
-        assert result == 1
+        with patch.object(real_utils, "stream_add", return_value=1) as m:
+            # Provide a dashboard token so the ddl layer is willing to run.
+            self.gl._dashboard_token = "test-token"
+            result = self.gl.streams.add("events", {"type": "click"})
+            mock_ddl_fetch.assert_called_once_with(
+                self.gl, "stream", "events", self.gl._dashboard_port, "test-token",
+            )
+            m.assert_called_once_with(
+                self.fake_conn, "events", {"type": "click"}, patterns=fake_patterns,
+            )
+            assert result == 1
 
     @patch("goldlapel.proxy._utils")
     def test_percolate(self, mock_utils):
@@ -147,9 +172,13 @@ class TestInstanceMethodDelegation:
 
 class TestMethodNotConnected:
     def test_method_raises_before_start(self):
+        # gl.documents.insert needs both a token (which it doesn't have)
+        # and a connection (which it doesn't have). The token check fires
+        # first now since DDL patterns are fetched before the conn is touched.
         gl = GoldLapel("postgresql://localhost:5432/mydb")
-        with pytest.raises(RuntimeError, match="Not connected"):
-            gl.doc_insert("users", {"name": "alice"})
+        # Without a dashboard token, .insert raises before reaching the conn.
+        with pytest.raises(RuntimeError):
+            gl.documents.insert("users", {"name": "alice"})
 
     def test_search_raises_before_start(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb")
@@ -158,12 +187,12 @@ class TestMethodNotConnected:
 
 
 class TestAllMethodsExist:
-    def test_all_util_methods_present(self):
+    def test_all_flat_util_methods_present(self):
+        # Flat namespaces (everything except documents and streams) stay as
+        # direct methods on GoldLapel until their own schema-to-core phase
+        # nests them too.
         gl = GoldLapel("postgresql://localhost:5432/mydb")
         expected = [
-            "doc_insert", "doc_insert_many", "doc_find", "doc_find_one",
-            "doc_update", "doc_update_one", "doc_delete", "doc_delete_one",
-            "doc_count", "doc_create_index", "doc_aggregate",
             "search", "search_fuzzy", "search_phonetic", "similar", "suggest",
             "facets", "aggregate", "create_search_config",
             "publish", "subscribe", "enqueue", "dequeue",
@@ -172,11 +201,48 @@ class TestAllMethodsExist:
             "zadd", "zincrby", "zrange", "zrank", "zscore", "zrem",
             "georadius", "geoadd", "geodist",
             "count_distinct", "script",
-            "stream_add", "stream_create_group", "stream_read",
-            "stream_ack", "stream_claim",
             "percolate_add", "percolate", "percolate_delete",
             "analyze", "explain_score",
         ]
         for method_name in expected:
             assert hasattr(gl, method_name), f"Missing method: {method_name}"
             assert callable(getattr(gl, method_name)), f"Not callable: {method_name}"
+
+    def test_documents_namespace_is_nested(self):
+        # gl.documents replaces gl.doc_*. See goldlapel/documents.py.
+        from goldlapel.documents import DocumentsAPI
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert isinstance(gl.documents, DocumentsAPI)
+        for verb in [
+            "insert", "insert_many", "find", "find_one", "find_cursor",
+            "update", "update_one", "delete", "delete_one",
+            "find_one_and_update", "find_one_and_delete", "distinct",
+            "count", "create_index", "aggregate",
+            "watch", "unwatch",
+            "create_ttl_index", "remove_ttl_index",
+            "create_capped", "remove_cap",
+            "create_collection",
+        ]:
+            assert hasattr(gl.documents, verb), f"Missing gl.documents.{verb}"
+            assert callable(getattr(gl.documents, verb)), f"Not callable: gl.documents.{verb}"
+        # The flat doc_* methods are gone — hard cut.
+        for legacy in ["doc_insert", "doc_find", "doc_update", "doc_delete"]:
+            assert not hasattr(gl, legacy), (
+                f"Legacy flat method {legacy} should have been removed; "
+                f"use gl.documents.<verb> instead."
+            )
+
+    def test_streams_namespace_is_nested(self):
+        # gl.streams replaces gl.stream_*. See goldlapel/streams.py.
+        from goldlapel.streams import StreamsAPI
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert isinstance(gl.streams, StreamsAPI)
+        for verb in ["add", "create_group", "read", "ack", "claim"]:
+            assert hasattr(gl.streams, verb), f"Missing gl.streams.{verb}"
+            assert callable(getattr(gl.streams, verb)), f"Not callable: gl.streams.{verb}"
+        # The flat stream_* methods are gone — hard cut.
+        for legacy in ["stream_add", "stream_read", "stream_ack"]:
+            assert not hasattr(gl, legacy), (
+                f"Legacy flat method {legacy} should have been removed; "
+                f"use gl.streams.<verb> instead."
+            )

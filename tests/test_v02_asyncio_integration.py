@@ -86,8 +86,8 @@ class TestNativeAsyncpgPath:
     async def test_doc_insert_and_find(self, pg_url, collection_name):
         from goldlapel.asyncio import start
         async with start(pg_url, port=7841) as gl:
-            await gl.doc_create_collection(collection_name, unlogged=True)
-            inserted = await gl.doc_insert(
+            await gl.documents.create_collection(collection_name, unlogged=True)
+            inserted = await gl.documents.insert(
                 collection_name, {"hello": "asyncpg", "count": 1},
             )
             assert inserted is not None
@@ -96,32 +96,32 @@ class TestNativeAsyncpgPath:
             assert isinstance(inserted["data"], dict)
             assert inserted["data"]["hello"] == "asyncpg"
 
-            found = await gl.doc_find(collection_name, {"hello": "asyncpg"})
+            found = await gl.documents.find(collection_name, {"hello": "asyncpg"})
             assert len(found) == 1
             assert found[0]["data"]["count"] == 1
 
-            one = await gl.doc_find_one(collection_name, {"hello": "asyncpg"})
+            one = await gl.documents.find_one(collection_name, {"hello": "asyncpg"})
             assert one["data"]["hello"] == "asyncpg"
 
-            n = await gl.doc_count(collection_name)
+            n = await gl.documents.count(collection_name)
             assert n == 1
 
     async def test_doc_update_and_delete(self, pg_url, collection_name):
         from goldlapel.asyncio import start
         async with start(pg_url, port=7842) as gl:
-            await gl.doc_create_collection(collection_name, unlogged=True)
-            await gl.doc_insert(collection_name, {"k": "a", "n": 1})
-            await gl.doc_insert(collection_name, {"k": "b", "n": 2})
-            updated = await gl.doc_update(
+            await gl.documents.create_collection(collection_name, unlogged=True)
+            await gl.documents.insert(collection_name, {"k": "a", "n": 1})
+            await gl.documents.insert(collection_name, {"k": "b", "n": 2})
+            updated = await gl.documents.update(
                 collection_name, {"k": "a"}, {"$set": {"n": 42}},
             )
             assert updated == 1
-            one = await gl.doc_find_one(collection_name, {"k": "a"})
+            one = await gl.documents.find_one(collection_name, {"k": "a"})
             assert one["data"]["n"] == 42
 
-            deleted = await gl.doc_delete(collection_name, {"k": "b"})
+            deleted = await gl.documents.delete(collection_name, {"k": "b"})
             assert deleted == 1
-            n = await gl.doc_count(collection_name)
+            n = await gl.documents.count(collection_name)
             assert n == 1
 
     async def test_search_native_async(self, pg_url, search_table):
@@ -142,7 +142,7 @@ class TestNativeAsyncpgPath:
         from goldlapel.asyncio import start
         async with start(pg_url, port=7844) as gl:
             # Pre-create the collection using the internal conn.
-            await gl.doc_create_collection(collection_name, unlogged=True)
+            await gl.documents.create_collection(collection_name, unlogged=True)
 
             # Open a user-owned asyncpg connection to the proxy URL and open
             # a tx on it; all inserts inside the `using` block go through it.
@@ -158,14 +158,14 @@ class TestNativeAsyncpgPath:
             try:
                 async with user_conn.transaction():
                     async with gl.using(user_conn):
-                        await gl.doc_insert(
+                        await gl.documents.insert(
                             collection_name, {"who": "user-tx", "n": 1},
                         )
-                        await gl.doc_insert(
+                        await gl.documents.insert(
                             collection_name, {"who": "user-tx", "n": 2},
                         )
                 # After commit, the rows are visible via the internal conn.
-                found = await gl.doc_find(collection_name, {"who": "user-tx"})
+                found = await gl.documents.find(collection_name, {"who": "user-tx"})
                 assert len(found) == 2
             finally:
                 await user_conn.close()
@@ -174,7 +174,7 @@ class TestNativeAsyncpgPath:
         """If the user-supplied transaction rolls back, writes must be gone."""
         from goldlapel.asyncio import start
         async with start(pg_url, port=7845) as gl:
-            await gl.doc_create_collection(collection_name, unlogged=True)
+            await gl.documents.create_collection(collection_name, unlogged=True)
 
             # Match the internal conn's settings: disable statement cache to
             # avoid the Gold Lapel proxy's CloseComplete-framing interaction
@@ -188,13 +188,13 @@ class TestNativeAsyncpgPath:
                 with pytest.raises(_Boom):
                     async with user_conn.transaction():
                         async with gl.using(user_conn):
-                            await gl.doc_insert(
+                            await gl.documents.insert(
                                 collection_name,
                                 {"who": "rollback", "n": 1},
                             )
                         raise _Boom("force rollback")
                 # Row should not be visible — tx rolled back.
-                count = await gl.doc_count(
+                count = await gl.documents.count(
                     collection_name, {"who": "rollback"},
                 )
                 assert count == 0
@@ -206,7 +206,7 @@ class TestNativeAsyncpgPath:
     ):
         from goldlapel.asyncio import start
         async with start(pg_url, port=7846) as gl:
-            await gl.doc_create_collection(collection_name, unlogged=True)
+            await gl.documents.create_collection(collection_name, unlogged=True)
             # Match the internal conn's settings: disable statement cache to
             # avoid the Gold Lapel proxy's CloseComplete-framing interaction
             # with persistent prepared statements.
@@ -214,12 +214,12 @@ class TestNativeAsyncpgPath:
             from goldlapel.asyncio._utils import _register_jsonb_codec
             await _register_jsonb_codec(user_conn)
             try:
-                await gl.doc_insert(
+                await gl.documents.insert(
                     collection_name, {"k": "kwarg"}, conn=user_conn,
                 )
                 # Visible via the internal conn too (auto-commit on asyncpg
                 # outside a transaction).
-                found = await gl.doc_find_one(collection_name, {"k": "kwarg"})
+                found = await gl.documents.find_one(collection_name, {"k": "kwarg"})
                 assert found is not None
             finally:
                 await user_conn.close()
@@ -258,17 +258,17 @@ class TestSyncAsyncParity:
 
         # Sync path: insert + find
         with goldlapel.start(pg_url, port=7852) as sync_gl:
-            sync_gl.doc_create_collection(collection_name, unlogged=True)
-            sync_gl.doc_insert(collection_name, {"tag": "a", "n": 1})
-            sync_gl.doc_insert(collection_name, {"tag": "a", "n": 2})
-            sync_gl.doc_insert(collection_name, {"tag": "b", "n": 3})
-            sync_results = sync_gl.doc_find(
+            sync_gl.documents.create_collection(collection_name, unlogged=True)
+            sync_gl.documents.insert(collection_name, {"tag": "a", "n": 1})
+            sync_gl.documents.insert(collection_name, {"tag": "a", "n": 2})
+            sync_gl.documents.insert(collection_name, {"tag": "b", "n": 3})
+            sync_results = sync_gl.documents.find(
                 collection_name, {"tag": "a"}, sort={"n": 1},
             )
 
         # Async path on the same table
         async with start(pg_url, port=7853) as async_gl:
-            async_results = await async_gl.doc_find(
+            async_results = await async_gl.documents.find(
                 collection_name, {"tag": "a"}, sort={"n": 1},
             )
 

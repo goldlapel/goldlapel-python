@@ -118,6 +118,11 @@ def test_supported_version_stream_is_v1():
     assert ddl.supported_version("stream") == "v1"
 
 
+def test_supported_version_doc_store_is_v1():
+    # Phase 4: doc-store family at canonical schema v1.
+    assert ddl.supported_version("doc_store") == "v1"
+
+
 # ----------------------------------------------------------------------------
 # fetch — HTTP round-trip
 # ----------------------------------------------------------------------------
@@ -256,6 +261,72 @@ class TestToPsycopg:
     def test_substitutes_dollar_placeholders(self):
         sql = "INSERT INTO x (a,b) VALUES ($1,$2) RETURNING $3"
         assert ddl.to_psycopg(sql) == "INSERT INTO x (a,b) VALUES (%s,%s) RETURNING %s"
+
+
+# ----------------------------------------------------------------------------
+# doc_store family — same wire shape, different family slug + options.
+# ----------------------------------------------------------------------------
+
+class TestFetchDocStore:
+    def test_doc_store_create_endpoint_path(self, fake_server):
+        _FakeHandler.responses = [(
+            200,
+            {
+                "accepted": True,
+                "family": "doc_store",
+                "schema_version": "v1",
+                "tables": {"main": "_goldlapel.doc_users"},
+                "query_patterns": {"insert": "INSERT INTO _goldlapel.doc_users ..."},
+            },
+        )]
+        owner = FakeOwner()
+        result = ddl.fetch_patterns(owner, "doc_store", "users", fake_server.port, "tok")
+        assert result["tables"]["main"] == "_goldlapel.doc_users"
+
+        path, headers, body = _FakeHandler.captured[0]
+        assert path == "/api/ddl/doc_store/create"
+        assert body == {"name": "users", "schema_version": "v1"}
+
+    def test_unlogged_option_is_passed_through(self, fake_server):
+        _FakeHandler.responses = [(
+            200,
+            {
+                "tables": {"main": "_goldlapel.doc_sessions"},
+                "query_patterns": {},
+            },
+        )]
+        owner = FakeOwner()
+        ddl.fetch_patterns(
+            owner, "doc_store", "sessions", fake_server.port, "tok",
+            options={"unlogged": True},
+        )
+        path, headers, body = _FakeHandler.captured[0]
+        assert body["options"] == {"unlogged": True}
+
+    def test_no_options_omits_options_field(self, fake_server):
+        _FakeHandler.responses = [(
+            200,
+            {"tables": {"main": "_goldlapel.doc_users"}, "query_patterns": {}},
+        )]
+        owner = FakeOwner()
+        ddl.fetch_patterns(owner, "doc_store", "users", fake_server.port, "tok")
+        path, headers, body = _FakeHandler.captured[0]
+        assert "options" not in body, "absent options should not be sent"
+
+    def test_doc_store_cache_isolated_from_stream(self, fake_server):
+        # Same name across two families — distinct cache entries.
+        for _ in range(2):
+            _FakeHandler.responses.append((
+                200,
+                {"tables": {"main": "_goldlapel.x"}, "query_patterns": {}},
+            ))
+        owner = FakeOwner()
+        ddl.fetch_patterns(owner, "stream", "events", fake_server.port, "tok")
+        ddl.fetch_patterns(owner, "doc_store", "events", fake_server.port, "tok")
+        # Both calls hit the wire — they're not the same cache key.
+        assert len(_FakeHandler.captured) == 2
+        assert _FakeHandler.captured[0][0] == "/api/ddl/stream/create"
+        assert _FakeHandler.captured[1][0] == "/api/ddl/doc_store/create"
 
     def test_leaves_literal_dollar_untouched(self):
         # No digit after $ → not a placeholder; leave alone.

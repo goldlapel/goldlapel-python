@@ -2,7 +2,7 @@
 
 Exercises the full flow:
 - Spawn a real proxy + real Postgres.
-- Call `gl.stream_add(...)` — verify table is at `_goldlapel.stream_<name>`.
+- Call `gl.streams.add(...)` — verify table is at `_goldlapel.stream_<name>`.
 - Verify `_goldlapel.schema_meta` contains a row for the stream.
 - Verify repeated calls do NOT re-issue DDL (HTTP round-trip count stays at 1
   per (family, name) per session).
@@ -61,7 +61,7 @@ def _direct_conn(pg_url):
 
 class TestStreamDdlOwnership:
     def test_stream_add_creates_prefixed_table(self, gl, pg_url, stream_name):
-        gl.stream_add(stream_name, {"type": "click"})
+        gl.streams.add(stream_name, {"type": "click"})
 
         # The canonical table should be _goldlapel.stream_<name>.
         conn = _direct_conn(pg_url)
@@ -89,7 +89,7 @@ class TestStreamDdlOwnership:
             conn.close()
 
     def test_schema_meta_row_recorded(self, gl, pg_url, stream_name):
-        gl.stream_add(stream_name, {"type": "click"})
+        gl.streams.add(stream_name, {"type": "click"})
 
         conn = _direct_conn(pg_url)
         try:
@@ -125,9 +125,9 @@ class TestStreamDdlOwnership:
         # HTTP round-trip didn't repeat by checking the captured request count…
         # Actually, the cache is inside fetch(), so fetch still runs — we measure
         # by counting the *distinct* results it returns (should be identical).
-        gl.stream_add(stream_name, {"i": 1})
-        gl.stream_add(stream_name, {"i": 2})
-        gl.stream_add(stream_name, {"i": 3})
+        gl.streams.add(stream_name, {"i": 1})
+        gl.streams.add(stream_name, {"i": 2})
+        gl.streams.add(stream_name, {"i": 3})
 
         assert counter["n"] == 3, (
             "fetch should be called once per stream_add invocation (but returns cached)"
@@ -150,10 +150,10 @@ class TestStreamDdlOwnership:
 
         monkeypatch.setattr(_ddl, "_post", counting_post)
 
-        gl.stream_add(stream_name, {"i": 1})
+        gl.streams.add(stream_name, {"i": 1})
         assert counter["n"] == 1, "first call should post once"
-        gl.stream_add(stream_name, {"i": 2})
-        gl.stream_add(stream_name, {"i": 3})
+        gl.streams.add(stream_name, {"i": 2})
+        gl.streams.add(stream_name, {"i": 3})
         assert counter["n"] == 1, (
             "subsequent calls must use the cached patterns — no extra POST"
         )
@@ -161,13 +161,13 @@ class TestStreamDdlOwnership:
 
 class TestStreamRoundTrip:
     def test_add_and_read_round_trip(self, gl, stream_name):
-        gl.stream_create_group(stream_name, "workers")
-        msg_id_1 = gl.stream_add(stream_name, {"i": 1})
-        msg_id_2 = gl.stream_add(stream_name, {"i": 2})
+        gl.streams.create_group(stream_name, "workers")
+        msg_id_1 = gl.streams.add(stream_name, {"i": 1})
+        msg_id_2 = gl.streams.add(stream_name, {"i": 2})
         assert isinstance(msg_id_1, int) and msg_id_1 > 0
         assert msg_id_2 > msg_id_1
 
-        messages = gl.stream_read(stream_name, "workers", "consumer-1", count=10)
+        messages = gl.streams.read(stream_name, "workers", "consumer-1", count=10)
         assert len(messages) == 2
         assert messages[0]["payload"] == {"i": 1}
         assert messages[1]["payload"] == {"i": 2}
@@ -175,24 +175,24 @@ class TestStreamRoundTrip:
         assert messages[1]["id"] == msg_id_2
 
     def test_ack_removes_pending(self, gl, stream_name):
-        gl.stream_create_group(stream_name, "workers")
-        msg_id = gl.stream_add(stream_name, {"i": 1})
-        messages = gl.stream_read(stream_name, "workers", "c", count=10)
+        gl.streams.create_group(stream_name, "workers")
+        msg_id = gl.streams.add(stream_name, {"i": 1})
+        messages = gl.streams.read(stream_name, "workers", "c", count=10)
         assert len(messages) == 1
 
-        ok = gl.stream_ack(stream_name, "workers", msg_id)
+        ok = gl.streams.ack(stream_name, "workers", msg_id)
         assert ok is True
         # Second ack is a no-op — already removed.
-        ok2 = gl.stream_ack(stream_name, "workers", msg_id)
+        ok2 = gl.streams.ack(stream_name, "workers", msg_id)
         assert ok2 is False
 
     def test_claim_reassigns_idle_pending(self, gl, stream_name):
-        gl.stream_create_group(stream_name, "workers")
-        gl.stream_add(stream_name, {"i": 1})
+        gl.streams.create_group(stream_name, "workers")
+        gl.streams.add(stream_name, {"i": 1})
         # Consume as consumer-A.
-        gl.stream_read(stream_name, "workers", "consumer-a", count=10)
+        gl.streams.read(stream_name, "workers", "consumer-a", count=10)
         # Claim with min_idle_ms=0 — should sweep in the pending row.
-        claimed = gl.stream_claim(stream_name, "workers", "consumer-b", min_idle_ms=0)
+        claimed = gl.streams.claim(stream_name, "workers", "consumer-b", min_idle_ms=0)
         assert len(claimed) == 1
         assert claimed[0]["payload"] == {"i": 1}
 
@@ -206,10 +206,10 @@ class TestAsyncStream:
         async with start(pg_url, port=port) as gl:
             assert gl.running
             name = f"gl_async_stream_{int(time.time() * 1000)}"
-            await gl.stream_create_group(name, "workers")
-            await gl.stream_add(name, {"i": 1})
-            await gl.stream_add(name, {"i": 2})
-            messages = await gl.stream_read(name, "workers", "c", count=10)
+            await gl.streams.create_group(name, "workers")
+            await gl.streams.add(name, {"i": 1})
+            await gl.streams.add(name, {"i": 2})
+            messages = await gl.streams.read(name, "workers", "c", count=10)
             assert len(messages) == 2
             assert messages[0]["payload"] == {"i": 1}
-            await gl.stream_ack(name, "workers", messages[0]["id"])
+            await gl.streams.ack(name, "workers", messages[0]["id"])

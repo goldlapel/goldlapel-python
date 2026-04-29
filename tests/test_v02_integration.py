@@ -61,35 +61,35 @@ class TestFactoryEndToEnd:
         conn.close()
 
     def test_wrapper_methods(self, gl, collection_name):
-        gl.doc_create_collection(collection_name, unlogged=True)
-        gl.doc_insert(collection_name, {"hello": "world", "n": 1})
-        hit = gl.doc_find_one(collection_name, {"hello": "world"})
+        gl.documents.create_collection(collection_name, unlogged=True)
+        gl.documents.insert(collection_name, {"hello": "world", "n": 1})
+        hit = gl.documents.find_one(collection_name, {"hello": "world"})
         assert hit is not None
         assert hit["data"]["hello"] == "world"
-        assert gl.doc_count(collection_name) == 1
+        assert gl.documents.count(collection_name) == 1
 
     def test_using_scope_with_user_conn(self, gl, collection_name):
         import psycopg2
-        gl.doc_create_collection(collection_name, unlogged=True)
+        gl.documents.create_collection(collection_name, unlogged=True)
 
         conn = psycopg2.connect(gl.url)
         with gl.using(conn):
-            gl.doc_insert(collection_name, {"from": "using-scope"})
+            gl.documents.insert(collection_name, {"from": "using-scope"})
         conn.close()
 
-        hit = gl.doc_find_one(collection_name, {"from": "using-scope"})
+        hit = gl.documents.find_one(collection_name, {"from": "using-scope"})
         assert hit is not None
         assert hit["data"]["from"] == "using-scope"
 
     def test_conn_kwarg_on_method(self, gl, collection_name):
         import psycopg2
-        gl.doc_create_collection(collection_name, unlogged=True)
+        gl.documents.create_collection(collection_name, unlogged=True)
 
         conn = psycopg2.connect(gl.url)
-        gl.doc_insert(collection_name, {"from": "kwarg"}, conn=conn)
+        gl.documents.insert(collection_name, {"from": "kwarg"}, conn=conn)
         conn.close()
 
-        hit = gl.doc_find_one(collection_name, {"from": "kwarg"})
+        hit = gl.documents.find_one(collection_name, {"from": "kwarg"})
         assert hit is not None
 
 
@@ -108,9 +108,9 @@ class TestAsyncEndToEnd:
         gl = await start(pg_url, port=7948)
         assert gl.running
         coll = f"gl_v02_smoke_async_{int(time.time() * 1000)}"
-        await gl.doc_create_collection(coll, unlogged=True)
-        await gl.doc_insert(coll, {"async": True})
-        hit = await gl.doc_find_one(coll, {"async": True})
+        await gl.documents.create_collection(coll, unlogged=True)
+        await gl.documents.insert(coll, {"async": True})
+        hit = await gl.documents.find_one(coll, {"async": True})
         assert hit is not None
         await gl.stop()
 
@@ -119,5 +119,5 @@ class TestAsyncEndToEnd:
         async with start(pg_url, port=7947) as gl:
             assert gl.running
             coll = f"gl_v02_smoke_async_ctx_{int(time.time() * 1000)}"
-            await gl.doc_create_collection(coll, unlogged=True)
+            await gl.documents.create_collection(coll, unlogged=True)
         assert not gl.running

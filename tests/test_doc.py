@@ -1,8 +1,19 @@
+"""Mock-style unit tests for the goldlapel.utils.doc_* functions.
+
+The doc_* utils are now driven by proxy-supplied query patterns (Phase 4 of
+schema-to-core). Each test wraps the legacy `doc_<verb>(conn, "users", ...)`
+call with a `patterns=` kwarg whose `tables.main` happens to be `"users"` —
+this keeps the existing SQL-shape assertions valid while exercising the new
+contract. Real callers go through `gl.documents.<verb>(...)` which fetches
+patterns from the proxy with `_goldlapel.doc_<name>` as the canonical table.
+"""
+
 from unittest.mock import MagicMock, call
 import json
 
 import pytest
 
+from goldlapel import utils
 from goldlapel.utils import (
     doc_insert,
     doc_insert_many,
@@ -36,6 +47,60 @@ from goldlapel.utils import (
 )
 
 
+def _patterns(name):
+    """Build a fake patterns dict keyed off the user collection name.
+
+    For the mock unit tests we use the bare name as the table — the proxy
+    would actually return `_goldlapel.doc_<name>` but the wrapper code is
+    table-name-agnostic, so this preserves the existing SQL-shape assertions
+    (which were written against the legacy `CREATE TABLE <name>` flow).
+    """
+    return {
+        "tables": {"main": name},
+        "query_patterns": {
+            "insert": f"INSERT INTO {name} (data) VALUES ($1::jsonb) RETURNING _id, data, created_at",
+        },
+    }
+
+
+# Wrap every doc_* function with `patterns=_patterns(name)` automatically.
+# This mirrors how `gl.documents.<verb>` would call them in production.
+def _wrap(fn):
+    def wrapped(conn, collection, *args, **kwargs):
+        kwargs.setdefault("patterns", _patterns(collection))
+        return fn(conn, collection, *args, **kwargs)
+    wrapped.__name__ = fn.__name__
+    wrapped.__wrapped__ = fn
+    return wrapped
+
+
+# Override module-level imports with the auto-patterns wrappers so existing
+# tests keep using `doc_insert(conn, "users", ...)` without each call site
+# threading the `patterns=` kwarg.
+doc_insert = _wrap(doc_insert)
+doc_insert_many = _wrap(doc_insert_many)
+doc_find = _wrap(doc_find)
+doc_find_one = _wrap(doc_find_one)
+doc_update = _wrap(doc_update)
+doc_update_one = _wrap(doc_update_one)
+doc_delete = _wrap(doc_delete)
+doc_delete_one = _wrap(doc_delete_one)
+doc_count = _wrap(doc_count)
+doc_create_index = _wrap(doc_create_index)
+doc_aggregate = _wrap(doc_aggregate)
+doc_watch = _wrap(doc_watch)
+doc_unwatch = _wrap(doc_unwatch)
+doc_create_ttl_index = _wrap(doc_create_ttl_index)
+doc_remove_ttl_index = _wrap(doc_remove_ttl_index)
+doc_create_capped = _wrap(doc_create_capped)
+doc_remove_cap = _wrap(doc_remove_cap)
+doc_find_one_and_update = _wrap(doc_find_one_and_update)
+doc_find_one_and_delete = _wrap(doc_find_one_and_delete)
+doc_distinct = _wrap(doc_distinct)
+doc_find_cursor = _wrap(doc_find_cursor)
+doc_create_collection = _wrap(doc_create_collection)
+
+
 class FakeConn:
     def __init__(self, cursor):
         self._cursor = cursor
@@ -60,36 +125,41 @@ def capture_sql(fetchall_result=None, fetchone_result=None, description=None, ro
 # ---------------------------------------------------------------------------
 
 class TestDocCreateCollection:
-    def test_creates_logged_table_by_default(self):
+    """doc_create_collection is now a no-op on the wrapper side — DDL is
+    executed by the proxy via /api/ddl/doc_store/create when the
+    DocumentsAPI._patterns helper fires. The util just validates the
+    identifier."""
+
+    def test_no_ddl_emitted_on_wrapper_side(self):
         conn, cur = capture_sql()
         doc_create_collection(conn, "users")
-        sql = cur.execute.call_args_list[0][0][0]
-        assert "CREATE TABLE IF NOT EXISTS users" in sql
-        assert "UNLOGGED" not in sql
+        # Proxy owns DDL — wrapper does not run any SQL itself.
+        assert cur.execute.call_count == 0
 
-    def test_creates_unlogged_table(self):
+    def test_unlogged_kwarg_does_not_emit_ddl(self):
+        # The unlogged flag flows through the DDL API options on the proxy
+        # side (see DocumentsAPI._patterns); the wrapper doesn't run DDL.
         conn, cur = capture_sql()
         doc_create_collection(conn, "sessions", unlogged=True)
-        sql = cur.execute.call_args_list[0][0][0]
-        assert "CREATE UNLOGGED TABLE IF NOT EXISTS sessions" in sql
+        assert cur.execute.call_count == 0
 
-    def test_unlogged_table_has_correct_schema(self):
-        conn, cur = capture_sql()
-        doc_create_collection(conn, "cache", unlogged=True)
-        sql = cur.execute.call_args_list[0][0][0]
-        assert "_id UUID PRIMARY KEY" in sql
-        assert "data JSONB NOT NULL" in sql
-        assert "created_at TIMESTAMPTZ" in sql
-
-    def test_commits_after_creation(self):
+    def test_no_commit_when_no_ddl(self):
+        # No DDL → no commit on the wrapper-side connection.
         conn, cur = capture_sql()
         doc_create_collection(conn, "test_col")
-        conn.commit.assert_called_once()
+        conn.commit.assert_not_called()
 
     def test_rejects_invalid_identifier(self):
         conn, cur = capture_sql()
         with pytest.raises(ValueError):
             doc_create_collection(conn, "Robert'; DROP TABLE")
+
+    def test_raises_when_patterns_missing(self):
+        # The wrapped helper at the top of this file always supplies patterns.
+        # Direct util calls without patterns should fail loud.
+        conn, cur = capture_sql()
+        with pytest.raises(RuntimeError, match="requires DDL patterns"):
+            utils.doc_create_collection(conn, "users")
 
 
 # ---------------------------------------------------------------------------
@@ -97,14 +167,16 @@ class TestDocCreateCollection:
 # ---------------------------------------------------------------------------
 
 class TestDocInsert:
-    def test_creates_table(self):
+    def test_no_create_table_emitted(self):
+        # Proxy owns CREATE TABLE — wrapper just runs the INSERT now.
         conn, cur = capture_sql(
             fetchone_result=("abc-uuid", {"name": "alice"}, "2026-01-01"),
         )
         doc_insert(conn, "users", {"name": "alice"})
         calls = [c[0][0] for c in cur.execute.call_args_list]
-        assert any("CREATE TABLE IF NOT EXISTS users" in c for c in calls)
-        assert any("_id UUID PRIMARY KEY" in c for c in calls)
+        assert not any("CREATE TABLE" in c for c in calls), (
+            "wrapper must not emit DDL — proxy owns it"
+        )
 
     def test_inserts_and_returns_dict(self):
         conn, cur = capture_sql(
@@ -138,13 +210,16 @@ class TestDocInsert:
 # ---------------------------------------------------------------------------
 
 class TestDocInsertMany:
-    def test_creates_table(self):
+    def test_no_create_table_emitted(self):
+        # Proxy owns CREATE TABLE — wrapper just runs the bulk INSERT now.
         conn, cur = capture_sql(
             fetchall_result=[("id1", {"a": 1}, "ts"), ("id2", {"b": 2}, "ts")],
         )
         doc_insert_many(conn, "items", [{"a": 1}, {"b": 2}])
         calls = [c[0][0] for c in cur.execute.call_args_list]
-        assert any("CREATE TABLE IF NOT EXISTS items" in c for c in calls)
+        assert not any("CREATE TABLE" in c for c in calls), (
+            "wrapper must not emit DDL — proxy owns it"
+        )
 
     def test_batch_insert_and_returns_list(self):
         conn, cur = capture_sql(
@@ -1157,11 +1232,13 @@ class TestDocCapped:
             "DROP TRIGGER IF EXISTS _gl_cap_logs_trigger" in c for c in calls
         )
 
-    def test_capped_ensures_collection(self):
+    def test_capped_does_not_create_collection_table(self):
+        # The collection table is materialized by the proxy via the DDL API.
+        # doc_create_capped only adds the cap trigger + supporting index.
         conn, cur = capture_sql()
         doc_create_capped(conn, "logs", 500)
         calls = [c[0][0] for c in cur.execute.call_args_list]
-        assert any("CREATE TABLE IF NOT EXISTS logs" in c for c in calls)
+        assert not any("CREATE TABLE" in c for c in calls)
 
     def test_capped_validates_max_documents(self):
         conn, _ = capture_sql()

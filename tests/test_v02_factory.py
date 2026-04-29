@@ -129,11 +129,17 @@ class TestConnKwargOnMethods:
             assert call_conn is gl._conn
 
     def test_doc_insert_uses_kwarg_conn(self):
+        # gl.documents.insert replaces gl.doc_insert. The DocumentsAPI calls
+        # _patterns first to fetch DDL — mock that out so we don't need a
+        # dashboard.
         gl = GoldLapel("postgresql://host/db")
         gl._conn = MagicMock(name="internal_conn")
         override = MagicMock(name="override_conn")
-        with patch("goldlapel.utils.doc_insert") as mock_fn:
-            gl.doc_insert("events", {"type": "x"}, conn=override)
+        fake_patterns = {"tables": {"main": "events"}, "query_patterns": {}}
+        with patch("goldlapel.ddl.fetch_patterns", return_value=fake_patterns), \
+             patch("goldlapel.utils.doc_insert") as mock_fn:
+            gl._dashboard_token = "test-token"
+            gl.documents.insert("events", {"type": "x"}, conn=override)
             call_conn = mock_fn.call_args[0][0]
             assert call_conn is override
 
@@ -152,8 +158,11 @@ class TestConnKwargOnMethods:
         gl._conn = MagicMock(name="internal_conn")
         scoped = MagicMock(name="scoped_conn")
         override = MagicMock(name="override_conn")
-        with patch("goldlapel.utils.doc_update") as mock_fn:
+        fake_patterns = {"tables": {"main": "users"}, "query_patterns": {}}
+        with patch("goldlapel.ddl.fetch_patterns", return_value=fake_patterns), \
+             patch("goldlapel.utils.doc_update") as mock_fn:
+            gl._dashboard_token = "test-token"
             with gl.using(scoped):
-                gl.doc_update("users", {"id": 1}, {"$set": {"name": "s"}}, conn=override)
+                gl.documents.update("users", {"id": 1}, {"$set": {"name": "s"}}, conn=override)
             call_conn = mock_fn.call_args[0][0]
             assert call_conn is override

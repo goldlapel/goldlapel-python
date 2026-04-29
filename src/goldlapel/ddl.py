@@ -27,6 +27,7 @@ from pathlib import Path
 
 _SUPPORTED_VERSIONS = {
     "stream": "v1",
+    "doc_store": "v1",
 }
 
 # Per-instance cache keyed on `id(owner)`: {owner_id: {(family, name): patterns}}.
@@ -124,11 +125,16 @@ def _post(url, token, body, timeout=10.0):
     return status, parsed
 
 
-def fetch_patterns(owner, family, name, dashboard_port, dashboard_token):
+def fetch_patterns(owner, family, name, dashboard_port, dashboard_token, options=None):
     """Fetch (and cache) the canonical {tables, query_patterns} for a helper.
 
     Per-session cache: one HTTP call on the first call for a given (family, name);
     cached result for every subsequent call in the same session.
+
+    `options` is a dict of per-family creation options (e.g. doc_store accepts
+    `{"unlogged": True}`). Only used on the create call — once the table exists,
+    its shape is fixed and subsequent options are silently ignored on the
+    proxy side (idempotent CREATE TABLE IF NOT EXISTS).
     """
     cache = _cache_for(owner)
     key = (family, name)
@@ -148,6 +154,8 @@ def fetch_patterns(owner, family, name, dashboard_port, dashboard_token):
 
     url = f"http://127.0.0.1:{dashboard_port}/api/ddl/{family}/create"
     body = {"name": name, "schema_version": supported_version(family)}
+    if options:
+        body["options"] = options
     status, resp = _post(url, dashboard_token, body)
     if status != 200:
         error = resp.get("error", "unknown") if isinstance(resp, dict) else "unknown"
