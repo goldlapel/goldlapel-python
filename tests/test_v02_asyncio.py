@@ -376,6 +376,8 @@ class TestAsyncMethodDelegation:
 
     @pytest.mark.asyncio
     async def test_method_passes_explicit_conn_kwarg(self):
+        # Wraps a non-doc auto-derived method (search) since doc_* methods
+        # are nested under gl.documents and need a DDL-pattern fetch.
         inst = AsyncGoldLapel.__new__(AsyncGoldLapel)
         inst._sync = MagicMock()
         inst._sync._using_conn.get.return_value = None
@@ -383,13 +385,13 @@ class TestAsyncMethodDelegation:
         override = MagicMock(name="explicit")
 
         with patch(
-            "goldlapel.asyncio._utils.doc_insert",
-            new=AsyncMock(return_value={"id": 1}),
-        ) as mock_insert:
-            result = await inst.doc_insert("events", {"type": "x"}, conn=override)
-            assert result == {"id": 1}
-            mock_insert.assert_awaited_once_with(
-                override, "events", {"type": "x"},
+            "goldlapel.asyncio._utils.search",
+            new=AsyncMock(return_value=[{"id": 1}]),
+        ) as mock_search:
+            result = await inst.search("articles", "body", "query", conn=override)
+            assert result == [{"id": 1}]
+            mock_search.assert_awaited_once_with(
+                override, "articles", "body", "query",
             )
 
 

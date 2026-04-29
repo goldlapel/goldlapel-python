@@ -65,6 +65,35 @@ def _drop(conn, *collections):
     conn.commit()
 
 
+def _patterns(name):
+    """Build a fake patterns dict for direct-util integration tests.
+
+    These tests hit Postgres directly (no proxy). They use the bare collection
+    name as both the table reference and the table name they ensure-create
+    before each test. Production callers go through `gl.documents.<verb>`
+    which fetches patterns from the proxy with `_goldlapel.doc_<name>` as
+    the canonical table.
+    """
+    return {
+        "tables": {"main": name},
+        "query_patterns": {},
+    }
+
+
+def _ensure_table(conn, name):
+    """Pre-create the doc-store table directly against Postgres. Mirrors the
+    canonical v1 schema the proxy would produce."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"CREATE TABLE IF NOT EXISTS {name} ("
+            "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
+            "data JSONB NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+        )
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # 1. $inc via doc_update_one — CTE + jsonb_set + COALESCE semantics
 #    Mock test: TestFieldUpdateOperators::test_inc_in_doc_update_one
@@ -77,14 +106,15 @@ def _drop(conn, *collections):
 def test_inc_update_one_applies_to_matched_row(conn, collection_name):
     from goldlapel.utils import doc_insert, doc_update_one, doc_find_one
     try:
-        doc_insert(conn, collection_name, {"name": "alice", "score": 10})
-        doc_insert(conn, collection_name, {"name": "bob", "score": 10})
+        _ensure_table(conn, collection_name)
+        doc_insert(conn, collection_name, {"name": "alice", "score": 10}, patterns=_patterns(collection_name))
+        doc_insert(conn, collection_name, {"name": "bob", "score": 10}, patterns=_patterns(collection_name))
 
-        matched = doc_update_one(conn, collection_name, {"name": "alice"}, {"$inc": {"score": 5}})
+        matched = doc_update_one(conn, collection_name, {"name": "alice"}, {"$inc": {"score": 5}}, patterns=_patterns(collection_name))
         assert matched == 1
 
-        alice = doc_find_one(conn, collection_name, {"name": "alice"})
-        bob = doc_find_one(conn, collection_name, {"name": "bob"})
+        alice = doc_find_one(conn, collection_name, {"name": "alice"}, patterns=_patterns(collection_name))
+        bob = doc_find_one(conn, collection_name, {"name": "bob"}, patterns=_patterns(collection_name))
         assert alice["data"]["score"] == 15
         assert bob["data"]["score"] == 10, "inc must not leak to sibling rows"
     finally:
@@ -94,11 +124,12 @@ def test_inc_update_one_applies_to_matched_row(conn, collection_name):
 def test_inc_update_one_creates_missing_field_from_zero(conn, collection_name):
     from goldlapel.utils import doc_insert, doc_update_one, doc_find_one
     try:
+        _ensure_table(conn, collection_name)
         # Insert a row with no "counter" field at all; $inc should COALESCE-default
         # it to 0 and then add 3 — i.e. land at 3, not NULL or an error.
-        doc_insert(conn, collection_name, {"name": "alice"})
-        doc_update_one(conn, collection_name, {"name": "alice"}, {"$inc": {"counter": 3}})
-        alice = doc_find_one(conn, collection_name, {"name": "alice"})
+        doc_insert(conn, collection_name, {"name": "alice"}, patterns=_patterns(collection_name))
+        doc_update_one(conn, collection_name, {"name": "alice"}, {"$inc": {"counter": 3}}, patterns=_patterns(collection_name))
+        alice = doc_find_one(conn, collection_name, {"name": "alice"}, patterns=_patterns(collection_name))
         assert alice["data"]["counter"] == 3
     finally:
         _drop(conn, collection_name)
@@ -118,15 +149,16 @@ def test_inc_update_one_creates_missing_field_from_zero(conn, collection_name):
 def test_push_appends_to_existing_array_and_creates_when_missing(conn, collection_name):
     from goldlapel.utils import doc_insert, doc_update, doc_find_one
     try:
+        _ensure_table(conn, collection_name)
         # Row 1: tags already exists — push should append.
-        doc_insert(conn, collection_name, {"name": "alice", "tags": ["python"]})
+        doc_insert(conn, collection_name, {"name": "alice", "tags": ["python"]}, patterns=_patterns(collection_name))
         # Row 2: tags missing — push should create the array.
-        doc_insert(conn, collection_name, {"name": "bob"})
+        doc_insert(conn, collection_name, {"name": "bob"}, patterns=_patterns(collection_name))
 
-        doc_update(conn, collection_name, {}, {"$push": {"tags": "rust"}})
+        doc_update(conn, collection_name, {}, {"$push": {"tags": "rust"}}, patterns=_patterns(collection_name))
 
-        alice = doc_find_one(conn, collection_name, {"name": "alice"})
-        bob = doc_find_one(conn, collection_name, {"name": "bob"})
+        alice = doc_find_one(conn, collection_name, {"name": "alice"}, patterns=_patterns(collection_name))
+        bob = doc_find_one(conn, collection_name, {"name": "bob"}, patterns=_patterns(collection_name))
         assert alice["data"]["tags"] == ["python", "rust"]
         assert bob["data"]["tags"] == ["rust"]
     finally:
@@ -144,18 +176,17 @@ def test_push_appends_to_existing_array_and_creates_when_missing(conn, collectio
 def test_unset_nested_removes_deep_key_only(conn, collection_name):
     from goldlapel.utils import doc_insert, doc_update_one, doc_find_one
     try:
+        _ensure_table(conn, collection_name)
         doc_insert(
             conn,
             collection_name,
-            {"name": "alice", "profile": {"city": "NYC", "zip": "10001"}},
-        )
+            {"name": "alice", "profile": {"city": "NYC", "zip": "10001"}}, patterns=_patterns(collection_name))
         doc_update_one(
             conn,
             collection_name,
             {"name": "alice"},
-            {"$unset": {"profile.zip": ""}},
-        )
-        alice = doc_find_one(conn, collection_name, {"name": "alice"})
+            {"$unset": {"profile.zip": ""}}, patterns=_patterns(collection_name))
+        alice = doc_find_one(conn, collection_name, {"name": "alice"}, patterns=_patterns(collection_name))
         assert alice["data"]["profile"] == {"city": "NYC"}
         assert "zip" not in alice["data"]["profile"]
     finally:
@@ -175,16 +206,16 @@ def test_unset_nested_removes_deep_key_only(conn, collection_name):
 def test_find_in_matches_listed_values_only(conn, collection_name):
     from goldlapel.utils import doc_insert, doc_find
     try:
-        doc_insert(conn, collection_name, {"name": "alice", "status": "active"})
-        doc_insert(conn, collection_name, {"name": "bob", "status": "pending"})
-        doc_insert(conn, collection_name, {"name": "carol", "status": "suspended"})
-        doc_insert(conn, collection_name, {"name": "dave"})  # no status field
+        _ensure_table(conn, collection_name)
+        doc_insert(conn, collection_name, {"name": "alice", "status": "active"}, patterns=_patterns(collection_name))
+        doc_insert(conn, collection_name, {"name": "bob", "status": "pending"}, patterns=_patterns(collection_name))
+        doc_insert(conn, collection_name, {"name": "carol", "status": "suspended"}, patterns=_patterns(collection_name))
+        doc_insert(conn, collection_name, {"name": "dave"}, patterns=_patterns(collection_name))  # no status field
 
         results = doc_find(
             conn,
             collection_name,
-            filter={"status": {"$in": ["active", "pending"]}},
-        )
+            filter={"status": {"$in": ["active", "pending"]}}, patterns=_patterns(collection_name))
         names = sorted(r["data"]["name"] for r in results)
         assert names == ["alice", "bob"]
     finally:
@@ -202,12 +233,13 @@ def test_find_in_matches_listed_values_only(conn, collection_name):
 def test_find_nested_or_and_respects_grouping(conn, collection_name):
     from goldlapel.utils import doc_insert, doc_find
     try:
+        _ensure_table(conn, collection_name)
         # We want to prove ($or [ $and[a,b], $not(c) ]) groups correctly.
         # Design rows so mis-grouping would yield a different set:
-        doc_insert(conn, collection_name, {"name": "r1", "a": 1, "b": 2, "c": 3})   # AND arm matches (a=1 AND b=2)
-        doc_insert(conn, collection_name, {"name": "r2", "a": 1, "b": 99, "c": 3})  # neither arm matches: AND fails (b!=2), NOT fails (c=3)
-        doc_insert(conn, collection_name, {"name": "r3", "a": 1, "b": 99, "c": 9})  # NOT arm matches (c!=3)
-        doc_insert(conn, collection_name, {"name": "r4", "a": 9, "b": 9, "c": 3})   # neither arm matches
+        doc_insert(conn, collection_name, {"name": "r1", "a": 1, "b": 2, "c": 3}, patterns=_patterns(collection_name))   # AND arm matches (a=1 AND b=2)
+        doc_insert(conn, collection_name, {"name": "r2", "a": 1, "b": 99, "c": 3}, patterns=_patterns(collection_name))  # neither arm matches: AND fails (b!=2), NOT fails (c=3)
+        doc_insert(conn, collection_name, {"name": "r3", "a": 1, "b": 99, "c": 9}, patterns=_patterns(collection_name))  # NOT arm matches (c!=3)
+        doc_insert(conn, collection_name, {"name": "r4", "a": 9, "b": 9, "c": 3}, patterns=_patterns(collection_name))   # neither arm matches
 
         results = doc_find(
             conn,
@@ -217,8 +249,7 @@ def test_find_nested_or_and_respects_grouping(conn, collection_name):
                     {"$and": [{"a": 1}, {"b": 2}]},
                     {"$not": {"c": 3}},
                 ]
-            },
-        )
+            }, patterns=_patterns(collection_name))
         names = sorted(r["data"]["name"] for r in results)
         assert names == ["r1", "r3"], f"expected grouping OR($and, $not), got {names}"
     finally:
@@ -236,19 +267,20 @@ def test_find_nested_or_and_respects_grouping(conn, collection_name):
 def test_find_sort_limit_skip_returns_correct_window(conn, collection_name):
     from goldlapel.utils import doc_insert, doc_find
     try:
+        _ensure_table(conn, collection_name)
         for i in [5, 3, 1, 4, 2]:
-            doc_insert(conn, collection_name, {"rank": i, "label": f"item-{i}"})
+            doc_insert(conn, collection_name, {"rank": i, "label": f"item-{i}"}, patterns=_patterns(collection_name))
 
-        page_1 = doc_find(conn, collection_name, sort={"rank": 1}, limit=2, skip=0)
-        page_2 = doc_find(conn, collection_name, sort={"rank": 1}, limit=2, skip=2)
-        page_3 = doc_find(conn, collection_name, sort={"rank": 1}, limit=2, skip=4)
+        page_1 = doc_find(conn, collection_name, sort={"rank": 1}, limit=2, skip=0, patterns=_patterns(collection_name))
+        page_2 = doc_find(conn, collection_name, sort={"rank": 1}, limit=2, skip=2, patterns=_patterns(collection_name))
+        page_3 = doc_find(conn, collection_name, sort={"rank": 1}, limit=2, skip=4, patterns=_patterns(collection_name))
 
         assert [r["data"]["rank"] for r in page_1] == [1, 2]
         assert [r["data"]["rank"] for r in page_2] == [3, 4]
         assert [r["data"]["rank"] for r in page_3] == [5]
 
         # Descending sort on the same data proves ASC/DESC is honored.
-        desc_top = doc_find(conn, collection_name, sort={"rank": -1}, limit=3)
+        desc_top = doc_find(conn, collection_name, sort={"rank": -1}, limit=3, patterns=_patterns(collection_name))
         assert [r["data"]["rank"] for r in desc_top] == [5, 4, 3]
     finally:
         _drop(conn, collection_name)
@@ -266,15 +298,15 @@ def test_find_sort_limit_skip_returns_correct_window(conn, collection_name):
 def test_find_one_and_update_returns_post_update_row(conn, collection_name):
     from goldlapel.utils import doc_insert, doc_find_one_and_update
     try:
-        doc_insert(conn, collection_name, {"name": "alice", "score": 10})
-        doc_insert(conn, collection_name, {"name": "alice", "score": 20})  # second alice — LIMIT 1 must pick exactly one
+        _ensure_table(conn, collection_name)
+        doc_insert(conn, collection_name, {"name": "alice", "score": 10}, patterns=_patterns(collection_name))
+        doc_insert(conn, collection_name, {"name": "alice", "score": 20}, patterns=_patterns(collection_name))  # second alice — LIMIT 1 must pick exactly one
 
         returned = doc_find_one_and_update(
             conn,
             collection_name,
             {"name": "alice"},
-            {"$inc": {"score": 100}},
-        )
+            {"$inc": {"score": 100}}, patterns=_patterns(collection_name))
         assert returned is not None
         assert returned["data"]["name"] == "alice"
         # The returned score must be post-update (old + 100), not pre-update.
@@ -299,21 +331,22 @@ def test_find_one_and_update_returns_post_update_row(conn, collection_name):
 def test_capped_collection_trigger_enforces_cap(conn, collection_name):
     from goldlapel.utils import doc_create_capped, doc_insert, doc_count
     try:
-        doc_create_capped(conn, collection_name, max_documents=3)
+        _ensure_table(conn, collection_name)
+        doc_create_capped(conn, collection_name, max_documents=3, patterns=_patterns(collection_name))
 
         for i in range(7):
-            doc_insert(conn, collection_name, {"seq": i})
+            doc_insert(conn, collection_name, {"seq": i}, patterns=_patterns(collection_name))
             # Ensure distinct created_at timestamps so the oldest-first DELETE
             # inside the trigger is deterministic. psycopg2 commits per call,
             # but NOW() can have microsecond resolution — add a tiny sleep.
             time.sleep(0.002)
 
         # Cap is 3; after 7 inserts, the trigger should have pruned back to <=3.
-        assert doc_count(conn, collection_name) == 3
+        assert doc_count(conn, collection_name, patterns=_patterns(collection_name)) == 3
 
         # The surviving rows must be the 3 most recent (seq 4, 5, 6).
         from goldlapel.utils import doc_find
-        survivors = sorted(r["data"]["seq"] for r in doc_find(conn, collection_name))
+        survivors = sorted(r["data"]["seq"] for r in doc_find(conn, collection_name, patterns=_patterns(collection_name)))
         assert survivors == [4, 5, 6]
     finally:
         _drop(conn, collection_name)
@@ -335,20 +368,20 @@ def test_capped_collection_trigger_enforces_cap(conn, collection_name):
 def test_distinct_with_numeric_filter_returns_unique_values(conn, collection_name):
     from goldlapel.utils import doc_insert, doc_distinct
     try:
-        doc_insert(conn, collection_name, {"status": "active", "age": 30})
-        doc_insert(conn, collection_name, {"status": "active", "age": 40})   # duplicate "active"
-        doc_insert(conn, collection_name, {"status": "pending", "age": 50})
-        doc_insert(conn, collection_name, {"status": "inactive", "age": 20}) # below filter threshold
-        doc_insert(conn, collection_name, {"age": 99})                       # missing status — must be excluded by IS NOT NULL
-        doc_insert(conn, collection_name, {"status": "ghost"})               # missing age — must not crash filter
+        _ensure_table(conn, collection_name)
+        doc_insert(conn, collection_name, {"status": "active", "age": 30}, patterns=_patterns(collection_name))
+        doc_insert(conn, collection_name, {"status": "active", "age": 40}, patterns=_patterns(collection_name))   # duplicate "active"
+        doc_insert(conn, collection_name, {"status": "pending", "age": 50}, patterns=_patterns(collection_name))
+        doc_insert(conn, collection_name, {"status": "inactive", "age": 20}, patterns=_patterns(collection_name)) # below filter threshold
+        doc_insert(conn, collection_name, {"age": 99}, patterns=_patterns(collection_name))                       # missing status — must be excluded by IS NOT NULL
+        doc_insert(conn, collection_name, {"status": "ghost"}, patterns=_patterns(collection_name))               # missing age — must not crash filter
 
         values = sorted(
             doc_distinct(
                 conn,
                 collection_name,
                 "status",
-                filter={"age": {"$gt": 25}},
-            )
+                filter={"age": {"$gt": 25}}, patterns=_patterns(collection_name))
         )
         assert values == ["active", "pending"]
     finally:

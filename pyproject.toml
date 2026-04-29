@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goldlapel"
-version = "0.0.0"
+# Pre-1.0 versioning: minor bump for breaking changes per Gold Lapel project policy.
+# Release CI rewrites this from the git tag at publish time — the in-source value
+# only matters for local dev installs.
+version = "0.3.0"
 description = "Self-optimizing Postgres proxy — automatic materialized views and indexes"
 readme = "README.md"
 license = "MIT"

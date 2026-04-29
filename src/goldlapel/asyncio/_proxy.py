@@ -133,6 +133,18 @@ class AsyncGoldLapel:
         )
         self._conn = None  # AsyncCachedConnection (wraps asyncpg.Connection)
 
+        # Nested namespaces — mirror the sync GoldLapel but with async sub-API
+        # classes. State is shared via the parent reference held in each
+        # sub-API's `self._gl`. The sync GoldLapel also constructed a
+        # DocumentsAPI / StreamsAPI bound to itself, but we never call those —
+        # users access the async surface via `gl.documents` / `gl.streams`
+        # below, where `gl` is the AsyncGoldLapel. This avoids accidentally
+        # calling sync code through an async client.
+        from goldlapel.asyncio._documents import AsyncDocumentsAPI
+        from goldlapel.asyncio._streams import AsyncStreamsAPI
+        self.documents = AsyncDocumentsAPI(self)
+        self.streams = AsyncStreamsAPI(self)
+
     # -- Properties (sync access, no await) ---------------------------------
 
     @property
@@ -365,61 +377,8 @@ class AsyncGoldLapel:
             return scoped
         return self.conn  # raises if not started
 
-    # -- Streams (explicit, not auto-generated — DDL patterns come from the proxy) --
-
-    async def _stream_patterns(self, stream):
-        """Fetch (and cache) canonical stream DDL + query patterns. Runs in
-        a threadpool executor because the proxy's /api/ddl/* uses blocking
-        urllib on the wrapper side (one HTTP round-trip per helper per session —
-        not on any hot path)."""
-        autils._validate_identifier(stream)
-        import asyncio as _asyncio
-        from goldlapel import ddl as _ddl
-        token = self._sync._dashboard_token or _ddl.token_from_env_or_file()
-        port = self._sync._dashboard_port
-        loop = _asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            _ddl.fetch_patterns,
-            self,  # owner for cache
-            "stream",
-            stream,
-            port,
-            token,
-        )
-
-    async def stream_add(self, stream, payload, *, conn=None):
-        patterns = await self._stream_patterns(stream)
-        return await autils.stream_add(
-            self._effective_conn(conn), stream, payload, patterns=patterns,
-        )
-
-    async def stream_create_group(self, stream, group, *, conn=None):
-        patterns = await self._stream_patterns(stream)
-        return await autils.stream_create_group(
-            self._effective_conn(conn), stream, group, patterns=patterns,
-        )
-
-    async def stream_read(self, stream, group, consumer, count=1, *, conn=None):
-        patterns = await self._stream_patterns(stream)
-        return await autils.stream_read(
-            self._effective_conn(conn), stream, group, consumer, count,
-            patterns=patterns,
-        )
-
-    async def stream_ack(self, stream, group, message_id, *, conn=None):
-        patterns = await self._stream_patterns(stream)
-        return await autils.stream_ack(
-            self._effective_conn(conn), stream, group, message_id,
-            patterns=patterns,
-        )
-
-    async def stream_claim(self, stream, group, consumer, min_idle_ms=60000, *, conn=None):
-        patterns = await self._stream_patterns(stream)
-        return await autils.stream_claim(
-            self._effective_conn(conn), stream, group, consumer, min_idle_ms,
-            patterns=patterns,
-        )
+    # -- Streams: gl.streams.<verb>(...). See goldlapel/asyncio/_streams.py.
+    # -- Documents: gl.documents.<verb>(...). See goldlapel/asyncio/_documents.py.
 
 
 # -- Auto-derive async wrappers from the sync GoldLapel surface ----------

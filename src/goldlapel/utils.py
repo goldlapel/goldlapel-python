@@ -1151,31 +1151,57 @@ def _build_filter(filter_dict):
     return " AND ".join(all_clauses), all_params
 
 
-def _ensure_collection(cur, collection, unlogged=False):
-    prefix = "CREATE UNLOGGED TABLE" if unlogged else "CREATE TABLE"
-    cur.execute(
-        f"{prefix} IF NOT EXISTS {collection} ("
-        "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
-        "data JSONB NOT NULL, "
-        "created_at TIMESTAMPTZ DEFAULT NOW())"
-    )
+def _doc_table(patterns):
+    """Resolve the canonical doc-store table name from proxy-fetched patterns.
+
+    Returns the FQ table name (e.g. `_goldlapel.doc_users`). Raises if
+    `patterns` is None — the wrapper API never builds DDL itself anymore;
+    `gl.documents.<verb>(...)` always supplies patterns.
+    """
+    if patterns is None:
+        raise RuntimeError(
+            "doc_* utils now require DDL patterns from the proxy — call via "
+            "`gl.documents.<verb>(...)` rather than the utils function directly."
+        )
+    return patterns["tables"]["main"]
 
 
-def doc_create_collection(conn, collection, unlogged=False):
+def _doc_index_name(table, suffix):
+    """Build a deterministic index name from a (possibly schema-qualified)
+    table reference. Strips any `schema.` prefix so the index name doesn't
+    contain a dot — Postgres rejects those without quoting."""
+    bare = table.rsplit(".", 1)[-1]
+    return f"idx_{bare}_{suffix}"
+
+
+def doc_create_collection(conn, collection, unlogged=False, *, patterns=None):
+    """Eagerly materialize the doc-store table via the proxy.
+
+    Idempotent: subsequent calls are no-ops on the proxy side (CREATE TABLE IF
+    NOT EXISTS + ON CONFLICT DO NOTHING in schema_meta). The `unlogged` flag
+    only takes effect on the first create — the proxy doesn't migrate storage
+    type on subsequent calls.
+    """
     _validate_identifier(collection)
+    # Calling _patterns on DocumentsAPI already issued the create — nothing
+    # left to do on the wrapper side. We accept `patterns=None` so direct
+    # `doc_create_collection(conn, "users")` calls fail loud instead of
+    # silently doing nothing.
+    if patterns is None:
+        raise RuntimeError(
+            "doc_create_collection requires DDL patterns from the proxy — call via "
+            "`gl.documents.create_collection(...)` rather than the utils function directly."
+        )
+    # No commit: the proxy already executed the DDL on its mgmt connection.
+
+
+def doc_insert(conn, collection, document, *, patterns=None):
+    _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    _ensure_collection(cur, collection, unlogged=unlogged)
-    raw.commit()
-
-
-def doc_insert(conn, collection, document):
-    _validate_identifier(collection)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
-    _ensure_collection(cur, collection)
     cur.execute(
-        f"INSERT INTO {collection} (data) VALUES (%s::jsonb) RETURNING _id, data, created_at",
+        f"INSERT INTO {table} (data) VALUES (%s::jsonb) RETURNING _id, data, created_at",
         (json.dumps(document),),
     )
     cols = [desc[0] for desc in cur.description]
@@ -1185,15 +1211,15 @@ def doc_insert(conn, collection, document):
     return dict(zip(cols, row))
 
 
-def doc_insert_many(conn, collection, documents):
+def doc_insert_many(conn, collection, documents, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    _ensure_collection(cur, collection)
     placeholders = ", ".join(["(%s::jsonb)"] * len(documents))
     params = tuple(json.dumps(d) for d in documents)
     cur.execute(
-        f"INSERT INTO {collection} (data) VALUES {placeholders} RETURNING _id, data, created_at",
+        f"INSERT INTO {table} (data) VALUES {placeholders} RETURNING _id, data, created_at",
         params,
     )
     cols = [desc[0] for desc in cur.description]
@@ -1203,11 +1229,12 @@ def doc_insert_many(conn, collection, documents):
     return results
 
 
-def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None):
+def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    sql = f"SELECT _id, data, created_at FROM {collection}"
+    sql = f"SELECT _id, data, created_at FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
     if where_clause:
@@ -1233,11 +1260,12 @@ def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None):
     return results
 
 
-def doc_find_cursor(conn, collection, filter=None, sort=None, limit=None, skip=None, batch_size=100):
+def doc_find_cursor(conn, collection, filter=None, sort=None, limit=None, skip=None, batch_size=100, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor(name=f"gl_cursor_{id(raw)}")
-    sql = f"SELECT _id, data, created_at FROM {collection}"
+    sql = f"SELECT _id, data, created_at FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
     if where_clause:
@@ -1269,11 +1297,12 @@ def doc_find_cursor(conn, collection, filter=None, sort=None, limit=None, skip=N
         cur.close()
 
 
-def doc_find_one(conn, collection, filter=None):
+def doc_find_one(conn, collection, filter=None, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    sql = f"SELECT _id, data, created_at FROM {collection}"
+    sql = f"SELECT _id, data, created_at FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
     if where_clause:
@@ -1289,13 +1318,14 @@ def doc_find_one(conn, collection, filter=None):
     return dict(zip(cols, row))
 
 
-def doc_update(conn, collection, filter, update):
+def doc_update(conn, collection, filter, update, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     where_clause, filter_params = _build_filter(filter)
     update_expr, update_params = _build_update(update)
-    sql = f"UPDATE {collection} SET data = {update_expr}"
+    sql = f"UPDATE {table} SET data = {update_expr}"
     params = list(update_params)
     if where_clause:
         sql += " WHERE " + where_clause
@@ -1307,8 +1337,9 @@ def doc_update(conn, collection, filter, update):
     return rowcount
 
 
-def doc_update_one(conn, collection, filter, update):
+def doc_update_one(conn, collection, filter, update, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     where_clause, filter_params = _build_filter(filter)
@@ -1318,8 +1349,8 @@ def doc_update_one(conn, collection, filter, update):
     else:
         cte_where = ""
     sql = (
-        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
-        f"UPDATE {collection} SET data = {update_expr} FROM target WHERE {collection}._id = target._id"
+        f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
+        f"UPDATE {table} SET data = {update_expr} FROM target WHERE {table}._id = target._id"
     )
     params = list(filter_params) + list(update_params)
     cur.execute(sql, tuple(params))
@@ -1329,12 +1360,13 @@ def doc_update_one(conn, collection, filter, update):
     return rowcount
 
 
-def doc_delete(conn, collection, filter):
+def doc_delete(conn, collection, filter, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     where_clause, filter_params = _build_filter(filter)
-    sql = f"DELETE FROM {collection}"
+    sql = f"DELETE FROM {table}"
     if where_clause:
         sql += " WHERE " + where_clause
     cur.execute(sql, tuple(filter_params))
@@ -1344,8 +1376,9 @@ def doc_delete(conn, collection, filter):
     return rowcount
 
 
-def doc_delete_one(conn, collection, filter):
+def doc_delete_one(conn, collection, filter, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     where_clause, filter_params = _build_filter(filter)
@@ -1354,8 +1387,8 @@ def doc_delete_one(conn, collection, filter):
     else:
         cte_where = ""
     cur.execute(
-        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
-        f"DELETE FROM {collection} USING target WHERE {collection}._id = target._id",
+        f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
+        f"DELETE FROM {table} USING target WHERE {table}._id = target._id",
         tuple(filter_params),
     )
     rowcount = cur.rowcount
@@ -1364,11 +1397,12 @@ def doc_delete_one(conn, collection, filter):
     return rowcount
 
 
-def doc_count(conn, collection, filter=None):
+def doc_count(conn, collection, filter=None, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    sql = f"SELECT COUNT(*) FROM {collection}"
+    sql = f"SELECT COUNT(*) FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
     if where_clause:
@@ -1380,8 +1414,9 @@ def doc_count(conn, collection, filter=None):
     return result
 
 
-def doc_find_one_and_update(conn, collection, filter, update):
+def doc_find_one_and_update(conn, collection, filter, update, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     where_clause, filter_params = _build_filter(filter)
@@ -1391,10 +1426,10 @@ def doc_find_one_and_update(conn, collection, filter, update):
     else:
         cte_where = ""
     sql = (
-        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
-        f"UPDATE {collection} SET data = {update_expr} FROM target "
-        f"WHERE {collection}._id = target._id "
-        f"RETURNING {collection}._id, {collection}.data, {collection}.created_at"
+        f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
+        f"UPDATE {table} SET data = {update_expr} FROM target "
+        f"WHERE {table}._id = target._id "
+        f"RETURNING {table}._id, {table}.data, {table}.created_at"
     )
     params = list(filter_params) + list(update_params)
     cur.execute(sql, tuple(params))
@@ -1407,8 +1442,9 @@ def doc_find_one_and_update(conn, collection, filter, update):
     return dict(zip(cols, row))
 
 
-def doc_find_one_and_delete(conn, collection, filter):
+def doc_find_one_and_delete(conn, collection, filter, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     where_clause, filter_params = _build_filter(filter)
@@ -1417,10 +1453,10 @@ def doc_find_one_and_delete(conn, collection, filter):
     else:
         cte_where = ""
     sql = (
-        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
-        f"DELETE FROM {collection} USING target "
-        f"WHERE {collection}._id = target._id "
-        f"RETURNING {collection}._id, {collection}.data, {collection}.created_at"
+        f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
+        f"DELETE FROM {table} USING target "
+        f"WHERE {table}._id = target._id "
+        f"RETURNING {table}._id, {table}.data, {table}.created_at"
     )
     cur.execute(sql, tuple(filter_params))
     cols = [desc[0] for desc in cur.description]
@@ -1432,12 +1468,13 @@ def doc_find_one_and_delete(conn, collection, filter):
     return dict(zip(cols, row))
 
 
-def doc_distinct(conn, collection, field, filter=None):
+def doc_distinct(conn, collection, field, filter=None, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     field_expr = _field_path(field)
-    sql = f"SELECT DISTINCT {field_expr} FROM {collection}"
+    sql = f"SELECT DISTINCT {field_expr} FROM {table}"
     params = []
     where_parts = [f"{field_expr} IS NOT NULL"]
     where_clause, filter_params = _build_filter(filter)
@@ -1451,20 +1488,23 @@ def doc_distinct(conn, collection, field, filter=None):
     return result
 
 
-def doc_create_index(conn, collection, keys=None):
+def doc_create_index(conn, collection, keys=None, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     if keys is None:
+        idx = _doc_index_name(table, "gin")
         cur.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{collection}_gin ON {collection} USING GIN (data)"
+            f"CREATE INDEX IF NOT EXISTS {idx} ON {table} USING GIN (data)"
         )
     else:
         for key in keys:
             if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
                 raise ValueError(f"Invalid key: {key}")
+            idx = _doc_index_name(table, key)
             cur.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_{collection}_{key} ON {collection} ((data->>'{key}'))"
+                f"CREATE INDEX IF NOT EXISTS {idx} ON {table} ((data->>'{key}'))"
             )
     raw.commit()
     cur.close()
@@ -1611,8 +1651,16 @@ def _build_group(group, unwind_map=None):
     return select_parts, group_by
 
 
-def doc_aggregate(conn, collection, pipeline):
+def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=None):
+    """Run a Mongo-style aggregation pipeline.
+
+    `lookup_tables` is a `{user_collection_name: canonical_proxy_table}` map
+    used to rewrite `$lookup.from` references to their proxy-canonical FQ
+    tables (`_goldlapel.doc_<name>`). Supplied by `gl.documents.aggregate` —
+    direct util callers may omit it (in which case `from` is used verbatim).
+    """
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
     _SUPPORTED_STAGES = {
@@ -1715,6 +1763,14 @@ def doc_aggregate(conn, collection, pipeline):
         select_parts = ["_id", "data", "created_at"]
 
     # Append $lookup subqueries to SELECT
+    #
+    # `lookup['from']` is the user-supplied collection name. The
+    # `lookup_tables` map (when present) is supplied by `gl.documents.aggregate`
+    # and resolves each `from` to its canonical proxy table (e.g. `users` →
+    # `_goldlapel.doc_users`). When `aggregate` is called via the legacy code
+    # path with no resolution map, the original collection name is used
+    # verbatim — direct util callers are responsible for using fully-qualified
+    # names if they want anything other than `public.<from>`.
     for lookup in lookup_stages:
         local_expr = _field_path(lookup["localField"])
         foreign_parts = lookup["foreignField"].split(".")
@@ -1728,15 +1784,16 @@ def doc_aggregate(conn, collection, pipeline):
             for part in foreign_parts[:-1]:
                 foreign_expr += f"->'{part}'"
             foreign_expr += f"->>'{foreign_parts[-1]}'"
+        from_table = lookup_tables.get(lookup["from"], lookup["from"]) if lookup_tables else lookup["from"]
         subquery = (
-            f"COALESCE((SELECT json_agg(b.data) FROM {lookup['from']} b "
-            f"WHERE {foreign_expr} = {collection}.{local_expr}), '[]'::json) "
+            f"COALESCE((SELECT json_agg(b.data) FROM {from_table} b "
+            f"WHERE {foreign_expr} = {table}.{local_expr}), '[]'::json) "
             f"AS {lookup['as']}"
         )
         select_parts.append(subquery)
 
     # Build FROM clause
-    from_clause = collection
+    from_clause = table
     for extra in from_extras:
         from_clause += f", {extra}"
 
@@ -1788,12 +1845,16 @@ def _make_listen_connection(conn):
     return listen_conn
 
 
-def doc_watch(conn, collection, callback, blocking=True):
+def doc_watch(conn, collection, callback, blocking=True, *, patterns=None):
     """Watch a collection for changes via triggers + pg_notify. Like MongoDB change streams."""
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
 
+    # Trigger / function / channel names are keyed off the user's collection
+    # name (validated identifier — safe to interpolate). The trigger fires on
+    # the canonical proxy table.
     cur.execute(f"""
         CREATE OR REPLACE FUNCTION _gl_watch_{collection}() RETURNS TRIGGER AS $$
         BEGIN
@@ -1814,7 +1875,7 @@ def doc_watch(conn, collection, callback, blocking=True):
     # product, so this is safe and matches the Go wrapper.
     cur.execute(f"""
         CREATE OR REPLACE TRIGGER _gl_watch_{collection}_trigger
-            AFTER INSERT OR UPDATE OR DELETE ON {collection}
+            AFTER INSERT OR UPDATE OR DELETE ON {table}
             FOR EACH ROW EXECUTE FUNCTION _gl_watch_{collection}()
     """)
     raw.commit()
@@ -1844,35 +1905,38 @@ def doc_watch(conn, collection, callback, blocking=True):
         return t
 
 
-def doc_unwatch(conn, collection):
+def doc_unwatch(conn, collection, *, patterns=None):
     """Remove change stream trigger from a collection."""
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"DROP TRIGGER IF EXISTS _gl_watch_{collection}_trigger ON {collection}")
+    cur.execute(f"DROP TRIGGER IF EXISTS _gl_watch_{collection}_trigger ON {table}")
     cur.execute(f"DROP FUNCTION IF EXISTS _gl_watch_{collection}()")
     raw.commit()
     cur.close()
 
 
-def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_at"):
+def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_at", *, patterns=None):
     """Create a TTL index that deletes expired rows on each INSERT. Like MongoDB TTL indexes."""
     _validate_identifier(collection)
     _validate_identifier(field)
     if not isinstance(expire_after_seconds, int):
         raise ValueError("expire_after_seconds must be an integer")
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
 
+    idx_ttl = _doc_index_name(table, "ttl")
     cur.execute(
-        f"CREATE INDEX IF NOT EXISTS idx_{collection}_ttl ON {collection} ({field})"
+        f"CREATE INDEX IF NOT EXISTS {idx_ttl} ON {table} ({field})"
     )
 
     expire_int = int(expire_after_seconds)
     cur.execute(f"""
         CREATE OR REPLACE FUNCTION _gl_ttl_{collection}() RETURNS TRIGGER AS $$
         BEGIN
-            DELETE FROM {collection} WHERE {field} < NOW() - INTERVAL '{expire_int} seconds';
+            DELETE FROM {table} WHERE {field} < NOW() - INTERVAL '{expire_int} seconds';
             RETURN NEW;
         END;
         $$ LANGUAGE plpgsql
@@ -1882,37 +1946,44 @@ def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_
     # See doc_watch for rationale.
     cur.execute(f"""
         CREATE OR REPLACE TRIGGER _gl_ttl_{collection}_trigger
-            BEFORE INSERT ON {collection}
+            BEFORE INSERT ON {table}
             FOR EACH STATEMENT EXECUTE FUNCTION _gl_ttl_{collection}()
     """)
     raw.commit()
     cur.close()
 
 
-def doc_remove_ttl_index(conn, collection):
+def doc_remove_ttl_index(conn, collection, *, patterns=None):
     """Remove TTL trigger, function, and index from a collection."""
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"DROP TRIGGER IF EXISTS _gl_ttl_{collection}_trigger ON {collection}")
+    idx_ttl = _doc_index_name(table, "ttl")
+    cur.execute(f"DROP TRIGGER IF EXISTS _gl_ttl_{collection}_trigger ON {table}")
     cur.execute(f"DROP FUNCTION IF EXISTS _gl_ttl_{collection}()")
-    cur.execute(f"DROP INDEX IF EXISTS idx_{collection}_ttl")
+    cur.execute(f"DROP INDEX IF EXISTS {idx_ttl}")
     raw.commit()
     cur.close()
 
 
-def doc_create_capped(conn, collection, max_documents):
-    """Create a capped collection that auto-deletes oldest rows. Like MongoDB capped collections."""
+def doc_create_capped(conn, collection, max_documents, *, patterns=None):
+    """Create a capped collection that auto-deletes oldest rows. Like MongoDB capped collections.
+
+    The underlying doc-store table is already materialized by the proxy
+    (DocumentsAPI._patterns issues create on first call). This call only adds
+    the cap trigger + supporting index.
+    """
     _validate_identifier(collection)
     if not isinstance(max_documents, int):
         raise ValueError("max_documents must be an integer")
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
 
-    _ensure_collection(cur, collection)
-
+    idx_created = _doc_index_name(table, "created_at")
     cur.execute(
-        f"CREATE INDEX IF NOT EXISTS idx_{collection}_created_at ON {collection} (created_at ASC)"
+        f"CREATE INDEX IF NOT EXISTS {idx_created} ON {table} (created_at ASC)"
     )
 
     max_int = int(max_documents)
@@ -1920,10 +1991,10 @@ def doc_create_capped(conn, collection, max_documents):
         CREATE OR REPLACE FUNCTION _gl_cap_{collection}() RETURNS TRIGGER AS $$
         DECLARE excess INTEGER;
         BEGIN
-            SELECT COUNT(*) - {max_int} INTO excess FROM {collection};
+            SELECT COUNT(*) - {max_int} INTO excess FROM {table};
             IF excess > 0 THEN
-                DELETE FROM {collection} WHERE _id IN (
-                    SELECT _id FROM {collection} ORDER BY created_at ASC LIMIT excess
+                DELETE FROM {table} WHERE _id IN (
+                    SELECT _id FROM {table} ORDER BY created_at ASC LIMIT excess
                 );
             END IF;
             RETURN NULL;
@@ -1935,19 +2006,20 @@ def doc_create_capped(conn, collection, max_documents):
     # See doc_watch for rationale.
     cur.execute(f"""
         CREATE OR REPLACE TRIGGER _gl_cap_{collection}_trigger
-            AFTER INSERT ON {collection}
+            AFTER INSERT ON {table}
             FOR EACH STATEMENT EXECUTE FUNCTION _gl_cap_{collection}()
     """)
     raw.commit()
     cur.close()
 
 
-def doc_remove_cap(conn, collection):
+def doc_remove_cap(conn, collection, *, patterns=None):
     """Remove capped collection trigger and function."""
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     raw = _get_raw_connection(conn)
     cur = raw.cursor()
-    cur.execute(f"DROP TRIGGER IF EXISTS _gl_cap_{collection}_trigger ON {collection}")
+    cur.execute(f"DROP TRIGGER IF EXISTS _gl_cap_{collection}_trigger ON {table}")
     cur.execute(f"DROP FUNCTION IF EXISTS _gl_cap_{collection}()")
     raw.commit()
     cur.close()

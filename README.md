@@ -36,6 +36,31 @@ Point your Postgres driver at `gl.url`. Gold Lapel sits between your app and you
 
 Async usage (`goldlapel.asyncio.start`), context managers, transactional coordination via `gl.using(conn)`, and framework integrations are in the docs.
 
+## Documents and streams
+
+Document store and stream operations live under nested namespaces:
+
+```python
+gl = goldlapel.start("postgresql://...")
+
+# Documents — Mongo-style API over JSONB-backed tables.
+gl.documents.insert("users", {"name": "alice", "age": 30})
+alice = gl.documents.find_one("users", {"name": "alice"})
+gl.documents.update("users", {"age": {"$gte": 30}}, {"$set": {"adult": True}})
+count = gl.documents.count("users", {"adult": True})
+
+# Streams — Kafka/Redis-streams-style append-only log with consumer groups.
+gl.streams.add("events", {"type": "click", "user": "alice"})
+gl.streams.create_group("events", "workers")
+messages = gl.streams.read("events", "workers", "consumer-1", count=10)
+for msg in messages:
+    gl.streams.ack("events", "workers", msg["id"])
+```
+
+Tables are materialized server-side at `_goldlapel.doc_<name>` / `_goldlapel.stream_<name>` — Gold Lapel owns the schema so every wrapper produces byte-identical tables. You don't run `CREATE TABLE` for these helpers anymore; the proxy does, idempotently, on first use.
+
+Other namespaces (`gl.search`, `gl.cache`, `gl.publish` / `gl.subscribe`, `gl.incr`, `gl.zadd`, `gl.hset`, `gl.geoadd`, …) remain at the top level for now and will move under their own nested namespaces in subsequent releases.
+
 ## Authentication
 
 For paid customers, paste your API key once and Gold Lapel handles the rest — fetching and auto-renewing the underlying license against entitlement changes:

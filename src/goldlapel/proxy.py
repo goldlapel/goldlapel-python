@@ -374,6 +374,18 @@ class GoldLapel:
         # Per-instance contextvar for `with gl.using(conn):` — async-safe, scoped override.
         self._using_conn = ContextVar(f"goldlapel_using_conn_{id(self)}", default=None)
 
+        # Nested namespaces — see goldlapel/documents.py and goldlapel/streams.py.
+        # These are the canonical schema-to-core sub-API instances. Each holds
+        # a back-reference to this client for shared state (license, dashboard
+        # token, http session, conn, DDL pattern cache). Other namespaces (cache,
+        # search, queues, counters, hashes, zsets, geo, auth, …) stay flat for
+        # now; they migrate to nested form one-at-a-time as their own
+        # schema-to-core phase fires.
+        from goldlapel.documents import DocumentsAPI
+        from goldlapel.streams import StreamsAPI
+        self.documents = DocumentsAPI(self)
+        self.streams = StreamsAPI(self)
+
     # Context manager support: `with goldlapel.start(...) as gl:` auto-stops on exit.
     def __enter__(self):
         if not self.running:
@@ -613,73 +625,7 @@ class GoldLapel:
     def running(self):
         return self._process is not None and self._process.poll() is None
 
-    # -- Document store --------------------------------------------------------
-
-    def doc_create_collection(self, *args, conn=None, **kwargs):
-        return _utils().doc_create_collection(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_insert(self, *args, conn=None, **kwargs):
-        return _utils().doc_insert(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_insert_many(self, *args, conn=None, **kwargs):
-        return _utils().doc_insert_many(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_find(self, *args, conn=None, **kwargs):
-        return _utils().doc_find(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_find_one(self, *args, conn=None, **kwargs):
-        return _utils().doc_find_one(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_update(self, *args, conn=None, **kwargs):
-        return _utils().doc_update(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_update_one(self, *args, conn=None, **kwargs):
-        return _utils().doc_update_one(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_delete(self, *args, conn=None, **kwargs):
-        return _utils().doc_delete(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_delete_one(self, *args, conn=None, **kwargs):
-        return _utils().doc_delete_one(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_find_one_and_update(self, *args, conn=None, **kwargs):
-        return _utils().doc_find_one_and_update(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_find_one_and_delete(self, *args, conn=None, **kwargs):
-        return _utils().doc_find_one_and_delete(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_distinct(self, *args, conn=None, **kwargs):
-        return _utils().doc_distinct(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_find_cursor(self, *args, conn=None, **kwargs):
-        return _utils().doc_find_cursor(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_count(self, *args, conn=None, **kwargs):
-        return _utils().doc_count(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_create_index(self, *args, conn=None, **kwargs):
-        return _utils().doc_create_index(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_aggregate(self, *args, conn=None, **kwargs):
-        return _utils().doc_aggregate(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_watch(self, *args, conn=None, **kwargs):
-        return _utils().doc_watch(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_unwatch(self, *args, conn=None, **kwargs):
-        return _utils().doc_unwatch(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_create_ttl_index(self, *args, conn=None, **kwargs):
-        return _utils().doc_create_ttl_index(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_remove_ttl_index(self, *args, conn=None, **kwargs):
-        return _utils().doc_remove_ttl_index(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_create_capped(self, *args, conn=None, **kwargs):
-        return _utils().doc_create_capped(self._effective_conn(conn), *args, **kwargs)
-
-    def doc_remove_cap(self, *args, conn=None, **kwargs):
-        return _utils().doc_remove_cap(self._effective_conn(conn), *args, **kwargs)
+    # -- Document store: gl.documents.<verb>(...). See goldlapel/documents.py.
 
     # -- Search ----------------------------------------------------------------
 
@@ -782,50 +728,7 @@ class GoldLapel:
     def script(self, *args, conn=None, **kwargs):
         return _utils().script(self._effective_conn(conn), *args, **kwargs)
 
-    # -- Streams ---------------------------------------------------------------
-
-    def _stream_patterns(self, stream):
-        """Fetch (and cache) canonical stream DDL + query patterns from the
-        proxy's DDL API. The DDL is executed on the proxy side — this call
-        only returns the patterns the wrapper should run against the proxy."""
-        from goldlapel.utils import _validate_identifier
-        _validate_identifier(stream)
-        from goldlapel import ddl as _ddl
-        token = self._dashboard_token or _ddl.token_from_env_or_file()
-        return _ddl.fetch_patterns(self, "stream", stream, self._dashboard_port, token)
-
-    def stream_add(self, stream, payload, *, conn=None):
-        patterns = self._stream_patterns(stream)
-        return _utils().stream_add(self._effective_conn(conn), stream, payload, patterns=patterns)
-
-    def stream_create_group(self, stream, group, *, conn=None):
-        patterns = self._stream_patterns(stream)
-        return _utils().stream_create_group(
-            self._effective_conn(conn), stream, group, patterns=patterns
-        )
-
-    def stream_read(self, stream, group, consumer, count=1, *, conn=None):
-        patterns = self._stream_patterns(stream)
-        return _utils().stream_read(
-            self._effective_conn(conn), stream, group, consumer, count, patterns=patterns
-        )
-
-    def stream_ack(self, stream, group, message_id, *, conn=None):
-        patterns = self._stream_patterns(stream)
-        return _utils().stream_ack(
-            self._effective_conn(conn), stream, group, message_id, patterns=patterns
-        )
-
-    def stream_claim(self, stream, group, consumer, min_idle_ms=60000, *, conn=None):
-        patterns = self._stream_patterns(stream)
-        return _utils().stream_claim(
-            self._effective_conn(conn),
-            stream,
-            group,
-            consumer,
-            min_idle_ms,
-            patterns=patterns,
-        )
+    # -- Streams: gl.streams.<verb>(...). See goldlapel/streams.py.
 
     # -- Percolator ------------------------------------------------------------
 

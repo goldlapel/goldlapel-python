@@ -785,47 +785,57 @@ async def explain_score(conn, table, column, query, id_column, id_value, lang="e
 
 # -- Document store ---------------------------------------------------------
 
-async def _ensure_collection(conn, collection, unlogged=False):
-    prefix = "CREATE UNLOGGED TABLE" if unlogged else "CREATE TABLE"
-    await _execute(conn, (
-        f"{prefix} IF NOT EXISTS {collection} ("
-        "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
-        "data JSONB NOT NULL, "
-        "created_at TIMESTAMPTZ DEFAULT NOW())"
-    ))
+def _doc_table(patterns):
+    if patterns is None:
+        raise RuntimeError(
+            "doc_* utils now require DDL patterns from the proxy — call via "
+            "`gl.documents.<verb>(...)` rather than the utils function directly."
+        )
+    return patterns["tables"]["main"]
 
 
-async def doc_create_collection(conn, collection, unlogged=False):
+def _doc_index_name(table, suffix):
+    bare = table.rsplit(".", 1)[-1]
+    return f"idx_{bare}_{suffix}"
+
+
+async def doc_create_collection(conn, collection, unlogged=False, *, patterns=None):
     _validate_identifier(collection)
-    await _ensure_collection(conn, collection, unlogged=unlogged)
+    if patterns is None:
+        raise RuntimeError(
+            "doc_create_collection requires DDL patterns from the proxy — call via "
+            "`gl.documents.create_collection(...)` rather than the utils function directly."
+        )
+    # The proxy already executed the DDL on its mgmt connection. Nothing left
+    # for the wrapper to do.
 
 
-async def doc_insert(conn, collection, document):
+async def doc_insert(conn, collection, document, *, patterns=None):
     _validate_identifier(collection)
-    await _ensure_collection(conn, collection)
+    table = _doc_table(patterns)
     row = await _fetchrow(
         conn,
-        f"INSERT INTO {collection} (data) VALUES (%s::jsonb) RETURNING _id, data, created_at",
+        f"INSERT INTO {table} (data) VALUES (%s::jsonb) RETURNING _id, data, created_at",
         (json.dumps(document),),
     )
     return _decode_doc_row(_row_to_dict(row))
 
 
-async def doc_insert_many(conn, collection, documents):
+async def doc_insert_many(conn, collection, documents, *, patterns=None):
     _validate_identifier(collection)
-    await _ensure_collection(conn, collection)
+    table = _doc_table(patterns)
     placeholders = ", ".join(["(%s::jsonb)"] * len(documents))
     params = tuple(json.dumps(d) for d in documents)
     rows = await _fetch(
         conn,
-        f"INSERT INTO {collection} (data) VALUES {placeholders} RETURNING _id, data, created_at",
+        f"INSERT INTO {table} (data) VALUES {placeholders} RETURNING _id, data, created_at",
         params,
     )
     return _decode_doc_rows(_rows_to_dicts(rows))
 
 
-def _build_doc_find_sql(collection, filter=None, sort=None, limit=None, skip=None):
-    sql = f"SELECT _id, data, created_at FROM {collection}"
+def _build_doc_find_sql(table, filter=None, sort=None, limit=None, skip=None):
+    sql = f"SELECT _id, data, created_at FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
     if where_clause:
@@ -847,15 +857,16 @@ def _build_doc_find_sql(collection, filter=None, sort=None, limit=None, skip=Non
     return sql, params
 
 
-async def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None):
+async def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None, *, patterns=None):
     _validate_identifier(collection)
-    sql, params = _build_doc_find_sql(collection, filter, sort, limit, skip)
+    table = _doc_table(patterns)
+    sql, params = _build_doc_find_sql(table, filter, sort, limit, skip)
     rows = await _fetch(conn, sql, tuple(params))
     return _decode_doc_rows(_rows_to_dicts(rows))
 
 
 async def doc_find_cursor(
-    conn, collection, filter=None, sort=None, limit=None, skip=None, batch_size=100,
+    conn, collection, filter=None, sort=None, limit=None, skip=None, batch_size=100, *, patterns=None,
 ):
     """Async generator version of doc_find_cursor.
 
@@ -863,7 +874,8 @@ async def doc_find_cursor(
     and close in a finally. Matches psycopg2's server-side cursor semantics.
     """
     _validate_identifier(collection)
-    sql, params = _build_doc_find_sql(collection, filter, sort, limit, skip)
+    table = _doc_table(patterns)
+    sql, params = _build_doc_find_sql(table, filter, sort, limit, skip)
     sql2, params2 = _to_asyncpg(sql, tuple(params))
     raw = _get_raw_connection(conn)
     async with raw.transaction():
@@ -876,9 +888,10 @@ async def doc_find_cursor(
                 yield _decode_doc_row(dict(row))
 
 
-async def doc_find_one(conn, collection, filter=None):
+async def doc_find_one(conn, collection, filter=None, *, patterns=None):
     _validate_identifier(collection)
-    sql = f"SELECT _id, data, created_at FROM {collection}"
+    table = _doc_table(patterns)
+    sql = f"SELECT _id, data, created_at FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
     if where_clause:
@@ -889,11 +902,12 @@ async def doc_find_one(conn, collection, filter=None):
     return _decode_doc_row(_row_to_dict(row))
 
 
-async def doc_update(conn, collection, filter, update):
+async def doc_update(conn, collection, filter, update, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     where_clause, filter_params = _build_filter(filter)
     update_expr, update_params = _build_update(update)
-    sql = f"UPDATE {collection} SET data = {update_expr}"
+    sql = f"UPDATE {table} SET data = {update_expr}"
     params = list(update_params)
     if where_clause:
         sql += " WHERE " + where_clause
@@ -902,46 +916,50 @@ async def doc_update(conn, collection, filter, update):
     return _rowcount_from_status(status)
 
 
-async def doc_update_one(conn, collection, filter, update):
+async def doc_update_one(conn, collection, filter, update, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     where_clause, filter_params = _build_filter(filter)
     update_expr, update_params = _build_update(update)
     cte_where = " WHERE " + where_clause if where_clause else ""
     sql = (
-        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
-        f"UPDATE {collection} SET data = {update_expr} FROM target WHERE {collection}._id = target._id"
+        f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
+        f"UPDATE {table} SET data = {update_expr} FROM target WHERE {table}._id = target._id"
     )
     params = list(filter_params) + list(update_params)
     status = await _execute(conn, sql, tuple(params))
     return _rowcount_from_status(status)
 
 
-async def doc_delete(conn, collection, filter):
+async def doc_delete(conn, collection, filter, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     where_clause, filter_params = _build_filter(filter)
-    sql = f"DELETE FROM {collection}"
+    sql = f"DELETE FROM {table}"
     if where_clause:
         sql += " WHERE " + where_clause
     status = await _execute(conn, sql, tuple(filter_params))
     return _rowcount_from_status(status)
 
 
-async def doc_delete_one(conn, collection, filter):
+async def doc_delete_one(conn, collection, filter, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     where_clause, filter_params = _build_filter(filter)
     cte_where = " WHERE " + where_clause if where_clause else ""
     status = await _execute(
         conn,
-        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
-        f"DELETE FROM {collection} USING target WHERE {collection}._id = target._id",
+        f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
+        f"DELETE FROM {table} USING target WHERE {table}._id = target._id",
         tuple(filter_params),
     )
     return _rowcount_from_status(status)
 
 
-async def doc_count(conn, collection, filter=None):
+async def doc_count(conn, collection, filter=None, *, patterns=None):
     _validate_identifier(collection)
-    sql = f"SELECT COUNT(*) FROM {collection}"
+    table = _doc_table(patterns)
+    sql = f"SELECT COUNT(*) FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
     if where_clause:
@@ -951,40 +969,43 @@ async def doc_count(conn, collection, filter=None):
     return val
 
 
-async def doc_find_one_and_update(conn, collection, filter, update):
+async def doc_find_one_and_update(conn, collection, filter, update, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     where_clause, filter_params = _build_filter(filter)
     update_expr, update_params = _build_update(update)
     cte_where = " WHERE " + where_clause if where_clause else ""
     sql = (
-        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
-        f"UPDATE {collection} SET data = {update_expr} FROM target "
-        f"WHERE {collection}._id = target._id "
-        f"RETURNING {collection}._id, {collection}.data, {collection}.created_at"
+        f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
+        f"UPDATE {table} SET data = {update_expr} FROM target "
+        f"WHERE {table}._id = target._id "
+        f"RETURNING {table}._id, {table}.data, {table}.created_at"
     )
     params = list(filter_params) + list(update_params)
     row = await _fetchrow(conn, sql, tuple(params))
     return _decode_doc_row(_row_to_dict(row))
 
 
-async def doc_find_one_and_delete(conn, collection, filter):
+async def doc_find_one_and_delete(conn, collection, filter, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     where_clause, filter_params = _build_filter(filter)
     cte_where = " WHERE " + where_clause if where_clause else ""
     sql = (
-        f"WITH target AS (SELECT _id FROM {collection}{cte_where} LIMIT 1) "
-        f"DELETE FROM {collection} USING target "
-        f"WHERE {collection}._id = target._id "
-        f"RETURNING {collection}._id, {collection}.data, {collection}.created_at"
+        f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
+        f"DELETE FROM {table} USING target "
+        f"WHERE {table}._id = target._id "
+        f"RETURNING {table}._id, {table}.data, {table}.created_at"
     )
     row = await _fetchrow(conn, sql, tuple(filter_params))
     return _decode_doc_row(_row_to_dict(row))
 
 
-async def doc_distinct(conn, collection, field, filter=None):
+async def doc_distinct(conn, collection, field, filter=None, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     field_expr = _field_path(field)
-    sql = f"SELECT DISTINCT {field_expr} FROM {collection}"
+    sql = f"SELECT DISTINCT {field_expr} FROM {table}"
     params = []
     where_parts = [f"{field_expr} IS NOT NULL"]
     where_clause, filter_params = _build_filter(filter)
@@ -996,28 +1017,32 @@ async def doc_distinct(conn, collection, field, filter=None):
     return [r[0] for r in rows]
 
 
-async def doc_create_index(conn, collection, keys=None):
+async def doc_create_index(conn, collection, keys=None, *, patterns=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     if keys is None:
+        idx = _doc_index_name(table, "gin")
         await _execute(
             conn,
-            f"CREATE INDEX IF NOT EXISTS idx_{collection}_gin ON {collection} USING GIN (data)",
+            f"CREATE INDEX IF NOT EXISTS {idx} ON {table} USING GIN (data)",
         )
     else:
         for key in keys:
             if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_.]*$", key):
                 raise ValueError(f"Invalid key: {key}")
+            idx = _doc_index_name(table, key)
             await _execute(
                 conn,
-                f"CREATE INDEX IF NOT EXISTS idx_{collection}_{key} "
-                f"ON {collection} ((data->>'{key}'))",
+                f"CREATE INDEX IF NOT EXISTS {idx} "
+                f"ON {table} ((data->>'{key}'))",
             )
 
 
 # -- Aggregation pipeline ---------------------------------------------------
 
-async def doc_aggregate(conn, collection, pipeline):
+async def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=None):
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     _SUPPORTED_STAGES = {
         "$match", "$group", "$sort", "$limit", "$skip",
         "$project", "$unwind", "$lookup",
@@ -1122,14 +1147,15 @@ async def doc_aggregate(conn, collection, pipeline):
             for part in foreign_parts[:-1]:
                 foreign_expr += f"->'{part}'"
             foreign_expr += f"->>'{foreign_parts[-1]}'"
+        from_table = lookup_tables.get(lookup["from"], lookup["from"]) if lookup_tables else lookup["from"]
         subquery = (
-            f"COALESCE((SELECT json_agg(b.data) FROM {lookup['from']} b "
-            f"WHERE {foreign_expr} = {collection}.{local_expr}), '[]'::json) "
+            f"COALESCE((SELECT json_agg(b.data) FROM {from_table} b "
+            f"WHERE {foreign_expr} = {table}.{local_expr}), '[]'::json) "
             f"AS {lookup['as']}"
         )
         select_parts.append(subquery)
 
-    from_clause = collection
+    from_clause = table
     for extra in from_extras:
         from_clause += f", {extra}"
 
@@ -1237,7 +1263,7 @@ def _decode_doc_rows(rows):
     return [_decode_doc_row(r) for r in rows]
 
 
-async def doc_watch(conn, collection, callback, blocking=True):
+async def doc_watch(conn, collection, callback, blocking=True, *, patterns=None):
     """Watch a collection for changes via triggers + pg_notify.
 
     Async version uses asyncpg's add_listener on a fresh connection.
@@ -1246,6 +1272,7 @@ async def doc_watch(conn, collection, callback, blocking=True):
     import asyncio
 
     _validate_identifier(collection)
+    table = _doc_table(patterns)
     await _execute(conn, f"""
         CREATE OR REPLACE FUNCTION _gl_watch_{collection}() RETURNS TRIGGER AS $$
         BEGIN
@@ -1264,7 +1291,7 @@ async def doc_watch(conn, collection, callback, blocking=True):
     # GL targets PG14+, so this is safe and matches the Go wrapper.
     await _execute(conn, f"""
         CREATE OR REPLACE TRIGGER _gl_watch_{collection}_trigger
-            AFTER INSERT OR UPDATE OR DELETE ON {collection}
+            AFTER INSERT OR UPDATE OR DELETE ON {table}
             FOR EACH ROW EXECUTE FUNCTION _gl_watch_{collection}()
     """)
 
@@ -1291,25 +1318,28 @@ async def doc_watch(conn, collection, callback, blocking=True):
         await listen_conn.close()
 
 
-async def doc_unwatch(conn, collection):
+async def doc_unwatch(conn, collection, *, patterns=None):
     _validate_identifier(collection)
-    await _execute(conn, f"DROP TRIGGER IF EXISTS _gl_watch_{collection}_trigger ON {collection}")
+    table = _doc_table(patterns)
+    await _execute(conn, f"DROP TRIGGER IF EXISTS _gl_watch_{collection}_trigger ON {table}")
     await _execute(conn, f"DROP FUNCTION IF EXISTS _gl_watch_{collection}()")
 
 
-async def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_at"):
+async def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_at", *, patterns=None):
     _validate_identifier(collection)
     _validate_identifier(field)
     if not isinstance(expire_after_seconds, int):
         raise ValueError("expire_after_seconds must be an integer")
+    table = _doc_table(patterns)
+    idx_ttl = _doc_index_name(table, "ttl")
     await _execute(
-        conn, f"CREATE INDEX IF NOT EXISTS idx_{collection}_ttl ON {collection} ({field})",
+        conn, f"CREATE INDEX IF NOT EXISTS {idx_ttl} ON {table} ({field})",
     )
     expire_int = int(expire_after_seconds)
     await _execute(conn, f"""
         CREATE OR REPLACE FUNCTION _gl_ttl_{collection}() RETURNS TRIGGER AS $$
         BEGIN
-            DELETE FROM {collection} WHERE {field} < NOW() - INTERVAL '{expire_int} seconds';
+            DELETE FROM {table} WHERE {field} < NOW() - INTERVAL '{expire_int} seconds';
             RETURN NEW;
         END;
         $$ LANGUAGE plpgsql
@@ -1318,37 +1348,40 @@ async def doc_create_ttl_index(conn, collection, expire_after_seconds, field="cr
     # See doc_watch for rationale.
     await _execute(conn, f"""
         CREATE OR REPLACE TRIGGER _gl_ttl_{collection}_trigger
-            BEFORE INSERT ON {collection}
+            BEFORE INSERT ON {table}
             FOR EACH STATEMENT EXECUTE FUNCTION _gl_ttl_{collection}()
     """)
 
 
-async def doc_remove_ttl_index(conn, collection):
+async def doc_remove_ttl_index(conn, collection, *, patterns=None):
     _validate_identifier(collection)
-    await _execute(conn, f"DROP TRIGGER IF EXISTS _gl_ttl_{collection}_trigger ON {collection}")
+    table = _doc_table(patterns)
+    idx_ttl = _doc_index_name(table, "ttl")
+    await _execute(conn, f"DROP TRIGGER IF EXISTS _gl_ttl_{collection}_trigger ON {table}")
     await _execute(conn, f"DROP FUNCTION IF EXISTS _gl_ttl_{collection}()")
-    await _execute(conn, f"DROP INDEX IF EXISTS idx_{collection}_ttl")
+    await _execute(conn, f"DROP INDEX IF EXISTS {idx_ttl}")
 
 
-async def doc_create_capped(conn, collection, max_documents):
+async def doc_create_capped(conn, collection, max_documents, *, patterns=None):
     _validate_identifier(collection)
     if not isinstance(max_documents, int):
         raise ValueError("max_documents must be an integer")
-    await _ensure_collection(conn, collection)
+    table = _doc_table(patterns)
+    idx_created = _doc_index_name(table, "created_at")
     await _execute(
         conn,
-        f"CREATE INDEX IF NOT EXISTS idx_{collection}_created_at "
-        f"ON {collection} (created_at ASC)",
+        f"CREATE INDEX IF NOT EXISTS {idx_created} "
+        f"ON {table} (created_at ASC)",
     )
     max_int = int(max_documents)
     await _execute(conn, f"""
         CREATE OR REPLACE FUNCTION _gl_cap_{collection}() RETURNS TRIGGER AS $$
         DECLARE excess INTEGER;
         BEGIN
-            SELECT COUNT(*) - {max_int} INTO excess FROM {collection};
+            SELECT COUNT(*) - {max_int} INTO excess FROM {table};
             IF excess > 0 THEN
-                DELETE FROM {collection} WHERE _id IN (
-                    SELECT _id FROM {collection} ORDER BY created_at ASC LIMIT excess
+                DELETE FROM {table} WHERE _id IN (
+                    SELECT _id FROM {table} ORDER BY created_at ASC LIMIT excess
                 );
             END IF;
             RETURN NULL;
@@ -1359,12 +1392,13 @@ async def doc_create_capped(conn, collection, max_documents):
     # See doc_watch for rationale.
     await _execute(conn, f"""
         CREATE OR REPLACE TRIGGER _gl_cap_{collection}_trigger
-            AFTER INSERT ON {collection}
+            AFTER INSERT ON {table}
             FOR EACH STATEMENT EXECUTE FUNCTION _gl_cap_{collection}()
     """)
 
 
-async def doc_remove_cap(conn, collection):
+async def doc_remove_cap(conn, collection, *, patterns=None):
     _validate_identifier(collection)
-    await _execute(conn, f"DROP TRIGGER IF EXISTS _gl_cap_{collection}_trigger ON {collection}")
+    table = _doc_table(patterns)
+    await _execute(conn, f"DROP TRIGGER IF EXISTS _gl_cap_{collection}_trigger ON {table}")
     await _execute(conn, f"DROP FUNCTION IF EXISTS _gl_cap_{collection}()")
