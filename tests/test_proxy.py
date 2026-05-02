@@ -7,10 +7,12 @@ import pytest
 
 import goldlapel.proxy as proxy_mod
 from goldlapel.proxy import (
+    _application_name_marker,
     _config_to_args,
     _find_binary,
     _make_proxy_url,
     _wait_for_port,
+    _wrapper_version,
     DEFAULT_PROXY_PORT,
     GoldLapel,
     config_keys,
@@ -19,6 +21,13 @@ from goldlapel.proxy import (
     stop,
     proxy_url,
 )
+
+
+# The proxy URL gets `application_name=goldlapel:python:<version>` appended so
+# the proxy can classify wrapper-vs-raw traffic and skip L2 cache for wrappers
+# (which already have their own L1 cache). The marker is suppressed if the
+# user already set application_name (URL or PGAPPNAME).
+_APP_NAME_SUFFIX = f"application_name=goldlapel:python:{_wrapper_version()}"
 
 
 class TestFindBinary:
@@ -113,23 +122,36 @@ class TestFindBinary:
 
 
 class TestMakeProxyUrl:
+    """The wrapper rewrites host/port to point at the proxy and appends
+    `application_name=goldlapel:python:<version>` so the proxy can distinguish
+    wrapper traffic from raw clients. PGAPPNAME is cleared from the env in
+    each test so the marker is applied deterministically (a developer running
+    `pytest` with PGAPPNAME set would otherwise see different URLs)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_pgappname(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PGAPPNAME", None)
+            yield
+
     def test_postgresql_url(self):
         url = "postgresql://user:pass@dbhost:5432/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:pass@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_postgres_url(self):
         url = "postgres://user:pass@remote.aws.com:5432/mydb"
-        assert _make_proxy_url(url, 7932) == "postgres://user:pass@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgres://user:pass@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_pg_url_without_port(self):
         url = "postgresql://user:pass@host.aws.com/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:pass@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_pg_url_without_port_or_path(self):
         url = "postgresql://user:pass@host.aws.com"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:pass@localhost:7932?{_APP_NAME_SUFFIX}"
 
     def test_bare_host_port(self):
+        # Bare-host form skips the marker — atypical caller path.
         assert _make_proxy_url("dbhost:5432", 7932) == "localhost:7932"
 
     def test_host_only(self):
@@ -137,55 +159,98 @@ class TestMakeProxyUrl:
 
     def test_preserves_params(self):
         url = "postgresql://user:pass@remote:5432/mydb?sslmode=require"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932/mydb?sslmode=require"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:pass@localhost:7932/mydb?sslmode=require&{_APP_NAME_SUFFIX}"
 
     def test_preserves_percent_encoded_password(self):
         url = "postgresql://user:p%40ss@remote:5432/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:p%40ss@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:p%40ss@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_no_userinfo(self):
         url = "postgresql://dbhost:5432/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_no_userinfo_no_port(self):
         url = "postgresql://dbhost/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_localhost_stays_localhost(self):
         url = "postgresql://user:pass@localhost:5432/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:pass@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:pass@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_at_sign_in_password_with_port(self):
         url = "postgresql://user:p@ss@host:5432/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:p@ss@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:p@ss@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_at_sign_in_password_without_port(self):
         url = "postgresql://user:p@ss@host/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:p@ss@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:p@ss@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_at_sign_in_password_with_query_params(self):
         url = "postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&{_APP_NAME_SUFFIX}"
 
     def test_password_starting_with_digit_with_port(self):
         url = "postgresql://user:9password@host:5432/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:9password@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:9password@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_password_starting_with_digit_without_port(self):
         url = "postgresql://user:9password@host/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:9password@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:9password@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_password_all_digits_without_port(self):
         url = "postgresql://user:123456@host/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:123456@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:123456@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_password_all_digits_with_port(self):
         url = "postgresql://user:123456@host:5432/mydb"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:123456@localhost:7932/mydb"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:123456@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_password_starting_with_digit_no_path(self):
         url = "postgresql://user:9secret@host"
-        assert _make_proxy_url(url, 7932) == "postgresql://user:9secret@localhost:7932"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:9secret@localhost:7932?{_APP_NAME_SUFFIX}"
+
+
+class TestApplicationNameMarker:
+    """L2-router architecture: wrappers identify themselves to the proxy via
+    PG `application_name`, so the proxy can gate L2 result cache (wrappers
+    have their own L1; raw clients don't)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_pgappname(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PGAPPNAME", None)
+            yield
+
+    def test_marker_format(self):
+        marker = _application_name_marker()
+        assert marker.startswith("goldlapel:python:")
+        # version segment is non-empty
+        assert marker.split(":", 2)[2]
+
+    def test_marker_appended_when_no_existing_query(self):
+        url = "postgresql://localhost:5432/mydb"
+        out = _make_proxy_url(url, 7932)
+        assert f"?{_APP_NAME_SUFFIX}" in out
+
+    def test_marker_appended_with_existing_query(self):
+        url = "postgresql://localhost:5432/mydb?sslmode=require"
+        out = _make_proxy_url(url, 7932)
+        assert "sslmode=require" in out
+        assert f"&{_APP_NAME_SUFFIX}" in out
+
+    def test_user_override_via_url_respected(self):
+        # User explicitly set application_name — wrapper does not clobber it.
+        url = "postgresql://localhost:5432/mydb?application_name=my-app"
+        out = _make_proxy_url(url, 7932)
+        assert "application_name=my-app" in out
+        assert "goldlapel:python" not in out
+
+    def test_user_override_via_pgappname_respected(self):
+        url = "postgresql://localhost:5432/mydb"
+        with patch.dict(os.environ, {"PGAPPNAME": "my-app"}):
+            out = _make_proxy_url(url, 7932)
+        assert "application_name=" not in out
+        assert "goldlapel:python" not in out
 
 
 class TestWaitForPort:
