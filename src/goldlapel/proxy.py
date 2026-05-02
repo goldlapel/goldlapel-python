@@ -218,6 +218,55 @@ def _find_binary():
     )
 
 
+def _wrapper_version():
+    """Return the wrapper's installed version, or "0.0.0" in dev installs.
+
+    Used to build the application_name marker (`goldlapel:python:<version>`)
+    that the proxy reads to classify wrapper-vs-raw traffic and gate L2 cache.
+    """
+    try:
+        from importlib.metadata import version as _v, PackageNotFoundError
+        try:
+            return _v("goldlapel")
+        except PackageNotFoundError:
+            return "0.0.0"
+    except ImportError:  # pragma: no cover — importlib.metadata is stdlib from 3.8+
+        return "0.0.0"
+
+
+def _application_name_marker():
+    """The application_name string the wrapper sets on PG connections.
+
+    Format: `goldlapel:python:<version>`. The proxy parses the startup packet's
+    application_name parameter; values starting with `goldlapel:` are treated
+    as wrapper traffic (skips L2 result cache — the wrapper has its own L1).
+    """
+    return f"goldlapel:python:{_wrapper_version()}"
+
+
+def _inject_application_name(url):
+    """Append `application_name=goldlapel:python:<version>` to `url` unless the
+    user already set one (in the original upstream or via env). Idempotent: a
+    pre-existing `application_name` parameter is left untouched so caller
+    overrides win.
+
+    The marker is opt-in convention — if the user explicitly set application_name
+    for their own debugging or telemetry tagging, we don't clobber it.
+    """
+    # Already has application_name (from the original upstream) — respect it.
+    if re.search(r'[?&]application_name=', url):
+        return url
+    # Caller set one via libpq env var — respect it. (The Python wrapper itself
+    # doesn't read PGAPPNAME, but psycopg/libpq do at connect time, and we don't
+    # want to override that out from under them.)
+    if os.environ.get("PGAPPNAME"):
+        return url
+
+    marker = _application_name_marker()
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}application_name={marker}"
+
+
 def _make_proxy_url(upstream, port):
     # Build a proxy URL: replace host with localhost and set the proxy port.
     # Uses regex instead of urlparse to avoid decoding percent-encoded characters
@@ -229,14 +278,16 @@ def _make_proxy_url(upstream, port):
     # cause the regex to skip the userinfo group and misparse "user:9..." as host:port.
     m = re.match(r'^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+):(\d+)([/?#].*)?$', upstream)
     if m:
-        return f"{m.group(1)}localhost:{port}{m.group(4) or ''}"
+        return _inject_application_name(f"{m.group(1)}localhost:{port}{m.group(4) or ''}")
 
     # pg URL without port: scheme://[userinfo@]host[/path][?query]
     m = re.match(r'^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+)(.*)$', upstream)
     if m:
-        return f"{m.group(1)}localhost:{port}{m.group(3)}"
+        return _inject_application_name(f"{m.group(1)}localhost:{port}{m.group(3)}")
 
     # bare host:port (only if not a URL — guard against splitting on scheme colons)
+    # The marker is URL-encoded only; we don't try to inject into a bare host:port
+    # form since callers using bare-host form are passing through unusual paths.
     if "://" not in upstream and ":" in upstream:
         return f"localhost:{port}"
 
