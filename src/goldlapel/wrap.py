@@ -1,6 +1,22 @@
+import atexit
+
 from goldlapel.cache import NativeCache, _detect_write, _DDL_SENTINEL, _TX_START, _TX_END
 
 _cache = None
+_atexit_registered = False
+
+
+def _shutdown_cache():
+    """atexit handler — emit a final wrapper_disconnected snapshot
+    before the process exits so the proxy's per-wrapper aggregate
+    flips to "gone" promptly. Best-effort; the socket may already be
+    torn down by other shutdown paths."""
+    global _cache
+    if _cache is not None:
+        try:
+            _cache.emit_wrapper_disconnected()
+        except Exception:
+            pass
 
 
 def _detect_invalidation_port():
@@ -17,13 +33,16 @@ def _detect_invalidation_port():
 
 
 def wrap(conn, invalidation_port=None):
-    global _cache
+    global _cache, _atexit_registered
     if _cache is None:
         _cache = NativeCache()
     if invalidation_port is None:
         invalidation_port = _detect_invalidation_port()
     if not _cache._invalidation_thread or not _cache._invalidation_thread.is_alive():
         _cache.connect_invalidation(invalidation_port)
+    if not _atexit_registered:
+        atexit.register(_shutdown_cache)
+        _atexit_registered = True
 
     if hasattr(conn, "fetch") and hasattr(conn, "fetchrow"):
         return AsyncCachedConnection(conn, _cache)

@@ -1,11 +1,42 @@
+import json
 import os
 import re
 import socket
 import sys
 import threading
+import time
+import uuid
 from collections import namedtuple, OrderedDict
+from importlib import metadata as _metadata
 
 _DDL_SENTINEL = "__ddl__"
+
+# --- L1 telemetry tuning ---
+#
+# Demand-driven model (2026-05-02): the wrapper has NO background timer.
+# Cache counters increment on cache ops (free); state-change events are
+# emitted synchronously when a relevant counter crosses a threshold;
+# snapshot replies are sent only when the proxy asks via ?:<request>.
+#
+# Hit-rate sliding window — last `_HIT_RATE_WINDOW` get() calls. Once
+# `_HIT_RATE_WARMUP` samples have accumulated, hit_rate_dropped fires
+# when the windowed rate falls below `_HIT_RATE_LOW_PCT`; the inverse
+# hit_rate_recovered fires when it rises back above
+# `_HIT_RATE_HIGH_PCT`. Hysteresis avoids flapping around the boundary.
+_HIT_RATE_WINDOW = 1000
+_HIT_RATE_WARMUP = 200
+_HIT_RATE_LOW_PCT = 30.0
+_HIT_RATE_HIGH_PCT = 50.0
+
+# Eviction-rate sliding window. cache_full fires when ≥
+# `_EVICT_RATE_HIGH` of the last `_EVICT_RATE_WINDOW` cache writes
+# (puts) caused an eviction; cache_recovered fires when the rate falls
+# back below `_EVICT_RATE_LOW`. With a 32k-entry default capacity, a
+# steady-state high eviction rate means the working set exceeds the
+# cache — actionable signal for the dashboard.
+_EVICT_RATE_WINDOW = 200
+_EVICT_RATE_HIGH = 0.5  # 50% of recent puts evicted → cache_full
+_EVICT_RATE_LOW = 0.1   # ≤ 10% → cache_recovered
 
 CacheEntry = namedtuple("CacheEntry", ["rows", "description", "tables"])
 
@@ -152,6 +183,40 @@ class NativeCache:
         self.stats_hits = 0
         self.stats_misses = 0
         self.stats_invalidations = 0
+        # L1 telemetry (2026-05-02). Eviction counter — was missing
+        # before; bumped in `_evict_one`. Configurable opt-out: set
+        # GOLDLAPEL_REPORT_STATS=false to disable all snapshot replies
+        # and state-change emissions (cache continues to function).
+        self.stats_evictions = 0
+        self._report_stats = (
+            os.environ.get("GOLDLAPEL_REPORT_STATS", "true").lower() != "false"
+        )
+        # Stable wrapper identity for the lifetime of the process.
+        # Lets the proxy aggregate per wrapper across reconnects.
+        self._wrapper_id = str(uuid.uuid4())
+        self._wrapper_lang = "python"
+        try:
+            self._wrapper_version = _metadata.version("goldlapel")
+        except Exception:
+            self._wrapper_version = "unknown"
+        # Synchronizes writes from the recv thread (replies to ?:) and
+        # any cache-op thread (state-change emissions). The socket is a
+        # single full-duplex stream; concurrent writes would interleave
+        # bytes. recv stays on the existing thread, send is serialized
+        # behind this lock.
+        self._socket = None
+        self._send_lock = threading.Lock()
+        # Sliding windows for state-change detection. Both are bounded
+        # ring buffers; updates are O(1) amortised.
+        self._recent_outcomes = []  # 1 = hit, 0 = miss; len ≤ window
+        self._recent_outcomes_idx = 0
+        self._recent_evictions = []  # 1 = evicted, 0 = inserted; len ≤ window
+        self._recent_evictions_idx = 0
+        # Latched state — only emit a state-change event when the state
+        # transitions. Without latching the wrapper would re-emit every
+        # tick the rate stays bad.
+        self._state_cache_full = False
+        self._state_hit_rate_dropped = False
         self._initialized = True
 
     def get(self, sql, params):
@@ -162,14 +227,21 @@ class NativeCache:
             hash(key)
         except TypeError:
             return None
+        outcome = None
         with self._lock:
             entry = self._cache.get(key)
             if entry is not None:
                 self._cache.move_to_end(key)
                 self.stats_hits += 1
-                return entry
-            self.stats_misses += 1
-            return None
+                self._record_outcome_locked(1)
+                outcome = entry
+            else:
+                self.stats_misses += 1
+                self._record_outcome_locked(0)
+        # State-change check happens outside the lock — emit may take
+        # `_send_lock` and we don't want to nest locks.
+        self._maybe_emit_hit_rate_state_change()
+        return outcome
 
     def put(self, sql, params, rows, description):
         if not self._enabled or not self._invalidation_connected:
@@ -180,16 +252,22 @@ class NativeCache:
         except TypeError:
             return
         tables = _extract_tables(sql)
+        evicted = 0
         with self._lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
             elif len(self._cache) >= self._max_entries:
                 self._evict_one()
+                evicted = 1
             self._cache[key] = CacheEntry(rows, description, tables)
             for table in tables:
                 if table not in self._table_index:
                     self._table_index[table] = set()
                 self._table_index[table].add(key)
+            self._record_eviction_locked(evicted)
+        # Eviction-rate threshold check outside the lock — same
+        # rationale as the get-path hit-rate check.
+        self._maybe_emit_eviction_rate_state_change()
 
     def invalidate_table(self, table):
         table = table.lower()
@@ -245,6 +323,13 @@ class NativeCache:
                 sock.settimeout(30.0)
                 self._invalidation_connected = True
                 self._reconnect_attempt = 0
+                # Stash the socket so `_send_line` (called from cache-op
+                # threads on state-change, and from `_process_request`
+                # on this thread for ?:/R:) writes to the live FD. Set
+                # before the wrapper_connected emit so the very first
+                # message goes out cleanly.
+                self._socket = sock
+                self._emit_state_change("wrapper_connected")
                 buf = b""
 
                 while not self._invalidation_stop.is_set():
@@ -264,6 +349,10 @@ class NativeCache:
             except (OSError, ConnectionRefusedError):
                 pass
             finally:
+                # Drop the socket reference under the send lock so any
+                # concurrent emitter doesn't write to a closed FD.
+                with self._send_lock:
+                    self._socket = None
                 if self._invalidation_connected:
                     self._invalidation_connected = False
                     self.invalidate_all()
@@ -279,12 +368,20 @@ class NativeCache:
             self._reconnect_attempt += 1
 
     def _process_signal(self, line):
+        # Backwards-compat: unknown prefixes are silently ignored. Older
+        # proxies sent only `I:` and `C:` and `P:` (keepalive); newer
+        # proxies may add request types here. Forward-compat: the
+        # wrapper accepts any well-formed prefix and routes by type.
         if line.startswith("I:"):
             table = line[2:].strip()
             if table == "*":
                 self.invalidate_all()
             else:
                 self.invalidate_table(table)
+        elif line.startswith("?:"):
+            # Snapshot request from the proxy. Reply with R:<json>.
+            self._process_request(line[2:])
+        # C: (config), P: (ping), and anything else — ignored.
 
     def _evict_one(self):
         if not self._cache:
@@ -296,6 +393,170 @@ class NativeCache:
                     self._table_index[table].discard(lru_key)
                     if not self._table_index[table]:
                         del self._table_index[table]
+        self.stats_evictions += 1
+
+    # ---- L1 telemetry: sliding windows ----
+
+    def _record_outcome_locked(self, outcome):
+        """Record a get() outcome (1 hit, 0 miss). Caller holds `_lock`.
+
+        Bounded ring — once at capacity, overwrites oldest in O(1).
+        """
+        if len(self._recent_outcomes) < _HIT_RATE_WINDOW:
+            self._recent_outcomes.append(outcome)
+        else:
+            self._recent_outcomes[self._recent_outcomes_idx] = outcome
+            self._recent_outcomes_idx = (self._recent_outcomes_idx + 1) % _HIT_RATE_WINDOW
+
+    def _record_eviction_locked(self, evicted):
+        """Record a put() outcome (1 evicted, 0 inserted). Caller holds `_lock`."""
+        if len(self._recent_evictions) < _EVICT_RATE_WINDOW:
+            self._recent_evictions.append(evicted)
+        else:
+            self._recent_evictions[self._recent_evictions_idx] = evicted
+            self._recent_evictions_idx = (self._recent_evictions_idx + 1) % _EVICT_RATE_WINDOW
+
+    def _hit_rate_pct(self):
+        """Sliding-window hit rate as percent. None if warmup not done."""
+        with self._lock:
+            n = len(self._recent_outcomes)
+            if n < _HIT_RATE_WARMUP:
+                return None
+            hits = sum(self._recent_outcomes)
+        return 100.0 * hits / n
+
+    def _eviction_rate(self):
+        """Sliding-window eviction-per-put rate as fraction (0..1)."""
+        with self._lock:
+            n = len(self._recent_evictions)
+            if n == 0:
+                return 0.0
+            evicted = sum(self._recent_evictions)
+        return evicted / n
+
+    # ---- L1 telemetry: snapshot + state-change emission ----
+
+    def _build_snapshot(self):
+        """Build the L1 snapshot dict the proxy aggregates per-tick.
+
+        All fields are point-in-time reads under `_lock`; counter
+        atomicity is achieved via the GIL + lock combo. The proxy
+        computes deltas across ticks; we just expose the raw counters.
+        """
+        with self._lock:
+            current_size = len(self._cache)
+        return {
+            "wrapper_id": self._wrapper_id,
+            "lang": self._wrapper_lang,
+            "version": self._wrapper_version,
+            "hits": self.stats_hits,
+            "misses": self.stats_misses,
+            "evictions": self.stats_evictions,
+            "invalidations": self.stats_invalidations,
+            "current_size_entries": current_size,
+            "capacity_entries": self._max_entries,
+        }
+
+    def _send_line(self, line):
+        """Serialize a line write under `_send_lock`. Best-effort —
+        socket errors are swallowed (the recv loop will detect the
+        broken connection on its next iteration and reconnect)."""
+        if not self._report_stats:
+            return
+        sock = self._socket
+        if sock is None:
+            return
+        data = line.encode("utf-8") if isinstance(line, str) else line
+        if not data.endswith(b"\n"):
+            data = data + b"\n"
+        with self._send_lock:
+            try:
+                sock.sendall(data)
+            except (OSError, ConnectionError):
+                # Connection dead — recv loop will rebuild on next
+                # iteration. Don't try to repair here; we'd race the
+                # reconnect logic.
+                pass
+
+    def _emit_state_change(self, state):
+        """Emit S:<json> with snapshot + state name."""
+        if not self._report_stats:
+            return
+        payload = self._build_snapshot()
+        payload["state"] = state
+        payload["ts_ms"] = int(time.time() * 1000)
+        try:
+            line = "S:" + json.dumps(payload, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return
+        self._send_line(line)
+
+    def _emit_response(self, snapshot=None):
+        """Emit R:<json> snapshot reply to a ?:<request>."""
+        if not self._report_stats:
+            return
+        if snapshot is None:
+            snapshot = self._build_snapshot()
+        snapshot.setdefault("ts_ms", int(time.time() * 1000))
+        try:
+            line = "R:" + json.dumps(snapshot, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return
+        self._send_line(line)
+
+    def _maybe_emit_hit_rate_state_change(self):
+        """Check the hit-rate sliding window and emit a state change
+        if the latched state should flip. Hysteresis-guarded —
+        dropping below LOW emits hit_rate_dropped; rising above HIGH
+        emits hit_rate_recovered. Between LOW and HIGH the state
+        sticks (no flapping)."""
+        rate = self._hit_rate_pct()
+        if rate is None:
+            return
+        if not self._state_hit_rate_dropped and rate < _HIT_RATE_LOW_PCT:
+            self._state_hit_rate_dropped = True
+            self._emit_state_change("hit_rate_dropped")
+        elif self._state_hit_rate_dropped and rate >= _HIT_RATE_HIGH_PCT:
+            self._state_hit_rate_dropped = False
+            self._emit_state_change("hit_rate_recovered")
+
+    def _maybe_emit_eviction_rate_state_change(self):
+        """Check the eviction-rate sliding window and emit a state
+        change if the latched state should flip. Hysteresis-guarded
+        the same way as the hit-rate check."""
+        # Need at least a full window before reporting state — a single
+        # eviction in 3 puts is noise.
+        with self._lock:
+            warmed = len(self._recent_evictions) >= _EVICT_RATE_WINDOW
+        if not warmed:
+            return
+        rate = self._eviction_rate()
+        if not self._state_cache_full and rate >= _EVICT_RATE_HIGH:
+            self._state_cache_full = True
+            self._emit_state_change("cache_full")
+        elif self._state_cache_full and rate <= _EVICT_RATE_LOW:
+            self._state_cache_full = False
+            self._emit_state_change("cache_recovered")
+
+    def _process_request(self, raw):
+        """Handle ?:<request> from the proxy. Today the only request
+        is `snapshot` — the proxy asks for a current counter snapshot
+        and we reply with R:<json>. Future requests can extend this
+        without breaking older proxies (they'd ignore unknown R:
+        lines, but only the proxy that sent ?:<x> will be expecting a
+        reply, so the contract is local to the request type)."""
+        # `raw` is the body after the `?:` prefix; today we accept any
+        # non-empty value as "snapshot" — the proxy doesn't differentiate
+        # request types yet.
+        body = raw.strip() if raw else ""
+        if not body or body == "snapshot":
+            self._emit_response()
+
+    def emit_wrapper_disconnected(self):
+        """Emit a final `wrapper_disconnected` snapshot before shutdown.
+        Called from atexit (registered by the wrapper layer) — best
+        effort; the socket may already be torn down."""
+        self._emit_state_change("wrapper_disconnected")
 
     @classmethod
     def _reset(cls):
