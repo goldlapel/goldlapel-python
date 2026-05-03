@@ -18,16 +18,6 @@ _DDL_SENTINEL = "__ddl__"
 # emitted synchronously when a relevant counter crosses a threshold;
 # snapshot replies are sent only when the proxy asks via ?:<request>.
 #
-# Hit-rate sliding window — last `_HIT_RATE_WINDOW` get() calls. Once
-# `_HIT_RATE_WARMUP` samples have accumulated, hit_rate_dropped fires
-# when the windowed rate falls below `_HIT_RATE_LOW_PCT`; the inverse
-# hit_rate_recovered fires when it rises back above
-# `_HIT_RATE_HIGH_PCT`. Hysteresis avoids flapping around the boundary.
-_HIT_RATE_WINDOW = 1000
-_HIT_RATE_WARMUP = 200
-_HIT_RATE_LOW_PCT = 30.0
-_HIT_RATE_HIGH_PCT = 50.0
-
 # Eviction-rate sliding window. cache_full fires when ≥
 # `_EVICT_RATE_HIGH` of the last `_EVICT_RATE_WINDOW` cache writes
 # (puts) caused an eviction; cache_recovered fires when the rate falls
@@ -206,17 +196,14 @@ class NativeCache:
         # behind this lock.
         self._socket = None
         self._send_lock = threading.Lock()
-        # Sliding windows for state-change detection. Both are bounded
-        # ring buffers; updates are O(1) amortised.
-        self._recent_outcomes = []  # 1 = hit, 0 = miss; len ≤ window
-        self._recent_outcomes_idx = 0
+        # Sliding window for eviction-rate state-change detection. A
+        # bounded ring buffer; updates are O(1) amortised.
         self._recent_evictions = []  # 1 = evicted, 0 = inserted; len ≤ window
         self._recent_evictions_idx = 0
         # Latched state — only emit a state-change event when the state
         # transitions. Without latching the wrapper would re-emit every
         # tick the rate stays bad.
         self._state_cache_full = False
-        self._state_hit_rate_dropped = False
         self._initialized = True
 
     def get(self, sql, params):
@@ -227,21 +214,14 @@ class NativeCache:
             hash(key)
         except TypeError:
             return None
-        outcome = None
         with self._lock:
             entry = self._cache.get(key)
             if entry is not None:
                 self._cache.move_to_end(key)
                 self.stats_hits += 1
-                self._record_outcome_locked(1)
-                outcome = entry
-            else:
-                self.stats_misses += 1
-                self._record_outcome_locked(0)
-        # State-change check happens outside the lock — emit may take
-        # `_send_lock` and we don't want to nest locks.
-        self._maybe_emit_hit_rate_state_change()
-        return outcome
+                return entry
+            self.stats_misses += 1
+            return None
 
     def put(self, sql, params, rows, description):
         if not self._enabled or not self._invalidation_connected:
@@ -265,8 +245,8 @@ class NativeCache:
                     self._table_index[table] = set()
                 self._table_index[table].add(key)
             self._record_eviction_locked(evicted)
-        # Eviction-rate threshold check outside the lock — same
-        # rationale as the get-path hit-rate check.
+        # Eviction-rate threshold check happens outside the lock — emit
+        # may take `_send_lock` and we don't want to nest locks.
         self._maybe_emit_eviction_rate_state_change()
 
     def invalidate_table(self, table):
@@ -397,65 +377,39 @@ class NativeCache:
 
     # ---- L1 telemetry: sliding windows ----
 
-    def _record_outcome_locked(self, outcome):
-        """Record a get() outcome (1 hit, 0 miss). Caller holds `_lock`.
+    def _record_eviction_locked(self, evicted):
+        """Record a put() outcome (1 evicted, 0 inserted). Caller holds `_lock`.
 
         Bounded ring — once at capacity, overwrites oldest in O(1).
         """
-        if len(self._recent_outcomes) < _HIT_RATE_WINDOW:
-            self._recent_outcomes.append(outcome)
-        else:
-            self._recent_outcomes[self._recent_outcomes_idx] = outcome
-            self._recent_outcomes_idx = (self._recent_outcomes_idx + 1) % _HIT_RATE_WINDOW
-
-    def _record_eviction_locked(self, evicted):
-        """Record a put() outcome (1 evicted, 0 inserted). Caller holds `_lock`."""
         if len(self._recent_evictions) < _EVICT_RATE_WINDOW:
             self._recent_evictions.append(evicted)
         else:
             self._recent_evictions[self._recent_evictions_idx] = evicted
             self._recent_evictions_idx = (self._recent_evictions_idx + 1) % _EVICT_RATE_WINDOW
 
-    def _hit_rate_pct(self):
-        """Sliding-window hit rate as percent. None if warmup not done."""
-        with self._lock:
-            n = len(self._recent_outcomes)
-            if n < _HIT_RATE_WARMUP:
-                return None
-            hits = sum(self._recent_outcomes)
-        return 100.0 * hits / n
-
-    def _eviction_rate(self):
-        """Sliding-window eviction-per-put rate as fraction (0..1)."""
-        with self._lock:
-            n = len(self._recent_evictions)
-            if n == 0:
-                return 0.0
-            evicted = sum(self._recent_evictions)
-        return evicted / n
-
     # ---- L1 telemetry: snapshot + state-change emission ----
 
     def _build_snapshot(self):
         """Build the L1 snapshot dict the proxy aggregates per-tick.
 
-        All fields are point-in-time reads under `_lock`; counter
-        atomicity is achieved via the GIL + lock combo. The proxy
-        computes deltas across ticks; we just expose the raw counters.
+        All counters + cache size read in a single critical section so
+        the snapshot is internally consistent (no torn reads where, e.g.,
+        hits and misses straddle a concurrent get()). The proxy computes
+        deltas across ticks; we just expose the raw counters.
         """
         with self._lock:
-            current_size = len(self._cache)
-        return {
-            "wrapper_id": self._wrapper_id,
-            "lang": self._wrapper_lang,
-            "version": self._wrapper_version,
-            "hits": self.stats_hits,
-            "misses": self.stats_misses,
-            "evictions": self.stats_evictions,
-            "invalidations": self.stats_invalidations,
-            "current_size_entries": current_size,
-            "capacity_entries": self._max_entries,
-        }
+            return {
+                "wrapper_id": self._wrapper_id,
+                "lang": self._wrapper_lang,
+                "version": self._wrapper_version,
+                "hits": self.stats_hits,
+                "misses": self.stats_misses,
+                "evictions": self.stats_evictions,
+                "invalidations": self.stats_invalidations,
+                "current_size_entries": len(self._cache),
+                "capacity_entries": self._max_entries,
+            }
 
     def _send_line(self, line):
         """Serialize a line write under `_send_lock`. Best-effort —
@@ -504,39 +458,33 @@ class NativeCache:
             return
         self._send_line(line)
 
-    def _maybe_emit_hit_rate_state_change(self):
-        """Check the hit-rate sliding window and emit a state change
-        if the latched state should flip. Hysteresis-guarded —
-        dropping below LOW emits hit_rate_dropped; rising above HIGH
-        emits hit_rate_recovered. Between LOW and HIGH the state
-        sticks (no flapping)."""
-        rate = self._hit_rate_pct()
-        if rate is None:
-            return
-        if not self._state_hit_rate_dropped and rate < _HIT_RATE_LOW_PCT:
-            self._state_hit_rate_dropped = True
-            self._emit_state_change("hit_rate_dropped")
-        elif self._state_hit_rate_dropped and rate >= _HIT_RATE_HIGH_PCT:
-            self._state_hit_rate_dropped = False
-            self._emit_state_change("hit_rate_recovered")
-
     def _maybe_emit_eviction_rate_state_change(self):
         """Check the eviction-rate sliding window and emit a state
-        change if the latched state should flip. Hysteresis-guarded
-        the same way as the hit-rate check."""
+        change if the latched state should flip. Hysteresis-guarded:
+        crossing HIGH emits cache_full, falling back below LOW emits
+        cache_recovered, and rates between LOW and HIGH leave the
+        latched state unchanged (no flapping)."""
+        # Read window state + flip latched flag under `_lock` so two
+        # concurrent puts that both cross the threshold can't both emit.
         # Need at least a full window before reporting state — a single
         # eviction in 3 puts is noise.
+        emit = None
         with self._lock:
-            warmed = len(self._recent_evictions) >= _EVICT_RATE_WINDOW
-        if not warmed:
-            return
-        rate = self._eviction_rate()
-        if not self._state_cache_full and rate >= _EVICT_RATE_HIGH:
-            self._state_cache_full = True
-            self._emit_state_change("cache_full")
-        elif self._state_cache_full and rate <= _EVICT_RATE_LOW:
-            self._state_cache_full = False
-            self._emit_state_change("cache_recovered")
+            n = len(self._recent_evictions)
+            if n < _EVICT_RATE_WINDOW:
+                return
+            rate = sum(self._recent_evictions) / n
+            if not self._state_cache_full and rate >= _EVICT_RATE_HIGH:
+                self._state_cache_full = True
+                emit = "cache_full"
+            elif self._state_cache_full and rate <= _EVICT_RATE_LOW:
+                self._state_cache_full = False
+                emit = "cache_recovered"
+        # Emit outside the lock — `_emit_state_change` takes `_send_lock`
+        # and may block on a socket write; we don't want to nest locks
+        # or hold `_lock` across I/O.
+        if emit is not None:
+            self._emit_state_change(emit)
 
     def _process_request(self, raw):
         """Handle ?:<request> from the proxy. Today the only request
