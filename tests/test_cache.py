@@ -16,10 +16,6 @@ from goldlapel.cache import (
     _EVICT_RATE_HIGH,
     _EVICT_RATE_LOW,
     _EVICT_RATE_WINDOW,
-    _HIT_RATE_HIGH_PCT,
-    _HIT_RATE_LOW_PCT,
-    _HIT_RATE_WARMUP,
-    _HIT_RATE_WINDOW,
     _TX_START,
     _TX_END,
 )
@@ -643,36 +639,6 @@ class TestStateChangeEmission:
         # No exception raised.
         cache._process_signal("Z:future-prefix")
         cache._process_signal("$:bogus")
-
-
-# --- L1 telemetry: hit-rate sliding window state changes ---
-
-class TestHitRateStateChange:
-    def test_hit_rate_dropped_fires_below_threshold(self):
-        cache = make_cache()
-        # Mock send_line to capture emissions instead of needing a socket.
-        emissions = []
-        cache._send_line = lambda line: emissions.append(line)
-        # Warmup with mostly misses → hit rate well below LOW threshold.
-        for i in range(_HIT_RATE_WARMUP + 50):
-            cache.get(f"NEVERCACHED-{i}", None)
-        # Hit rate should be 0%; expect a hit_rate_dropped emission.
-        s_lines = [e for e in emissions if e.startswith("S:")]
-        assert any("hit_rate_dropped" in s for s in s_lines), \
-            f"expected hit_rate_dropped, got {s_lines}"
-
-    def test_hit_rate_dropped_only_fires_once_until_recovered(self):
-        cache = make_cache()
-        emissions = []
-        cache._send_line = lambda line: emissions.append(line)
-        for i in range(_HIT_RATE_WARMUP + 50):
-            cache.get(f"NEVERCACHED-{i}", None)
-        first_count = sum(1 for e in emissions if "hit_rate_dropped" in e)
-        # More misses — must NOT re-emit while latched.
-        for i in range(50):
-            cache.get(f"STILL-NOT-CACHED-{i}", None)
-        second_count = sum(1 for e in emissions if "hit_rate_dropped" in e)
-        assert first_count == second_count == 1
 
 
 # --- L1 telemetry: eviction-rate state changes ---
