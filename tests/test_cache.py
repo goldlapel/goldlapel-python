@@ -1,3 +1,4 @@
+import json
 import os
 import socket
 import threading
@@ -12,6 +13,13 @@ from goldlapel.cache import (
     _extract_tables,
     _make_key,
     _DDL_SENTINEL,
+    _EVICT_RATE_HIGH,
+    _EVICT_RATE_LOW,
+    _EVICT_RATE_WINDOW,
+    _HIT_RATE_HIGH_PCT,
+    _HIT_RATE_LOW_PCT,
+    _HIT_RATE_WARMUP,
+    _HIT_RATE_WINDOW,
     _TX_START,
     _TX_END,
 )
@@ -447,3 +455,277 @@ class TestThreadSafety:
             t.join()
 
         assert not errors
+
+
+# --- L1 telemetry: counters + snapshot ---
+
+class TestEvictionsCounter:
+    def test_evictions_counter_starts_zero(self):
+        cache = make_cache(max_entries=4)
+        assert cache.stats_evictions == 0
+
+    def test_evictions_counter_bumps_on_overflow(self):
+        cache = make_cache(max_entries=4)
+        for i in range(8):
+            cache.put(f"SELECT {i}", None, [(i,)], None)
+        # 8 puts, capacity 4 → 4 evictions.
+        assert cache.stats_evictions == 4
+
+    def test_evictions_counter_no_bump_within_capacity(self):
+        cache = make_cache(max_entries=8)
+        for i in range(4):
+            cache.put(f"SELECT {i}", None, [(i,)], None)
+        assert cache.stats_evictions == 0
+
+
+class TestSnapshotShape:
+    def test_snapshot_carries_required_fields(self):
+        cache = make_cache(max_entries=64)
+        cache.put("SELECT 1", None, [(1,)], None)
+        cache.get("SELECT 1", None)
+        cache.get("SELECT MISS", None)
+        snap = cache._build_snapshot()
+        assert snap["wrapper_id"] == cache._wrapper_id
+        assert snap["lang"] == "python"
+        assert "version" in snap
+        assert snap["hits"] == 1
+        assert snap["misses"] == 1
+        assert snap["evictions"] == 0
+        assert snap["current_size_entries"] == 1
+        assert snap["capacity_entries"] == 64
+
+    def test_wrapper_id_is_uuid(self):
+        cache = make_cache()
+        # UUID4 string format check
+        import uuid as _uuid
+        parsed = _uuid.UUID(cache._wrapper_id)
+        assert parsed.version == 4
+
+    def test_wrapper_id_stable_across_calls(self):
+        cache = make_cache()
+        a = cache._build_snapshot()["wrapper_id"]
+        b = cache._build_snapshot()["wrapper_id"]
+        assert a == b
+
+
+# --- L1 telemetry: state-change emission via real socket ---
+
+def _wait_for(predicate, timeout=2.0, interval=0.02):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _accept_with_buf(server):
+    """Accept a connection and start a buffered reader. Returns (conn, lines_list, stop_fn)."""
+    conn, _ = server.accept()
+    conn.settimeout(0.5)
+    lines = []
+    stop = threading.Event()
+
+    def reader():
+        buf = b""
+        while not stop.is_set():
+            try:
+                data = conn.recv(4096)
+                if not data:
+                    return
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    lines.append(line.decode("utf-8", errors="replace"))
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    def stop_fn():
+        stop.set()
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    return conn, lines, stop_fn
+
+
+class TestStateChangeEmission:
+    def _spawn_server(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        port = server.getsockname()[1]
+        server.listen(1)
+        return server, port
+
+    def test_wrapper_connected_emitted_on_socket_connect(self):
+        cache = make_cache()
+        server, port = self._spawn_server()
+        try:
+            cache.connect_invalidation(port)
+            conn, lines, stop_fn = _accept_with_buf(server)
+            try:
+                _wait_for(lambda: any(l.startswith("S:") for l in lines))
+                state_lines = [l for l in lines if l.startswith("S:")]
+                assert state_lines, f"expected S: line, got {lines}"
+                payload = json.loads(state_lines[0][2:])
+                assert payload["state"] == "wrapper_connected"
+                assert payload["wrapper_id"] == cache._wrapper_id
+                assert payload["lang"] == "python"
+            finally:
+                stop_fn()
+        finally:
+            cache.stop_invalidation()
+            server.close()
+
+    def test_snapshot_request_returns_response(self):
+        cache = make_cache()
+        cache.put("SELECT 1", None, [(1,)], None)
+        cache.get("SELECT 1", None)
+        server, port = self._spawn_server()
+        try:
+            cache.connect_invalidation(port)
+            conn, lines, stop_fn = _accept_with_buf(server)
+            try:
+                # Wait for wrapper_connected first so we know the socket
+                # is wired.
+                _wait_for(lambda: any(l.startswith("S:") for l in lines))
+                # Send the snapshot request from the "proxy" side.
+                conn.sendall(b"?:snapshot\n")
+                _wait_for(lambda: any(l.startswith("R:") for l in lines))
+                r_lines = [l for l in lines if l.startswith("R:")]
+                assert r_lines, f"expected R: line, got {lines}"
+                payload = json.loads(r_lines[0][2:])
+                assert payload["wrapper_id"] == cache._wrapper_id
+                assert payload["hits"] == 1
+                assert payload["current_size_entries"] == 1
+            finally:
+                stop_fn()
+        finally:
+            cache.stop_invalidation()
+            server.close()
+
+    def test_report_stats_disabled_suppresses_emissions(self):
+        os.environ["GOLDLAPEL_REPORT_STATS"] = "false"
+        try:
+            NativeCache._reset()
+            cache = make_cache()
+        finally:
+            os.environ.pop("GOLDLAPEL_REPORT_STATS", None)
+        assert cache._report_stats is False
+        server, port = self._spawn_server()
+        try:
+            cache.connect_invalidation(port)
+            conn, lines, stop_fn = _accept_with_buf(server)
+            try:
+                # Give it a moment then check no S: was sent.
+                time.sleep(0.2)
+                conn.sendall(b"?:snapshot\n")
+                time.sleep(0.2)
+                state_lines = [l for l in lines if l.startswith("S:") or l.startswith("R:")]
+                assert state_lines == [], f"expected no S/R lines, got {state_lines}"
+            finally:
+                stop_fn()
+        finally:
+            cache.stop_invalidation()
+            server.close()
+
+    def test_unknown_proxy_prefix_silently_ignored(self):
+        # Backwards-compat: the wrapper must not crash when a future
+        # proxy sends an unknown prefix.
+        cache = make_cache()
+        # No exception raised.
+        cache._process_signal("Z:future-prefix")
+        cache._process_signal("$:bogus")
+
+
+# --- L1 telemetry: hit-rate sliding window state changes ---
+
+class TestHitRateStateChange:
+    def test_hit_rate_dropped_fires_below_threshold(self):
+        cache = make_cache()
+        # Mock send_line to capture emissions instead of needing a socket.
+        emissions = []
+        cache._send_line = lambda line: emissions.append(line)
+        # Warmup with mostly misses → hit rate well below LOW threshold.
+        for i in range(_HIT_RATE_WARMUP + 50):
+            cache.get(f"NEVERCACHED-{i}", None)
+        # Hit rate should be 0%; expect a hit_rate_dropped emission.
+        s_lines = [e for e in emissions if e.startswith("S:")]
+        assert any("hit_rate_dropped" in s for s in s_lines), \
+            f"expected hit_rate_dropped, got {s_lines}"
+
+    def test_hit_rate_dropped_only_fires_once_until_recovered(self):
+        cache = make_cache()
+        emissions = []
+        cache._send_line = lambda line: emissions.append(line)
+        for i in range(_HIT_RATE_WARMUP + 50):
+            cache.get(f"NEVERCACHED-{i}", None)
+        first_count = sum(1 for e in emissions if "hit_rate_dropped" in e)
+        # More misses — must NOT re-emit while latched.
+        for i in range(50):
+            cache.get(f"STILL-NOT-CACHED-{i}", None)
+        second_count = sum(1 for e in emissions if "hit_rate_dropped" in e)
+        assert first_count == second_count == 1
+
+
+# --- L1 telemetry: eviction-rate state changes ---
+
+class TestEvictionRateStateChange:
+    def test_cache_full_fires_when_evictions_dominate(self):
+        # Capacity 4 — every put past the 4th evicts. Window = 200 puts.
+        cache = make_cache(max_entries=4)
+        emissions = []
+        cache._send_line = lambda line: emissions.append(line)
+        # Need to fill the window before any state-change can fire.
+        for i in range(_EVICT_RATE_WINDOW + 10):
+            cache.put(f"SELECT {i}", None, [(i,)], None)
+        s_lines = [e for e in emissions if "cache_full" in e]
+        assert s_lines, "expected at least one cache_full emission"
+
+    def test_cache_full_does_not_fire_below_window(self):
+        # With fewer puts than the window, no state-change fires —
+        # warmup gate.
+        cache = make_cache(max_entries=2)
+        emissions = []
+        cache._send_line = lambda line: emissions.append(line)
+        for i in range(_EVICT_RATE_WINDOW - 1):
+            cache.put(f"SELECT {i}", None, [(i,)], None)
+        # No cache_full yet — window not full.
+        assert not any("cache_full" in e for e in emissions)
+
+
+# --- L1 telemetry: process_request ---
+
+class TestProcessRequest:
+    def test_request_snapshot_emits_response(self):
+        cache = make_cache()
+        emissions = []
+        cache._send_line = lambda line: emissions.append(line)
+        cache._process_request("snapshot")
+        r_lines = [e for e in emissions if e.startswith("R:")]
+        assert len(r_lines) == 1
+        payload = json.loads(r_lines[0][2:])
+        assert payload["wrapper_id"] == cache._wrapper_id
+
+    def test_request_empty_body_treated_as_snapshot(self):
+        cache = make_cache()
+        emissions = []
+        cache._send_line = lambda line: emissions.append(line)
+        cache._process_request("")
+        r_lines = [e for e in emissions if e.startswith("R:")]
+        assert len(r_lines) == 1
+
+    def test_request_unknown_body_silently_dropped(self):
+        cache = make_cache()
+        emissions = []
+        cache._send_line = lambda line: emissions.append(line)
+        cache._process_request("future_request_type")
+        r_lines = [e for e in emissions if e.startswith("R:")]
+        assert r_lines == []
