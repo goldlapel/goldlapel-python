@@ -481,3 +481,77 @@ class TestAsyncStartupBanner:
                 assert "goldlapel →" not in captured.err
         finally:
             _reset_proxy_state()
+
+
+class TestAsyncDisableL1:
+    """`disable_l1` is plumbed through the async factory the same way as
+    the sync surface — stored on the underlying GoldLapel and forwarded
+    to wrap() at internal-conn open time."""
+
+    def _base_patches(self):
+        fake_asyncpg = MagicMock()
+        fake_raw = MagicMock()
+        fake_raw.set_type_codec = AsyncMock()
+        fake_raw.close = AsyncMock()
+        fake_asyncpg.connect = AsyncMock(return_value=fake_raw)
+        return fake_asyncpg
+
+    def test_async_disable_l1_defaults_false(self):
+        gl = AsyncGoldLapel("postgresql://localhost:5432/mydb")
+        assert gl._sync._disable_l1 is False
+
+    def test_async_disable_l1_true_stored(self):
+        gl = AsyncGoldLapel("postgresql://localhost:5432/mydb", disable_l1=True)
+        assert gl._sync._disable_l1 is True
+
+    @pytest.mark.asyncio
+    async def test_async_disable_l1_forwarded_to_wrap(self):
+        _reset_proxy_state()
+        try:
+            fake_asyncpg = self._base_patches()
+            wrap_calls = []
+
+            def fake_wrap(c, **kw):
+                wrap_calls.append(kw)
+                return c
+
+            with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
+                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
+                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
+                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
+                 patch("goldlapel.wrap.wrap", side_effect=fake_wrap), \
+                 patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
+                await gl_async.start(
+                    "postgresql://host:5432/mydb",
+                    disable_l1=True,
+                    silent=True,
+                )
+            assert wrap_calls, "wrap() was not called"
+            assert wrap_calls[0].get("disable_l1") is True
+        finally:
+            _reset_proxy_state()
+
+    @pytest.mark.asyncio
+    async def test_async_disable_l1_default_passes_false_to_wrap(self):
+        _reset_proxy_state()
+        try:
+            fake_asyncpg = self._base_patches()
+            wrap_calls = []
+
+            def fake_wrap(c, **kw):
+                wrap_calls.append(kw)
+                return c
+
+            with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
+                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
+                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
+                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
+                 patch("goldlapel.wrap.wrap", side_effect=fake_wrap), \
+                 patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
+                await gl_async.start("postgresql://host:5432/mydb", silent=True)
+            assert wrap_calls, "wrap() was not called"
+            assert wrap_calls[0].get("disable_l1") is False
+        finally:
+            _reset_proxy_state()

@@ -365,6 +365,7 @@ class GoldLapel:
         mesh=False,
         mesh_tag=None,
         enable_l2_for_wrappers=False,
+        disable_l1=False,
     ):
         self._upstream = upstream
         self._proxy_port = proxy_port if proxy_port is not None else DEFAULT_PROXY_PORT
@@ -408,6 +409,15 @@ class GoldLapel:
         # for them (wrappers carry their own L1). Multi-pod fleet customers set
         # this True so L2 acts as a shared cache across pods/restarts.
         self._enable_l2_for_wrappers = bool(enable_l2_for_wrappers)
+        # Explicit L1 disable knob. Default False (L1 active). When True,
+        # the wrapper's NativeCache becomes a no-op pass-through: get()
+        # always returns None, put() is silent. Lets users keep their tuned
+        # cache_size and toggle the layer with a flag instead of zeroing
+        # the size. Counters still tick (misses bump on each get) and the
+        # invalidation socket still connects so the dashboard sees a live
+        # wrapper with "0 hits, N misses" — clear "L1 off" signal vs. a
+        # silent / disconnected wrapper.
+        self._disable_l1 = bool(disable_l1)
 
         # Validate structured-config keys eagerly so a test that constructs
         # without spawning still catches bad keys.
@@ -587,7 +597,11 @@ class GoldLapel:
                 from goldlapel.wrap import wrap
                 # invalidation_port is resolved at construction: either the
                 # explicit kwarg or proxy_port + 2.
-                self._conn = wrap(raw_conn, invalidation_port=self._invalidation_port)
+                self._conn = wrap(
+                    raw_conn,
+                    invalidation_port=self._invalidation_port,
+                    disable_l1=self._disable_l1,
+                )
             except BaseException:
                 # Kill the subprocess we just spawned; leaked running processes = port
                 # collisions on retry + zombie resources. BaseException catches KeyboardInterrupt too.
@@ -784,6 +798,7 @@ def _ensure_running(
     mesh=False,
     mesh_tag=None,
     enable_l2_for_wrappers=False,
+    disable_l1=False,
 ):
     global _cleanup_registered, _next_port
     with _lock:
@@ -815,6 +830,7 @@ def _ensure_running(
             mesh=mesh,
             mesh_tag=mesh_tag,
             enable_l2_for_wrappers=enable_l2_for_wrappers,
+            disable_l1=disable_l1,
         )
         _instances[upstream] = inst
         if not _cleanup_registered:
@@ -875,6 +891,7 @@ def start(
     mesh=False,
     mesh_tag=None,
     enable_l2_for_wrappers=False,
+    disable_l1=False,
 ):
     """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
     GoldLapel instance. Call wrapper methods on the returned instance
@@ -907,6 +924,11 @@ def start(
         wrapper-tagged connections. Default False — the proxy auto-skips L2 for
         wrappers since they carry their own L1. Multi-pod fleet customers turn
         this on so L2 acts as a shared cache across pods/restarts.
+    - disable_l1: turn off the wrapper's L1 cache without changing its
+        configured size. Default False. When True, get() always returns
+        None (cache miss), put() is a silent no-op, and the invalidation
+        socket still connects so the dashboard sees a live wrapper with
+        "0 hits, N misses" — clear "L1 off" signal.
 
     Promoted top-level concepts are rejected inside the `config` dict.
 
@@ -943,6 +965,7 @@ def start(
         mesh=mesh,
         mesh_tag=mesh_tag,
         enable_l2_for_wrappers=enable_l2_for_wrappers,
+        disable_l1=disable_l1,
     )
     return inst
 
@@ -967,7 +990,11 @@ def connect(upstream=None):
     else:
         conn = driver.connect(inst.url)
     from goldlapel.wrap import wrap
-    return wrap(conn, invalidation_port=inst.invalidation_port)
+    return wrap(
+        conn,
+        invalidation_port=inst.invalidation_port,
+        disable_l1=inst._disable_l1,
+    )
 
 
 def stop(upstream=None):

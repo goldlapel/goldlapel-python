@@ -61,6 +61,39 @@ class TestWrap:
             wrapped = wrap(conn, invalidation_port=9999)
         assert isinstance(wrapped, AsyncCachedConnection)
 
+    def test_disable_l1_propagates_to_native_cache_first_construction(self):
+        conn = MagicMock()
+        delattr(conn, "fetch")
+        delattr(conn, "fetchrow")
+        # Cache fixture wipes _cache to None, so this exercises the
+        # first-construction branch.
+        wrap(conn, invalidation_port=9999, disable_l1=True)
+        from goldlapel.cache import NativeCache as _NC
+        assert _NC._instance is not None
+        assert _NC._instance._disabled is True
+
+    def test_disable_l1_propagates_to_native_cache_subsequent_construction(self):
+        conn = MagicMock()
+        delattr(conn, "fetch")
+        delattr(conn, "fetchrow")
+        # First wrap with default — disabled False.
+        wrap(conn, invalidation_port=9999)
+        from goldlapel.cache import NativeCache as _NC
+        assert _NC._instance._disabled is False
+        # Second wrap with disable_l1=True flips the flag on the existing
+        # singleton. (wrap() short-circuits the singleton construction
+        # but still re-passes the kwarg through NativeCache.__init__.)
+        wrap(conn, invalidation_port=9999, disable_l1=True)
+        assert _NC._instance._disabled is True
+
+    def test_disable_l1_default_false(self):
+        conn = MagicMock()
+        delattr(conn, "fetch")
+        delattr(conn, "fetchrow")
+        wrap(conn, invalidation_port=9999)
+        from goldlapel.cache import NativeCache as _NC
+        assert _NC._instance._disabled is False
+
 
 # --- CachedConnection ---
 

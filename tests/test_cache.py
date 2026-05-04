@@ -695,3 +695,110 @@ class TestProcessRequest:
         cache._process_request("future_request_type")
         r_lines = [e for e in emissions if e.startswith("R:")]
         assert r_lines == []
+
+
+# --- L1 explicit-disable knob (`disable_l1`) ---
+
+class TestDisableL1:
+    """`disable_l1=True` makes NativeCache a no-op pass-through: get()
+    always returns None, put() is silent. Counters still tick so the
+    dashboard sees a connected wrapper with "0 hits, N misses" — clear
+    "L1 off" signal — and the snapshot carries `l1_disabled: true`."""
+
+    def test_disabled_default_false(self):
+        cache = make_cache()
+        assert cache._disabled is False
+
+    def test_disabled_get_returns_none_and_bumps_misses(self):
+        # Seed the cache before flipping the flag — proves the disabled
+        # get() path doesn't peek at stored entries.
+        cache = make_cache()
+        cache.put("SELECT 1", None, [(1,)], None)
+        # Sanity: hit works pre-flip.
+        assert cache.get("SELECT 1", None) is not None
+        cache.stats_hits = 0
+        cache.stats_misses = 0
+        # Flip and re-query.
+        cache._disabled = True
+        assert cache.get("SELECT 1", None) is None
+        assert cache.get("SELECT NEW", None) is None
+        assert cache.stats_hits == 0
+        assert cache.stats_misses == 2
+
+    def test_disabled_put_is_no_op(self):
+        cache = make_cache()
+        cache._disabled = True
+        cache.put("SELECT 1", None, [(1,)], None)
+        # Nothing stored — re-flipping the flag and re-getting still
+        # misses (no entry was ever inserted).
+        assert len(cache._cache) == 0
+        cache._disabled = False
+        assert cache.get("SELECT 1", None) is None
+
+    def test_disabled_put_does_not_evict(self):
+        # With disable_l1 on we never store — so we never evict either.
+        # stats_evictions stays 0, which the dashboard reads as
+        # "no churn" (true: there's nothing to churn).
+        cache = make_cache(max_entries=2)
+        cache._disabled = True
+        for i in range(50):
+            cache.put(f"SELECT {i}", None, [(i,)], None)
+        assert cache.stats_evictions == 0
+        assert len(cache._cache) == 0
+
+    def test_disabled_unhashable_params_still_count_as_miss(self):
+        # In the normal path, unhashable params return None without
+        # bumping misses (we never reached the cache lookup). In the
+        # disabled path, we want every get() call to count as a miss
+        # so the dashboard's "wrapper alive, querying" signal is
+        # accurate regardless of param shape.
+        cache = make_cache()
+        cache._disabled = True
+        cache.get("SELECT $1", [{"unhashable": [1, 2]}])
+        assert cache.stats_misses == 1
+
+    def test_disabled_invalidate_table_still_works(self):
+        # Even with disable_l1 on, invalidate_table is a no-op in
+        # practice (cache is empty) — but should not crash if the
+        # proxy sends an `I:<table>` signal. Counter does not bump
+        # because no keys were affected.
+        cache = make_cache()
+        cache._disabled = True
+        cache.invalidate_table("orders")
+        assert cache.stats_invalidations == 0
+
+    def test_snapshot_includes_l1_disabled_true(self):
+        cache = make_cache()
+        cache._disabled = True
+        snap = cache._build_snapshot()
+        assert snap["l1_disabled"] is True
+
+    def test_snapshot_includes_l1_disabled_false(self):
+        cache = make_cache()
+        snap = cache._build_snapshot()
+        assert snap["l1_disabled"] is False
+
+    def test_disabled_snapshot_counters_reflect_misses_only(self):
+        cache = make_cache()
+        cache._disabled = True
+        for i in range(5):
+            cache.get(f"SELECT {i}", None)
+        for i in range(3):
+            cache.put(f"SELECT {i}", None, [(i,)], None)
+        snap = cache._build_snapshot()
+        assert snap["hits"] == 0
+        assert snap["misses"] == 5
+        assert snap["evictions"] == 0
+        assert snap["current_size_entries"] == 0
+        assert snap["l1_disabled"] is True
+
+    def test_construct_with_disabled_kwarg(self):
+        # Singleton: first construction wins on most state, but `disabled`
+        # is intentionally late-binding so wrap() can flip it.
+        cache = NativeCache(disabled=True)
+        cache._invalidation_connected = True
+        assert cache._disabled is True
+        # Re-constructing with disabled=False should flip the flag back.
+        cache2 = NativeCache(disabled=False)
+        assert cache2 is cache  # singleton
+        assert cache._disabled is False

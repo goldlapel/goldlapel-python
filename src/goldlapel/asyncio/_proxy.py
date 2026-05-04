@@ -112,6 +112,7 @@ class AsyncGoldLapel:
         mesh=False,
         mesh_tag=None,
         enable_l2_for_wrappers=False,
+        disable_l1=False,
     ):
         # Piggyback on the sync GoldLapel for subprocess/lifecycle state so
         # `using(conn)` / ContextVar semantics and stop-on-exit are identical.
@@ -132,6 +133,7 @@ class AsyncGoldLapel:
             mesh=mesh,
             mesh_tag=mesh_tag,
             enable_l2_for_wrappers=enable_l2_for_wrappers,
+            disable_l1=disable_l1,
         )
         self._conn = None  # AsyncCachedConnection (wraps asyncpg.Connection)
 
@@ -281,7 +283,11 @@ class AsyncGoldLapel:
             from goldlapel.wrap import wrap
             # invalidation_port is resolved at construction: either the
             # explicit kwarg or proxy_port + 2.
-            self._conn = wrap(raw, invalidation_port=self._sync._invalidation_port)
+            self._conn = wrap(
+                raw,
+                invalidation_port=self._sync._invalidation_port,
+                disable_l1=self._sync._disable_l1,
+            )
         except BaseException:
             # Kill subprocess + close any half-open asyncpg conn before raising.
             await self._teardown_async()
@@ -546,7 +552,11 @@ async def _actual_start(upstream, **kwargs):
             raw = await _open_asyncpg_conn(inst._sync._proxy_url)
             from goldlapel.wrap import wrap
             # invalidation_port is resolved at sync construction.
-            inst._conn = wrap(raw, invalidation_port=inst._sync._invalidation_port)
+            inst._conn = wrap(
+                raw,
+                invalidation_port=inst._sync._invalidation_port,
+                disable_l1=inst._sync._disable_l1,
+            )
         return inst
     except Exception:
         if need_spawn:
@@ -618,6 +628,7 @@ def start(
     mesh=False,
     mesh_tag=None,
     enable_l2_for_wrappers=False,
+    disable_l1=False,
 ):
     """Factory: spawn a Gold Lapel proxy and return an AsyncGoldLapel instance.
 
@@ -656,4 +667,5 @@ def start(
         mesh=mesh,
         mesh_tag=mesh_tag,
         enable_l2_for_wrappers=enable_l2_for_wrappers,
+        disable_l1=disable_l1,
     )

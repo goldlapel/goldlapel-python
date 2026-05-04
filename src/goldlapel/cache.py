@@ -150,20 +150,35 @@ class NativeCache:
     _instance = None
     _instance_lock = threading.Lock()
 
-    def __new__(cls):
+    def __new__(cls, *args, **kwargs):
+        # Accept (and discard) ctor args so the singleton constructor
+        # signature stays in sync with __init__. Real handling lives in
+        # __init__ — __new__ exists only to enforce the singleton.
         with cls._instance_lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
                 cls._instance._initialized = False
             return cls._instance
 
-    def __init__(self):
+    def __init__(self, *, disabled=False):
         if self._initialized:
+            # Singleton already constructed — propagate `disabled` so a
+            # later wrap() can flip the flag (e.g. a second start() in
+            # the same process). The cache is process-wide; most-recent
+            # caller wins.
+            self._disabled = bool(disabled)
             return
         self._cache = OrderedDict()
         self._table_index = {}
         self._max_entries = int(os.environ.get("GOLDLAPEL_NATIVE_CACHE_SIZE", "32768"))
         self._enabled = os.environ.get("GOLDLAPEL_NATIVE_CACHE", "true").lower() != "false"
+        # Explicit L1 disable: get() always misses, put() is a no-op.
+        # Distinct from _enabled (env-var on/off) and _invalidation_connected
+        # (transport state). When disabled, counters still tick so the
+        # dashboard sees "wrapper connected, 0 hits, N misses" — a clear
+        # signal that L1 is intentionally off rather than the wrapper
+        # being silent.
+        self._disabled = bool(disabled)
         self._lock = threading.Lock()
         self._invalidation_connected = False
         self._invalidation_thread = None
@@ -209,6 +224,15 @@ class NativeCache:
     def get(self, sql, params):
         if not self._enabled or not self._invalidation_connected:
             return None
+        # Disabled mode: always miss, but still tick the counter so the
+        # dashboard sees "wrapper alive, 0 hits, N misses" — i.e. L1 is
+        # explicitly off, not silent. Skip key computation entirely (no
+        # point) — even unhashable params bump the miss counter, which
+        # is the desired signal: we attempted a get, the cache said no.
+        if self._disabled:
+            with self._lock:
+                self.stats_misses += 1
+            return None
         try:
             key = _make_key(sql, params)
             hash(key)
@@ -225,6 +249,11 @@ class NativeCache:
 
     def put(self, sql, params, rows, description):
         if not self._enabled or not self._invalidation_connected:
+            return
+        # Disabled mode: silent no-op. We never store, so eviction can't
+        # fire, so stats_evictions stays at 0 — another clear "L1 off"
+        # signal in the dashboard snapshot.
+        if self._disabled:
             return
         try:
             key = _make_key(sql, params)
@@ -399,7 +428,7 @@ class NativeCache:
         deltas across ticks; we just expose the raw counters.
         """
         with self._lock:
-            return {
+            snap = {
                 "wrapper_id": self._wrapper_id,
                 "lang": self._wrapper_lang,
                 "version": self._wrapper_version,
@@ -410,6 +439,11 @@ class NativeCache:
                 "current_size_entries": len(self._cache),
                 "capacity_entries": self._max_entries,
             }
+            # `l1_disabled` is a forward-compat field for the dashboard.
+            # Always emit so consumers can rely on its presence — Manor
+            # display is free to ignore it today.
+            snap["l1_disabled"] = self._disabled
+            return snap
 
     def _send_line(self, line):
         """Serialize a line write under `_send_lock`. Best-effort —

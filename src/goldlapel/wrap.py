@@ -32,10 +32,14 @@ def _detect_invalidation_port():
         return 7934
 
 
-def wrap(conn, invalidation_port=None):
+def wrap(conn, invalidation_port=None, disable_l1=False):
     global _cache, _atexit_registered
-    if _cache is None:
-        _cache = NativeCache()
+    # Pass `disable_l1` through on every wrap() call. NativeCache is a
+    # singleton; on first construction it stores the flag, and on every
+    # later call (a second start(), or this same start() opening a new
+    # conn) the __init__ short-circuit re-binds `_disabled` so the most
+    # recent caller's intent wins.
+    _cache = NativeCache(disabled=disable_l1)
     if invalidation_port is None:
         invalidation_port = _detect_invalidation_port()
     if not _cache._invalidation_thread or not _cache._invalidation_thread.is_alive():
