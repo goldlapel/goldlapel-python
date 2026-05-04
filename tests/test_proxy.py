@@ -984,3 +984,71 @@ class TestMeshKwargs:
         cmd = call_args[0]
         assert "--mesh" in cmd
         assert "--mesh-tag" not in cmd
+
+
+class TestEnableL2ForWrappersKwarg:
+    """`enable_l2_for_wrappers` overrides the proxy's per-connection L2 wrapper
+    skip. Default False — proxy auto-skips L2 for wrapper-tagged conns.
+    Multi-pod fleet customers set True so L2 is a shared cross-pod cache.
+    """
+
+    def setup_method(self):
+        _reset_module_state()
+
+    def teardown_method(self):
+        _reset_module_state()
+
+    def test_enable_l2_for_wrappers_defaults_false(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert gl._enable_l2_for_wrappers is False
+
+    def test_enable_l2_for_wrappers_true_stored(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", enable_l2_for_wrappers=True)
+        assert gl._enable_l2_for_wrappers is True
+
+    def test_enable_l2_for_wrappers_in_config_map_rejected(self):
+        # Regression guard: enable_l2_for_wrappers is a top-level kwarg, not a config key.
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"enable_l2_for_wrappers": True})
+
+    def test_enable_l2_for_wrappers_not_in_config_keys(self):
+        keys = config_keys()
+        assert "enable_l2_for_wrappers" not in keys
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_enable_l2_for_wrappers_flag_forwarded_to_binary(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start(
+            "postgresql://host:5432/mydb",
+            enable_l2_for_wrappers=True,
+            silent=True,
+        )
+
+        call_args, _ = mock_popen.call_args
+        cmd = call_args[0]
+        assert "--enable-l2-for-wrappers" in cmd, (
+            f"--enable-l2-for-wrappers missing from argv: {cmd}"
+        )
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_enable_l2_for_wrappers_default_no_flag(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", silent=True)
+
+        call_args, _ = mock_popen.call_args
+        cmd = call_args[0]
+        assert "--enable-l2-for-wrappers" not in cmd

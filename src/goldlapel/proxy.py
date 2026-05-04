@@ -364,6 +364,7 @@ class GoldLapel:
         silent=False,
         mesh=False,
         mesh_tag=None,
+        enable_l2_for_wrappers=False,
     ):
         self._upstream = upstream
         self._proxy_port = proxy_port if proxy_port is not None else DEFAULT_PROXY_PORT
@@ -402,6 +403,11 @@ class GoldLapel:
         # Mesh membership (startup intent — HQ enforces license).
         self._mesh = bool(mesh)
         self._mesh_tag = mesh_tag if mesh_tag else None
+        # Override the proxy's per-connection wrapper-skip on L2. Default False
+        # — the proxy auto-detects wrappers via application_name and skips L2
+        # for them (wrappers carry their own L1). Multi-pod fleet customers set
+        # this True so L2 acts as a shared cache across pods/restarts.
+        self._enable_l2_for_wrappers = bool(enable_l2_for_wrappers)
 
         # Validate structured-config keys eagerly so a test that constructs
         # without spawning still catches bad keys.
@@ -514,6 +520,8 @@ class GoldLapel:
             cmd.append("--mesh")
         if self._mesh_tag is not None:
             cmd += ["--mesh-tag", self._mesh_tag]
+        if self._enable_l2_for_wrappers:
+            cmd.append("--enable-l2-for-wrappers")
         cmd += _config_to_args(self._config) + self._extra_args
 
         _kill_orphan_on_port(self._proxy_port)
@@ -775,6 +783,7 @@ def _ensure_running(
     silent=False,
     mesh=False,
     mesh_tag=None,
+    enable_l2_for_wrappers=False,
 ):
     global _cleanup_registered, _next_port
     with _lock:
@@ -805,6 +814,7 @@ def _ensure_running(
             silent=silent,
             mesh=mesh,
             mesh_tag=mesh_tag,
+            enable_l2_for_wrappers=enable_l2_for_wrappers,
         )
         _instances[upstream] = inst
         if not _cleanup_registered:
@@ -864,6 +874,7 @@ def start(
     silent=False,
     mesh=False,
     mesh_tag=None,
+    enable_l2_for_wrappers=False,
 ):
     """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
     GoldLapel instance. Call wrapper methods on the returned instance
@@ -892,6 +903,10 @@ def start(
     - silent: suppress the startup banner
     - mesh: opt into the mesh at startup (HQ enforces license; denial is non-fatal)
     - mesh_tag: optional tag — instances sharing a tag cluster together
+    - enable_l2_for_wrappers: force the proxy to keep L2 (result cache) on for
+        wrapper-tagged connections. Default False — the proxy auto-skips L2 for
+        wrappers since they carry their own L1. Multi-pod fleet customers turn
+        this on so L2 acts as a shared cache across pods/restarts.
 
     Promoted top-level concepts are rejected inside the `config` dict.
 
@@ -927,6 +942,7 @@ def start(
         silent=silent,
         mesh=mesh,
         mesh_tag=mesh_tag,
+        enable_l2_for_wrappers=enable_l2_for_wrappers,
     )
     return inst
 

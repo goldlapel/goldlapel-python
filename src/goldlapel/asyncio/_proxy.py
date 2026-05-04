@@ -111,6 +111,7 @@ class AsyncGoldLapel:
         silent=False,
         mesh=False,
         mesh_tag=None,
+        enable_l2_for_wrappers=False,
     ):
         # Piggyback on the sync GoldLapel for subprocess/lifecycle state so
         # `using(conn)` / ContextVar semantics and stop-on-exit are identical.
@@ -130,6 +131,7 @@ class AsyncGoldLapel:
             silent=silent,
             mesh=mesh,
             mesh_tag=mesh_tag,
+            enable_l2_for_wrappers=enable_l2_for_wrappers,
         )
         self._conn = None  # AsyncCachedConnection (wraps asyncpg.Connection)
 
@@ -223,6 +225,8 @@ class AsyncGoldLapel:
                 cmd.append("--mesh")
             if sync._mesh_tag is not None:
                 cmd += ["--mesh-tag", sync._mesh_tag]
+            if sync._enable_l2_for_wrappers:
+                cmd.append("--enable-l2-for-wrappers")
             cmd += _config_to_args(sync._config) + sync._extra_args
 
             _kill_orphan_on_port(sync._proxy_port)
@@ -613,6 +617,7 @@ def start(
     silent=False,
     mesh=False,
     mesh_tag=None,
+    enable_l2_for_wrappers=False,
 ):
     """Factory: spawn a Gold Lapel proxy and return an AsyncGoldLapel instance.
 
@@ -650,4 +655,5 @@ def start(
         silent=silent,
         mesh=mesh,
         mesh_tag=mesh_tag,
+        enable_l2_for_wrappers=enable_l2_for_wrappers,
     )
