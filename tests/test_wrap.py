@@ -792,3 +792,91 @@ class TestAsyncMultiStatementWriteDetection:
         )
         assert cache.get("SELECT * FROM orders", None) is None
         assert cache.get("SELECT * FROM users", None) is None
+
+
+# --- SET / RESET responses are not cached (Bug fix 2026-05-04) ---
+
+
+class TestSetResponseNotCached:
+    """psycopg's sync path sets `cursor.description = None` on SET / RESET
+    statements, so the existing `if self._real.description is not None`
+    guard already skips the put. Confirm that empirically — the test
+    documents the contract so a future refactor that gates on something
+    else (e.g. `command in {SET, RESET}`) doesn't regress.
+    """
+
+    def test_set_response_not_cached(self):
+        # description=None mirrors psycopg's SET behaviour. With the
+        # existing `if self._real.description is not None` guard the
+        # wrapper must not call cache.put.
+        conn, cursor = mock_conn(description=None)
+        cache = make_connected_cache()
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        # Pick a SET that doesn't change the GUC state hash, so we don't
+        # also have to reason about state_hash.
+        before = cache.stats_invalidations
+        cc.execute("SET timezone = 'UTC'")
+        # No cache entry under any state hash.
+        assert cache.get("SET timezone = 'UTC'", None) is None
+        # Sanity: the SET went down the read path (cache miss + put-skip),
+        # not the write path — no invalidations fired.
+        assert cache.stats_invalidations == before
+
+    def test_reset_response_not_cached(self):
+        conn, cursor = mock_conn(description=None)
+        cache = make_connected_cache()
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("RESET timezone")
+        assert cache.get("RESET timezone", None) is None
+
+
+class TestAsyncSetResponseNotCached:
+    """asyncpg's `fetch` returns `[]` on a SET (it doesn't surface a
+    description / command tag the way psycopg does), so the old code
+    path would happily cache a useless empty entry. The fix gates on
+    `if rows:` — empty result sets are skipped.
+    """
+
+    @pytest.mark.asyncio
+    async def test_async_fetch_empty_result_not_cached(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        seen_puts = []
+        original_put = NativeCache.put
+
+        def spy_put(self, sql, params, rows, description, state_hash=0):
+            seen_puts.append(sql)
+            return original_put(self, sql, params, rows, description, state_hash)
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                return []  # SET / RESET / LISTEN all look like this
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+
+        with patch.object(NativeCache, "put", spy_put):
+            await a.fetch("SET timezone = 'UTC'")
+            await a.fetch("RESET timezone")
+            await a.fetch("LISTEN channel")
+
+        assert seen_puts == [], (
+            f"Empty fetch results must not be cached; saw puts for {seen_puts}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_fetch_non_empty_result_still_cached(self):
+        # Sanity: the empty-rows guard only short-circuits empty results.
+        # Real SELECT rows still land in the cache.
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                return [("alice",)]
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.fetch("SELECT name FROM accounts")
+        assert cache.get("SELECT name FROM accounts", None) is not None

@@ -301,7 +301,14 @@ class AsyncCachedConnection:
             return entry.rows
 
         rows = await self._real.fetch(sql, *args)
-        self._cache.put(sql, params, list(rows), None, state_hash)
+        # Skip caching empty result sets — most often these are session-state
+        # commands like `SET` / `RESET` / `LISTEN` routed through `fetch()`,
+        # which return `[]` and would otherwise pollute the cache without
+        # ever serving a real row. (psycopg's sync path already filters via
+        # `description is not None`; asyncpg has no equivalent — `fetch`
+        # always returns a list — so we gate on emptiness instead.)
+        if rows:
+            self._cache.put(sql, params, list(rows), None, state_hash)
         return rows
 
     async def fetchrow(self, sql, *args):
