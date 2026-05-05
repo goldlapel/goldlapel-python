@@ -11,6 +11,7 @@ from goldlapel.cache import (
     CacheEntry,
     ConnectionGucState,
     _detect_write,
+    _detect_writes_multi,
     _extract_tables,
     _make_key,
     _DDL_SENTINEL,
@@ -145,6 +146,62 @@ class TestDetectWrite:
 
     def test_copy_with_columns(self):
         assert _detect_write("COPY orders(id, name) FROM '/tmp/data.csv'") == "orders"
+
+
+# --- Multi-statement write detection ---
+
+class TestDetectWritesMulti:
+    """Single-statement bodies short-circuit to `_detect_write`'s shape;
+    multi-statement bodies split and union per-segment results."""
+
+    def test_single_select_returns_none(self):
+        assert _detect_writes_multi("SELECT * FROM orders") is None
+
+    def test_single_insert_returns_set(self):
+        assert _detect_writes_multi("INSERT INTO orders VALUES (1)") == {"orders"}
+
+    def test_single_ddl_returns_sentinel(self):
+        assert _detect_writes_multi("CREATE TABLE foo (id int)") is _DDL_SENTINEL
+
+    def test_set_then_insert_unions(self):
+        # The original bug: `SET ...; INSERT ...` looked like a SET to
+        # `_detect_write` and was misclassified as a read.
+        result = _detect_writes_multi(
+            "SET app.user_id = '42'; INSERT INTO orders VALUES (1)"
+        )
+        assert result == {"orders"}
+
+    def test_two_writes_two_tables(self):
+        result = _detect_writes_multi(
+            "INSERT INTO orders VALUES (1); UPDATE users SET v = 1"
+        )
+        assert result == {"orders", "users"}
+
+    def test_ddl_anywhere_short_circuits_to_sentinel(self):
+        # DDL as a later segment still trips global invalidation.
+        assert _detect_writes_multi(
+            "INSERT INTO orders VALUES (1); CREATE TABLE foo (id int)"
+        ) is _DDL_SENTINEL
+
+    def test_two_selects_returns_none(self):
+        assert _detect_writes_multi("SELECT 1; SELECT 2") is None
+
+    def test_set_then_select_returns_none(self):
+        # `SET ...; SELECT ...` — the SET observation runs separately
+        # (via `observe_sql`), and there's no actual write here.
+        assert _detect_writes_multi("SET app.user_id = '42'; SELECT 1") is None
+
+    def test_empty_returns_none(self):
+        assert _detect_writes_multi("") is None
+
+    def test_quoted_semicolon_does_not_split(self):
+        # A `;` inside a string literal must not be treated as a statement
+        # boundary — single-token detection still sees the INSERT.
+        assert _detect_writes_multi("INSERT INTO orders VALUES ('a;b')") == {"orders"}
+
+    def test_trailing_semicolon_treated_as_single_statement(self):
+        # Matches the `observe_sql` fast-path heuristic.
+        assert _detect_writes_multi("INSERT INTO orders VALUES (1);") == {"orders"}
 
 
 # --- Table extraction ---

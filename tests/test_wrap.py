@@ -630,3 +630,165 @@ class TestAsyncStateHashWiring:
             sql == "SELECT name FROM accounts" and state_hash != 0
             for sql, _params, state_hash in seen_puts
         ), f"Expected non-zero state_hash on fetch put, saw {seen_puts}"
+
+
+# --- Multi-statement write detection (Bug fix 2026-05-04) ---
+
+
+class TestMultiStatementWriteDetection:
+    """A single Q message can carry multiple statements separated by `;`.
+    `_detect_write` looks at the first token only, so `SET ...; INSERT ...`
+    used to slip past the write path and leak a stale cache entry. The
+    multi-statement detector splits the body and unions per-segment results.
+    """
+
+    def test_set_then_insert_invalidates_table(self):
+        # `SET ...; INSERT INTO orders ...` — first token is SET, but the
+        # INSERT must still trigger invalidation of `orders`.
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("SET app.user_id = '42'; INSERT INTO orders VALUES (1)")
+        assert cache.get("SELECT * FROM orders", None) is None
+
+    def test_set_then_insert_delegates_to_real_cursor(self):
+        # The whole multi-statement body goes through to the real cursor —
+        # the wrapper neither short-circuits nor splits the wire message.
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        sql = "SET app.user_id = '42'; INSERT INTO orders VALUES (1)"
+        cc.execute(sql)
+        cursor.execute.assert_called_once_with(sql, None)
+
+    def test_set_then_ddl_invalidates_all(self):
+        # Any DDL anywhere in the multi-statement body trips the global
+        # invalidation, even if other statements only touch known tables.
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        cache.put("SELECT * FROM users", None, [(2,)], None)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("SET app.user_id = '42'; CREATE TABLE foo (id int)")
+        assert cache.get("SELECT * FROM orders", None) is None
+        assert cache.get("SELECT * FROM users", None) is None
+
+    def test_multiple_writes_invalidate_all_tables(self):
+        # Two writes, two distinct tables → both invalidated, none missed.
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        cache.put("SELECT * FROM users", None, [(2,)], None)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("INSERT INTO orders VALUES (1); UPDATE users SET v = 1")
+        assert cache.get("SELECT * FROM orders", None) is None
+        assert cache.get("SELECT * FROM users", None) is None
+
+    def test_select_only_multi_statement_not_a_write(self):
+        # Two SELECTs separated by `;` — neither is a write, so the read
+        # path is taken (we still go through the cache path, not the
+        # write-invalidation path).
+        conn, cursor = mock_conn(
+            description=(("v",),),
+            fetchall_result=[(1,)],
+        )
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("SELECT 1; SELECT 2")
+        # No invalidation happened; the pre-existing entry survives.
+        assert cache.get("SELECT * FROM orders", None) is not None
+
+    def test_write_with_semicolons_in_string_literal(self):
+        # The splitter respects quoted literals — a `;` inside a string
+        # must not look like a statement terminator.
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("INSERT INTO orders VALUES ('a;b;c')")
+        assert cache.get("SELECT * FROM orders", None) is None
+
+    def test_executemany_multi_statement_write(self):
+        # `executemany` shares the same multi-statement detection path.
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.executemany(
+            "SET app.user_id = '42'; INSERT INTO orders VALUES (%s)",
+            [(1,), (2,)],
+        )
+        assert cache.get("SELECT * FROM orders", None) is None
+
+
+class TestAsyncMultiStatementWriteDetection:
+    @pytest.mark.asyncio
+    async def test_async_fetch_set_then_insert_invalidates(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                return []
+
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.fetch("SET app.user_id = '42'; INSERT INTO orders VALUES (1)")
+        assert cache.get("SELECT * FROM orders", None) is None
+
+    @pytest.mark.asyncio
+    async def test_async_execute_set_then_insert_invalidates(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                return "INSERT 0 1"
+
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.execute("SET app.user_id = '42'; INSERT INTO orders VALUES (1)")
+        assert cache.get("SELECT * FROM orders", None) is None
+
+    @pytest.mark.asyncio
+    async def test_async_fetchrow_set_then_ddl_invalidates_all(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def fetchrow(self, sql, *args):
+                return None
+
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        cache.put("SELECT * FROM users", None, [(2,)], None)
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.fetchrow("SET app.user_id = '42'; CREATE TABLE foo (id int)")
+        assert cache.get("SELECT * FROM orders", None) is None
+        assert cache.get("SELECT * FROM users", None) is None
+
+    @pytest.mark.asyncio
+    async def test_async_fetchval_multi_writes(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def fetchval(self, sql, *args, column=0):
+                return None
+
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        cache.put("SELECT * FROM users", None, [(2,)], None)
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.fetchval(
+            "INSERT INTO orders VALUES (1); UPDATE users SET v = 1"
+        )
+        assert cache.get("SELECT * FROM orders", None) is None
+        assert cache.get("SELECT * FROM users", None) is None

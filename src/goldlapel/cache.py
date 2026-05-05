@@ -392,6 +392,43 @@ def _make_key(sql, params, state_hash=0):
     return (sql, params_part, state_hash)
 
 
+def _detect_writes_multi(sql):
+    """Detect writes in a (potentially multi-statement) SQL body.
+
+    Returns one of:
+    - `_DDL_SENTINEL` — at least one segment is a DDL/CTE-write/SELECT INTO,
+      so the caller must invalidate the entire cache.
+    - a non-empty `set` of bare table names — every segment is a recognised
+      write against a known table; caller invalidates each.
+    - `None` — no writes detected; caller proceeds on the read path.
+
+    A single Q message like `SET app.user_id='42'; INSERT INTO orders ...`
+    looks like a SET to `_detect_write` (single-token first match) but
+    contains a real write. Splitting and unioning per-segment results
+    closes that gap.
+    """
+    # Fast path: no `;` → single statement, skip the splitter allocation.
+    trimmed = sql.rstrip()
+    if trimmed.endswith(";"):
+        trimmed = trimmed[:-1]
+    if ";" not in trimmed:
+        t = _detect_write(sql)
+        if t is None:
+            return None
+        if t == _DDL_SENTINEL:
+            return _DDL_SENTINEL
+        return {t}
+
+    tables = set()
+    for seg in split_statements(sql):
+        t = _detect_write(seg)
+        if t == _DDL_SENTINEL:
+            return _DDL_SENTINEL
+        if t is not None:
+            tables.add(t)
+    return tables if tables else None
+
+
 def _detect_write(sql):
     trimmed = sql.strip()
     tokens = trimmed.split()

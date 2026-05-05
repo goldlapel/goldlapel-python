@@ -3,7 +3,7 @@ import atexit
 from goldlapel.cache import (
     NativeCache,
     ConnectionGucState,
-    _detect_write,
+    _detect_writes_multi,
     _DDL_SENTINEL,
     _TX_START,
     _TX_END,
@@ -11,6 +11,24 @@ from goldlapel.cache import (
 
 _cache = None
 _atexit_registered = False
+
+
+def _apply_write_invalidation(cache, write_result):
+    """Invalidate cache entries based on `_detect_writes_multi` output.
+
+    Returns True if any invalidation happened (i.e. the SQL was a write
+    body and the caller should skip the read path). False means no
+    writes were detected.
+    """
+    if write_result is None:
+        return False
+    if write_result is _DDL_SENTINEL:
+        cache.invalidate_all()
+        return True
+    # Non-empty set of bare table names.
+    for table in write_result:
+        cache.invalidate_table(table)
+    return True
 
 
 def _shutdown_cache():
@@ -135,13 +153,11 @@ class CachedCursor:
                 object.__setattr__(self._conn, "_in_transaction", False)
             return self._real.execute(sql, params)
 
-        # Write detection + self-invalidation (always, even in transactions)
-        write_table = _detect_write(sql)
-        if write_table:
-            if write_table == _DDL_SENTINEL:
-                self._cache.invalidate_all()
-            else:
-                self._cache.invalidate_table(write_table)
+        # Write detection + self-invalidation (always, even in transactions).
+        # Use the multi-statement-aware detector so a single Q message like
+        # `SET app.user_id='42'; INSERT INTO orders VALUES (1)` invalidates
+        # `orders` even though the first token is `SET`.
+        if _apply_write_invalidation(self._cache, _detect_writes_multi(sql)):
             return self._real.execute(sql, params)
 
         # Inside transaction: bypass cache for reads
@@ -225,12 +241,7 @@ class CachedCursor:
         # but cheap to track and avoids stale cache slots if they do).
         if self._conn is not None:
             self._conn._guc_state.observe_sql(sql)
-        write_table = _detect_write(sql)
-        if write_table:
-            if write_table == _DDL_SENTINEL:
-                self._cache.invalidate_all()
-            else:
-                self._cache.invalidate_table(write_table)
+        _apply_write_invalidation(self._cache, _detect_writes_multi(sql))
         return self._real.executemany(sql, params_list)
 
     def callproc(self, procname, params=None):
@@ -278,12 +289,7 @@ class AsyncCachedConnection:
     async def fetch(self, sql, *args):
         self._guc_state.observe_sql(sql)
         state_hash = self._guc_state.hash
-        write_table = _detect_write(sql)
-        if write_table:
-            if write_table == _DDL_SENTINEL:
-                self._cache.invalidate_all()
-            else:
-                self._cache.invalidate_table(write_table)
+        if _apply_write_invalidation(self._cache, _detect_writes_multi(sql)):
             return await self._real.fetch(sql, *args)
 
         if self._in_transaction:
@@ -301,12 +307,7 @@ class AsyncCachedConnection:
     async def fetchrow(self, sql, *args):
         self._guc_state.observe_sql(sql)
         state_hash = self._guc_state.hash
-        write_table = _detect_write(sql)
-        if write_table:
-            if write_table == _DDL_SENTINEL:
-                self._cache.invalidate_all()
-            else:
-                self._cache.invalidate_table(write_table)
+        if _apply_write_invalidation(self._cache, _detect_writes_multi(sql)):
             return await self._real.fetchrow(sql, *args)
 
         if self._in_transaction:
@@ -325,12 +326,7 @@ class AsyncCachedConnection:
     async def fetchval(self, sql, *args, column=0):
         self._guc_state.observe_sql(sql)
         state_hash = self._guc_state.hash
-        write_table = _detect_write(sql)
-        if write_table:
-            if write_table == _DDL_SENTINEL:
-                self._cache.invalidate_all()
-            else:
-                self._cache.invalidate_table(write_table)
+        if _apply_write_invalidation(self._cache, _detect_writes_multi(sql)):
             return await self._real.fetchval(sql, *args, column=column)
 
         if self._in_transaction:
@@ -354,12 +350,7 @@ class AsyncCachedConnection:
         # status strings, not rows), but we still observe SETs so a
         # subsequent fetch* call sees the updated state hash.
         self._guc_state.observe_sql(sql)
-        write_table = _detect_write(sql)
-        if write_table:
-            if write_table == _DDL_SENTINEL:
-                self._cache.invalidate_all()
-            else:
-                self._cache.invalidate_table(write_table)
+        _apply_write_invalidation(self._cache, _detect_writes_multi(sql))
         return await self._real.execute(sql, *args)
 
     def transaction(self, **kwargs):
