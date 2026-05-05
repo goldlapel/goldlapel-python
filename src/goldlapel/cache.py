@@ -91,6 +91,42 @@ def is_unsafe_guc(name):
     return lower in _UNSAFE_GUC_SHORT_LIST
 
 
+def _strip_string_literals(sql):
+    """Replace the contents of `'...'` and `"..."` string literals with
+    spaces, preserving overall length so positions line up with the
+    original. PG's doubled-quote `''` / `""` escapes are handled the same
+    way as in `split_statements`. Used by `_detect_write`'s SELECT branch
+    so that bare words like `INTO` inside a literal (e.g.
+    `SELECT 'INSERT INTO orders' FROM audit_log`) don't trip the
+    SELECT-INTO DDL classifier.
+    """
+    if not sql:
+        return sql
+    out = list(sql)
+    quote = None
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if quote is not None:
+            if c == quote:
+                if i + 1 < n and sql[i + 1] == quote:
+                    # Doubled-quote escape: blank both, stay inside literal.
+                    out[i] = " "
+                    out[i + 1] = " "
+                    i += 2
+                    continue
+                # Closing quote: leave the delimiter, drop the literal body.
+                quote = None
+            else:
+                out[i] = " "
+        else:
+            if c == "'" or c == '"':
+                quote = c
+        i += 1
+    return "".join(out)
+
+
 def split_statements(sql):
     """Split a SQL string on top-level `;` characters, respecting single-
     and double-quoted string literals (PG's doubled-quote escape `''`/`""`
@@ -463,9 +499,16 @@ def _detect_write(sql):
             return None
         return _bare_table(tokens[2])
     elif first == "SELECT":
+        # Re-tokenize from a literal-stripped form so that bare words like
+        # `INTO` or `FROM` inside `'...'` / `"..."` don't trigger the
+        # SELECT-INTO DDL classifier (e.g. `SELECT 'INSERT INTO orders'
+        # FROM audit_log`, `SELECT * FROM "into_table"`). Other detect
+        # branches use fixed-position token checks (tokens[1], tokens[2])
+        # and aren't affected by literal contents.
+        scan_tokens = _strip_string_literals(trimmed).split()
         saw_into = False
         into_target = None
-        for tok in tokens[1:]:
+        for tok in scan_tokens[1:]:
             upper = tok.upper()
             if upper == "INTO" and not saw_into:
                 saw_into = True

@@ -147,6 +147,40 @@ class TestDetectWrite:
     def test_copy_with_columns(self):
         assert _detect_write("COPY orders(id, name) FROM '/tmp/data.csv'") == "orders"
 
+    # Regression: SELECT with `INTO` inside a string literal must not be
+    # classified as SELECT-INTO DDL. The pre-fix tokenizer split on
+    # whitespace only, so a literal like `'INSERT INTO orders'` smuggled
+    # the bare word INTO into the scan and tripped the DDL sentinel,
+    # forcing a full cache invalidation on a plain read.
+    def test_select_with_into_in_single_quoted_literal_is_not_ddl(self):
+        assert _detect_write(
+            "SELECT 'INSERT INTO orders;' FROM audit_log"
+        ) is None
+
+    def test_select_with_into_in_double_quoted_identifier_is_not_ddl(self):
+        assert _detect_write('SELECT * FROM "into_table"') is None
+
+    def test_select_with_into_in_like_pattern_literal_is_not_ddl(self):
+        assert _detect_write(
+            "SELECT message FROM logs WHERE message LIKE '%INTO%'"
+        ) is None
+
+    def test_select_with_into_inside_doubled_quote_escape_is_not_ddl(self):
+        assert _detect_write(
+            "SELECT 'It''s INTO trouble' FROM notes"
+        ) is None
+
+    def test_real_select_into_new_table_is_still_ddl(self):
+        # Regression guard: real SELECT-INTO DDL must still be flagged.
+        assert _detect_write(
+            "SELECT * INTO new_table FROM source"
+        ) is _DDL_SENTINEL
+
+    def test_real_select_into_temp_table_is_still_ddl(self):
+        assert _detect_write(
+            "SELECT id INTO TEMP scratch FROM source"
+        ) is _DDL_SENTINEL
+
 
 # --- Multi-statement write detection ---
 
