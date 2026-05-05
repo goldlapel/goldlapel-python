@@ -1,13 +1,13 @@
-# Wrapper L1 telemetry pattern
+# Wrapper native-cache telemetry pattern (L1)
 
-Reference shape for porting L1 telemetry from `goldlapel-python` to the
+Reference shape for porting native-cache (L1) telemetry from `goldlapel-python` to the
 JS / Ruby / Java / PHP / Go / .NET wrappers. The Python implementation
 in `src/goldlapel/cache.py` is canon — when in doubt, mirror what's
 there.
 
 ## Goals
 
-L1 telemetry exists so the proxy / dashboard can show what's happening
+Native-cache (L1) telemetry exists so the proxy / dashboard can show what's happening
 inside each wrapper's local cache without the wrapper having to push
 periodic snapshots. Three properties matter:
 
