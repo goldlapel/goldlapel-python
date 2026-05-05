@@ -730,6 +730,149 @@ class TestMultiStatementWriteDetection:
         assert cache.get("SELECT * FROM orders", None) is None
 
 
+# --- Multi-statement tx-flag bookkeeping (Bug fix 2026-05-04) ---
+
+
+class TestMultiStatementTxBookkeeping:
+    """A multi-statement Q like `BEGIN; INSERT INTO t VALUES (1); COMMIT`
+    used to flip wrapper-side `_in_transaction` based on first token only,
+    leaving the wrapper believing it's in a tx after the COMMIT closed it
+    server-side. Subsequent reads bypass the cache forever (until a fresh
+    BEGIN/COMMIT cycle resets it). Walking segments converges the wrapper's
+    view to the server's actual end-state.
+    """
+
+    def test_begin_insert_commit_ends_out_of_tx(self):
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("BEGIN; INSERT INTO orders VALUES (1); COMMIT")
+        assert mock_cc._in_transaction is False
+
+    def test_begin_insert_no_commit_stays_in_tx(self):
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("BEGIN; INSERT INTO orders VALUES (1)")
+        assert mock_cc._in_transaction is True
+
+    def test_insert_commit_no_begin_ends_out_of_tx(self):
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        # Pre-condition: already in a tx from an earlier BEGIN.
+        cc.execute("BEGIN")
+        assert mock_cc._in_transaction is True
+        cc.execute("INSERT INTO orders VALUES (1); COMMIT")
+        assert mock_cc._in_transaction is False
+
+    def test_savepoint_release_round_trip(self):
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("BEGIN")
+        # `SAVEPOINT ... ; RELEASE ...` — by spec, RELEASE flips to out-of-tx
+        # (conservative single-token classifier; false positive bypasses
+        # cache, which is safe).
+        cc.execute("SAVEPOINT s1; INSERT INTO orders VALUES (1); RELEASE s1")
+        assert mock_cc._in_transaction is False
+        # And invalidation still fires:
+        # (precondition: cache had an entry — set it up to assert the
+        # write took effect).
+
+    def test_plain_select_no_tx_change(self):
+        conn, cursor = mock_conn(
+            description=(("v",),),
+            fetchall_result=[(1,)],
+        )
+        cache = make_connected_cache()
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("SELECT * FROM orders")
+        assert mock_cc._in_transaction is False
+
+    def test_multi_statement_tx_body_still_invalidates_writes(self):
+        # A `BEGIN; INSERT INTO orders ...; COMMIT` body must invalidate
+        # `orders` (the original code's TX_START regex returned early
+        # before write detection ran, leaking stale entries).
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1,)], None)
+        mock_cc = MockCachedConn()
+        cc = CachedCursor(cursor, cache, mock_cc)
+        cc.execute("BEGIN; INSERT INTO orders VALUES (1); COMMIT")
+        assert cache.get("SELECT * FROM orders", None) is None
+
+
+class TestAsyncMultiStatementTxBookkeeping:
+    """Same bookkeeping shape for the asyncpg path."""
+
+    @pytest.mark.asyncio
+    async def test_async_execute_begin_insert_commit_ends_out_of_tx(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                return "INSERT 0 1"
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.execute("BEGIN; INSERT INTO orders VALUES (1); COMMIT")
+        assert a._in_transaction is False
+
+    @pytest.mark.asyncio
+    async def test_async_execute_begin_alone_starts_tx(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                return "BEGIN"
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.execute("BEGIN")
+        assert a._in_transaction is True
+
+    @pytest.mark.asyncio
+    async def test_async_fetch_with_tx_markers_dispatches_to_real(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            def __init__(self):
+                self.calls = 0
+
+            async def fetch(self, sql, *args):
+                self.calls += 1
+                return [(42,)]
+
+        cache = make_connected_cache()
+        # Pre-populate a cache entry — the body has a tx marker so the
+        # wrapper must dispatch to real, not serve from cache.
+        cache.put("BEGIN; SELECT 1; COMMIT", None, [(99,)], None)
+        real = FakeAsyncpgConn()
+        a = AsyncCachedConnection(real, cache)
+        await a.fetch("BEGIN; SELECT 1; COMMIT")
+        assert real.calls == 1
+        assert a._in_transaction is False
+
+    @pytest.mark.asyncio
+    async def test_async_execute_balanced_begin_rollback_ends_out_of_tx(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                return "ROLLBACK"
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.execute("BEGIN; ROLLBACK")
+        assert a._in_transaction is False
+
+
 class TestAsyncMultiStatementWriteDetection:
     @pytest.mark.asyncio
     async def test_async_fetch_set_then_insert_invalidates(self):

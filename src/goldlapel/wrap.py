@@ -5,8 +5,7 @@ from goldlapel.cache import (
     ConnectionGucState,
     _detect_writes_multi,
     _DDL_SENTINEL,
-    _TX_START,
-    _TX_END,
+    update_tx_state,
 )
 
 _cache = None
@@ -143,21 +142,36 @@ class CachedCursor:
             self._conn._guc_state.observe_sql(sql)
         state_hash = self._conn._guc_state.hash if self._conn is not None else 0
 
-        # Transaction tracking (state on connection, not cursor)
-        if _TX_START.match(sql):
-            if self._conn is not None:
-                object.__setattr__(self._conn, "_in_transaction", True)
-            return self._real.execute(sql, params)
-        if _TX_END.match(sql):
-            if self._conn is not None:
-                object.__setattr__(self._conn, "_in_transaction", False)
+        # Write detection + self-invalidation (always, even in transactions
+        # or when the body has tx markers — `BEGIN; INSERT INTO t; COMMIT`
+        # must still invalidate `t`). Multi-statement-aware so a single Q
+        # message like `SET app.user_id='42'; INSERT INTO orders VALUES (1)`
+        # also invalidates `orders` even though the first token is `SET`.
+        write_found = _apply_write_invalidation(
+            self._cache, _detect_writes_multi(sql)
+        )
+
+        # Transaction tracking — segment-walking so a multi-statement body
+        # like `BEGIN; INSERT INTO t VALUES (1); COMMIT` converges the
+        # wrapper's tx flag to the server's actual end-state (out-of-tx),
+        # not just the first token's intent (in-tx). State lives on the
+        # connection, not the cursor.
+        if self._conn is not None:
+            new_tx, had_tx_marker = update_tx_state(
+                self._conn._in_transaction, sql
+            )
+            if new_tx != self._conn._in_transaction:
+                object.__setattr__(self._conn, "_in_transaction", new_tx)
+        else:
+            had_tx_marker = False
+        # Bodies that contain tx-boundary segments (BEGIN/COMMIT/etc.) are
+        # never cached — the response is a status string, and pretending to
+        # serve it from cache would skip a real server round-trip the
+        # caller intends. Same shape as a write-found short-circuit.
+        if had_tx_marker:
             return self._real.execute(sql, params)
 
-        # Write detection + self-invalidation (always, even in transactions).
-        # Use the multi-statement-aware detector so a single Q message like
-        # `SET app.user_id='42'; INSERT INTO orders VALUES (1)` invalidates
-        # `orders` even though the first token is `SET`.
-        if _apply_write_invalidation(self._cache, _detect_writes_multi(sql)):
+        if write_found:
             return self._real.execute(sql, params)
 
         # Inside transaction: bypass cache for reads
@@ -242,6 +256,16 @@ class CachedCursor:
         if self._conn is not None:
             self._conn._guc_state.observe_sql(sql)
         _apply_write_invalidation(self._cache, _detect_writes_multi(sql))
+        # Track tx markers for parity with `execute`. Multi-statement bodies
+        # containing BEGIN/COMMIT in `executemany` are unusual but the cost
+        # is negligible (single-statement fast path) and keeps the wrapper's
+        # `_in_transaction` flag from drifting if a caller does it anyway.
+        if self._conn is not None:
+            new_tx, _had_tx_marker = update_tx_state(
+                self._conn._in_transaction, sql
+            )
+            if new_tx != self._conn._in_transaction:
+                object.__setattr__(self._conn, "_in_transaction", new_tx)
         return self._real.executemany(sql, params_list)
 
     def callproc(self, procname, params=None):
@@ -286,10 +310,26 @@ class AsyncCachedConnection:
         # with different RLS context.
         object.__setattr__(self, "_guc_state", ConnectionGucState())
 
+    def _observe_tx(self, sql):
+        """Walk segments to update `_in_transaction`. Returns
+        `had_tx_marker` so the caller can short-circuit cache decisions
+        on bodies that contain tx-boundary segments (the response is a
+        status string, not rows worth caching). Mirrors the sync path's
+        `update_tx_state` call.
+        """
+        new_tx, had_tx_marker = update_tx_state(self._in_transaction, sql)
+        if new_tx != self._in_transaction:
+            object.__setattr__(self, "_in_transaction", new_tx)
+        return had_tx_marker
+
     async def fetch(self, sql, *args):
         self._guc_state.observe_sql(sql)
         state_hash = self._guc_state.hash
-        if _apply_write_invalidation(self._cache, _detect_writes_multi(sql)):
+        write_found = _apply_write_invalidation(
+            self._cache, _detect_writes_multi(sql)
+        )
+        had_tx_marker = self._observe_tx(sql)
+        if had_tx_marker or write_found:
             return await self._real.fetch(sql, *args)
 
         if self._in_transaction:
@@ -314,7 +354,11 @@ class AsyncCachedConnection:
     async def fetchrow(self, sql, *args):
         self._guc_state.observe_sql(sql)
         state_hash = self._guc_state.hash
-        if _apply_write_invalidation(self._cache, _detect_writes_multi(sql)):
+        write_found = _apply_write_invalidation(
+            self._cache, _detect_writes_multi(sql)
+        )
+        had_tx_marker = self._observe_tx(sql)
+        if had_tx_marker or write_found:
             return await self._real.fetchrow(sql, *args)
 
         if self._in_transaction:
@@ -333,7 +377,11 @@ class AsyncCachedConnection:
     async def fetchval(self, sql, *args, column=0):
         self._guc_state.observe_sql(sql)
         state_hash = self._guc_state.hash
-        if _apply_write_invalidation(self._cache, _detect_writes_multi(sql)):
+        write_found = _apply_write_invalidation(
+            self._cache, _detect_writes_multi(sql)
+        )
+        had_tx_marker = self._observe_tx(sql)
+        if had_tx_marker or write_found:
             return await self._real.fetchval(sql, *args, column=column)
 
         if self._in_transaction:
@@ -355,9 +403,14 @@ class AsyncCachedConnection:
     async def execute(self, sql, *args):
         # `execute` doesn't read into the cache (asyncpg's execute returns
         # status strings, not rows), but we still observe SETs so a
-        # subsequent fetch* call sees the updated state hash.
+        # subsequent fetch* call sees the updated state hash, and walk
+        # segments for tx markers so a body like
+        # `BEGIN; INSERT INTO t VALUES (1); COMMIT` converges
+        # `_in_transaction` to the server's actual end-state instead of
+        # tracking only the first token.
         self._guc_state.observe_sql(sql)
         _apply_write_invalidation(self._cache, _detect_writes_multi(sql))
+        self._observe_tx(sql)
         return await self._real.execute(sql, *args)
 
     def transaction(self, **kwargs):

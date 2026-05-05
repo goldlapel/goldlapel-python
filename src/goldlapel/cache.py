@@ -33,6 +33,17 @@ CacheEntry = namedtuple("CacheEntry", ["rows", "description", "tables"])
 _TX_START = re.compile(r"^\s*(BEGIN|START\s+TRANSACTION)\b", re.IGNORECASE)
 _TX_END = re.compile(r"^\s*(COMMIT|ROLLBACK|END)\b", re.IGNORECASE)
 
+# Per-segment classifiers used by `update_tx_state`. A multi-statement Q
+# message like `BEGIN; INSERT INTO t VALUES (1); COMMIT` flips wrapper-side
+# `_in_transaction` based on the first token only (`BEGIN`) — but the
+# COMMIT at the end means the server ends out-of-tx. Walking segments
+# converges the wrapper's view to the server's actual end-state. Order
+# matters: a segment whose first keyword is in `_TX_END_KEYWORDS` ends the
+# transaction; one in `_TX_START_KEYWORDS` opens it; anything else leaves
+# state unchanged.
+_TX_START_KEYWORDS = frozenset({"BEGIN", "START", "SAVEPOINT"})
+_TX_END_KEYWORDS = frozenset({"COMMIT", "ROLLBACK", "RELEASE", "END"})
+
 _TABLE_PATTERN = re.compile(
     r"\b(?:FROM|JOIN)\s+(?:ONLY\s+)?(?:(\w+)\.)?(\w+)",
     re.IGNORECASE,
@@ -426,6 +437,74 @@ def _make_key(sql, params, state_hash=0):
     # for the same SQL+params (which is correct — they have identical
     # security context).
     return (sql, params_part, state_hash)
+
+
+def update_tx_state(in_transaction, sql):
+    """Compute the wrapper's transaction state after observing a SQL body.
+
+    Walks each top-level statement in `sql` (string-literal-aware splitter)
+    and folds per-segment first-keyword classification:
+    - `BEGIN` / `START` / `SAVEPOINT` → in_transaction = True
+    - `COMMIT` / `ROLLBACK` / `RELEASE` / `END` → in_transaction = False
+    - Anything else → leaves state unchanged.
+
+    Returns `(new_state, had_tx_marker)`:
+    - `new_state` — the final tx state (boolean) after walking all segments.
+      The walk preserves order, so a body like `BEGIN; INSERT INTO t
+      VALUES (1); COMMIT` ends with `False` — matching the server, where
+      the COMMIT closes the tx the BEGIN opened. Without this fix, the
+      wrapper's tx state diverges from the server's and subsequent reads
+      bypass the cache forever (until a fresh BEGIN/COMMIT cycle resets).
+    - `had_tx_marker` — True if any segment's first-token was a tx-boundary
+      keyword. Lets callers detect bodies like `BEGIN; ROLLBACK` whose
+      net state is unchanged but which still shouldn't go through the
+      cache path.
+
+    Cheap on the hot path — single-statement bodies skip the splitter
+    allocation entirely.
+    """
+    # Fast path: no `;` → single segment, classify directly.
+    trimmed = sql.rstrip()
+    if trimmed.endswith(";"):
+        trimmed = trimmed[:-1]
+    if ";" not in trimmed:
+        return _classify_tx_segment(in_transaction, sql)
+
+    state = in_transaction
+    had_marker = False
+    for seg in split_statements(sql):
+        state, seg_marker = _classify_tx_segment(state, seg)
+        if seg_marker:
+            had_marker = True
+    return state, had_marker
+
+
+def _classify_tx_segment(in_transaction, segment):
+    """Classify a single segment's effect on tx state. First-keyword check —
+    case-insensitive, no string-literal awareness needed because the
+    keyword can only appear at the very start of a statement to be
+    syntactically meaningful (and `split_statements` already trimmed
+    whitespace).
+
+    Returns `(new_state, is_tx_marker)`.
+    """
+    s = segment.lstrip()
+    if not s:
+        return in_transaction, False
+    # First whitespace-delimited token, uppercase. Strip a trailing
+    # semicolon from a single-token segment like `COMMIT;` (split_statements
+    # already drops trailing `;` from segments it produces, but the
+    # fast-path single-segment caller may pass `BEGIN;` directly).
+    end = 0
+    n = len(s)
+    while end < n and not s[end].isspace() and s[end] != ";":
+        end += 1
+    head = s[:end].upper()
+    if head in _TX_END_KEYWORDS:
+        return False, True
+    if head in _TX_START_KEYWORDS:
+        return True, True
+    return in_transaction, False
 
 
 def _detect_writes_multi(sql):

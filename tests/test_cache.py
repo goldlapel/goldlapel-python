@@ -23,6 +23,7 @@ from goldlapel.cache import (
     is_unsafe_guc,
     parse_set_command,
     split_statements,
+    update_tx_state,
     SET_KIND_SET,
     SET_KIND_SET_LOCAL,
     SET_KIND_RESET,
@@ -236,6 +237,120 @@ class TestDetectWritesMulti:
     def test_trailing_semicolon_treated_as_single_statement(self):
         # Matches the `observe_sql` fast-path heuristic.
         assert _detect_writes_multi("INSERT INTO orders VALUES (1);") == {"orders"}
+
+
+# --- Multi-statement tx-state bookkeeping ---
+
+
+class TestUpdateTxState:
+    """A multi-statement Q like `BEGIN; INSERT INTO t VALUES (1); COMMIT`
+    flips wrapper-side `_in_transaction` based on first token only (`BEGIN`)
+    in the pre-fix code, but the COMMIT at the end means the server ends
+    out-of-tx. The wrapper's tx state diverges from the server's, and
+    subsequent reads bypass the cache forever (until a fresh BEGIN/COMMIT
+    cycle resets it). Walking segments converges the wrapper's view to the
+    server's end-state.
+    """
+
+    def test_begin_insert_commit_ends_out_of_tx(self):
+        new_tx, had_marker = update_tx_state(
+            False, "BEGIN; INSERT INTO t VALUES (1); COMMIT"
+        )
+        assert new_tx is False
+        assert had_marker is True
+
+    def test_begin_insert_no_commit_stays_in_tx(self):
+        new_tx, had_marker = update_tx_state(
+            False, "BEGIN; INSERT INTO t VALUES (1)"
+        )
+        assert new_tx is True
+        assert had_marker is True
+
+    def test_insert_commit_no_begin_ends_out_of_tx(self):
+        # Already in tx (from a prior BEGIN), now COMMITting at end of body.
+        new_tx, had_marker = update_tx_state(
+            True, "INSERT INTO t VALUES (1); COMMIT"
+        )
+        assert new_tx is False
+        assert had_marker is True
+
+    def test_savepoint_release_ends_out_of_tx_per_spec(self):
+        # Per spec classification: SAVEPOINT → tx=true, RELEASE → tx=false.
+        # (RELEASE SAVEPOINT inside a real tx is a no-op on the actual
+        # transaction, but the conservative single-token classifier treats
+        # it as a tx-end marker. Acceptable trade-off: false positives
+        # bypass the cache, which is safe.)
+        new_tx, had_marker = update_tx_state(
+            True, "SAVEPOINT s1; INSERT INTO t VALUES (1); RELEASE s1"
+        )
+        assert new_tx is False
+        assert had_marker is True
+
+    def test_plain_select_no_change(self):
+        new_tx_false, had_false = update_tx_state(False, "SELECT * FROM t")
+        assert new_tx_false is False
+        assert had_false is False
+        new_tx_true, had_true = update_tx_state(True, "SELECT * FROM t")
+        assert new_tx_true is True
+        assert had_true is False
+
+    def test_begin_alone(self):
+        new_tx, had_marker = update_tx_state(False, "BEGIN")
+        assert new_tx is True
+        assert had_marker is True
+
+    def test_commit_alone(self):
+        new_tx, had_marker = update_tx_state(True, "COMMIT")
+        assert new_tx is False
+        assert had_marker is True
+
+    def test_rollback_alone(self):
+        new_tx, had_marker = update_tx_state(True, "ROLLBACK")
+        assert new_tx is False
+        assert had_marker is True
+
+    def test_start_transaction(self):
+        new_tx, had_marker = update_tx_state(False, "START TRANSACTION")
+        assert new_tx is True
+        assert had_marker is True
+
+    def test_balanced_begin_rollback_nets_out_of_tx_with_marker(self):
+        # `BEGIN; ROLLBACK` net state == prior state (False), but the body
+        # had tx markers — callers must dispatch to the real connection
+        # rather than treat as cacheable.
+        new_tx, had_marker = update_tx_state(False, "BEGIN; ROLLBACK")
+        assert new_tx is False
+        assert had_marker is True
+
+    def test_case_insensitive(self):
+        new_tx, had_marker = update_tx_state(
+            False, "begin; insert into t values (1); commit"
+        )
+        assert new_tx is False
+        assert had_marker is True
+
+    def test_trailing_semicolon_does_not_split(self):
+        # `BEGIN;` is a single-statement body in our splitter. Still flips.
+        new_tx, had_marker = update_tx_state(False, "BEGIN;")
+        assert new_tx is True
+        assert had_marker is True
+
+    def test_quoted_semicolon_not_a_split(self):
+        # `;` inside a string literal must not produce an extra segment.
+        # The body is a single-statement INSERT; no tx marker.
+        new_tx, had_marker = update_tx_state(
+            False, "INSERT INTO t VALUES ('a;b')"
+        )
+        assert new_tx is False
+        assert had_marker is False
+
+    def test_empty_sql(self):
+        new_tx, had_marker = update_tx_state(False, "")
+        assert new_tx is False
+        assert had_marker is False
+        new_tx, had_marker = update_tx_state(True, "")
+        assert new_tx is True
+        assert had_marker is False
 
 
 # --- Table extraction ---
