@@ -1139,6 +1139,36 @@ class TestConnectionGucState:
         s.observe_sql("SET app.tenant = 'has;semicolon'; SELECT 1")
         assert s.hash != 0
 
+    def test_reset_unset_unsafe_guc_is_noop(self):
+        # `RESET app.user_id` on a fresh state (the GUC was never SET) is
+        # a no-op — hash stays at baseline, observe_sql returns False.
+        s = ConnectionGucState()
+        assert s.hash == 0
+        assert s.observe_sql("RESET app.user_id") is False
+        assert s.hash == 0
+
+    def test_reset_all_on_empty_state_is_noop(self):
+        # `RESET ALL` on a fresh state with no unsafe GUCs ever set is a
+        # no-op — we don't recompute the hash, and observe_sql signals no
+        # change.
+        s = ConnectionGucState()
+        assert s.hash == 0
+        assert s.observe_sql("RESET ALL") is False
+        assert s.hash == 0
+
+    def test_first_set_then_separate_select_keys_under_post_set_hash(self):
+        # Sequenced (not multi-statement) form: SET first, then a separate
+        # SELECT. Proves the SELECT issued AFTER the SET sees the post-SET
+        # state hash — equivalent end state to the single-shot
+        # `SET ...; SELECT ...` form already covered.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        post_set_hash = s.hash
+        assert post_set_hash != 0
+        # Subsequent non-SET statement does not change the state.
+        assert s.observe_sql("SELECT name FROM accounts") is False
+        assert s.hash == post_set_hash
+
 
 # --- L1 state-hash: cache key correctness ---
 #
