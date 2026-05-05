@@ -111,8 +111,11 @@ class AsyncGoldLapel:
         silent=False,
         mesh=False,
         mesh_tag=None,
-        enable_proxy_cache_for_wrappers=False,
         disable_native_cache=False,
+        disable_proxy_cache=False,
+        disable_matviews=False,
+        disable_sqloptimize=False,
+        disable_auto_indexes=False,
     ):
         # Piggyback on the sync GoldLapel for subprocess/lifecycle state so
         # `using(conn)` / ContextVar semantics and stop-on-exit are identical.
@@ -132,8 +135,11 @@ class AsyncGoldLapel:
             silent=silent,
             mesh=mesh,
             mesh_tag=mesh_tag,
-            enable_proxy_cache_for_wrappers=enable_proxy_cache_for_wrappers,
             disable_native_cache=disable_native_cache,
+            disable_proxy_cache=disable_proxy_cache,
+            disable_matviews=disable_matviews,
+            disable_sqloptimize=disable_sqloptimize,
+            disable_auto_indexes=disable_auto_indexes,
         )
         self._conn = None  # AsyncCachedConnection (wraps asyncpg.Connection)
 
@@ -227,8 +233,14 @@ class AsyncGoldLapel:
                 cmd.append("--mesh")
             if sync._mesh_tag is not None:
                 cmd += ["--mesh-tag", sync._mesh_tag]
-            if sync._enable_proxy_cache_for_wrappers:
-                cmd.append("--enable-proxy-cache-for-wrappers")
+            if sync._disable_proxy_cache:
+                cmd.append("--disable-proxy-cache")
+            if sync._disable_matviews:
+                cmd.append("--disable-matviews")
+            if sync._disable_sqloptimize:
+                cmd.append("--disable-sqloptimize")
+            if sync._disable_auto_indexes:
+                cmd.append("--disable-auto-indexes")
             cmd += _config_to_args(sync._config) + sync._extra_args
 
             _kill_orphan_on_port(sync._proxy_port)
@@ -627,8 +639,11 @@ def start(
     silent=False,
     mesh=False,
     mesh_tag=None,
-    enable_proxy_cache_for_wrappers=False,
     disable_native_cache=False,
+    disable_proxy_cache=False,
+    disable_matviews=False,
+    disable_sqloptimize=False,
+    disable_auto_indexes=False,
 ):
     """Factory: spawn a Gold Lapel proxy and return an AsyncGoldLapel instance.
 
@@ -666,6 +681,9 @@ def start(
         silent=silent,
         mesh=mesh,
         mesh_tag=mesh_tag,
-        enable_proxy_cache_for_wrappers=enable_proxy_cache_for_wrappers,
         disable_native_cache=disable_native_cache,
+        disable_proxy_cache=disable_proxy_cache,
+        disable_matviews=disable_matviews,
+        disable_sqloptimize=disable_sqloptimize,
+        disable_auto_indexes=disable_auto_indexes,
     )

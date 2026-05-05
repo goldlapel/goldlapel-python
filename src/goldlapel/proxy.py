@@ -31,19 +31,19 @@ _VALID_CONFIG_KEYS = frozenset({
     "pool_mode", "mgmt_idle_timeout", "fallback", "read_after_write_secs",
     "n1_threshold", "n1_window_ms", "n1_cross_threshold",
     "tls_cert", "tls_key", "tls_client_ca",
-    "disable_matviews", "disable_consolidation", "disable_btree_indexes",
+    "disable_consolidation", "disable_btree_indexes",
     "disable_trigram_indexes", "disable_expression_indexes",
     "disable_partial_indexes", "disable_rewrite", "disable_rewrite_prepared_cache",
-    "disable_proxy_cache", "disable_pool",
+    "disable_pool",
     "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
     "enable_coalescing", "replica", "exclude_tables",
 })
 
 _BOOLEAN_KEYS = frozenset({
-    "disable_matviews", "disable_consolidation", "disable_btree_indexes",
+    "disable_consolidation", "disable_btree_indexes",
     "disable_trigram_indexes", "disable_expression_indexes",
     "disable_partial_indexes", "disable_rewrite", "disable_rewrite_prepared_cache",
-    "disable_proxy_cache", "disable_pool",
+    "disable_pool",
     "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
     "enable_coalescing",
 })
@@ -366,8 +366,11 @@ class GoldLapel:
         silent=False,
         mesh=False,
         mesh_tag=None,
-        enable_proxy_cache_for_wrappers=False,
         disable_native_cache=False,
+        disable_proxy_cache=False,
+        disable_matviews=False,
+        disable_sqloptimize=False,
+        disable_auto_indexes=False,
     ):
         self._upstream = upstream
         self._proxy_port = proxy_port if proxy_port is not None else DEFAULT_PROXY_PORT
@@ -406,13 +409,6 @@ class GoldLapel:
         # Mesh membership (startup intent — HQ enforces license).
         self._mesh = bool(mesh)
         self._mesh_tag = mesh_tag if mesh_tag else None
-        # Override the proxy's per-connection wrapper-skip on the proxy
-        # cache. Default False — the proxy auto-detects wrappers via
-        # application_name and skips the proxy cache for them (wrappers
-        # carry their own native cache). Multi-pod fleet customers set this
-        # True so the proxy cache acts as a shared cache across
-        # pods/restarts.
-        self._enable_proxy_cache_for_wrappers = bool(enable_proxy_cache_for_wrappers)
         # Explicit native-cache disable knob. Default False (native cache
         # active). When True, the wrapper's NativeCache becomes a no-op
         # pass-through: get() always returns None, put() is silent. Lets
@@ -423,6 +419,14 @@ class GoldLapel:
         # clear "native cache off" signal vs. a silent / disconnected
         # wrapper.
         self._disable_native_cache = bool(disable_native_cache)
+        # Promoted disable flags (Wave: top-level options for parity
+        # with `disable_native_cache`). Each maps 1:1 to the proxy CLI
+        # flag at spawn time. Removed from the structured `config` map —
+        # passing them through `config={...}` is a hard error.
+        self._disable_proxy_cache = bool(disable_proxy_cache)
+        self._disable_matviews = bool(disable_matviews)
+        self._disable_sqloptimize = bool(disable_sqloptimize)
+        self._disable_auto_indexes = bool(disable_auto_indexes)
 
         # Validate structured-config keys eagerly so a test that constructs
         # without spawning still catches bad keys.
@@ -535,8 +539,16 @@ class GoldLapel:
             cmd.append("--mesh")
         if self._mesh_tag is not None:
             cmd += ["--mesh-tag", self._mesh_tag]
-        if self._enable_proxy_cache_for_wrappers:
-            cmd.append("--enable-proxy-cache-for-wrappers")
+        # Promoted disable flags — emitted as 1:1 CLI flags. Suppressed
+        # when False so the binary applies its own defaults.
+        if self._disable_proxy_cache:
+            cmd.append("--disable-proxy-cache")
+        if self._disable_matviews:
+            cmd.append("--disable-matviews")
+        if self._disable_sqloptimize:
+            cmd.append("--disable-sqloptimize")
+        if self._disable_auto_indexes:
+            cmd.append("--disable-auto-indexes")
         cmd += _config_to_args(self._config) + self._extra_args
 
         _kill_orphan_on_port(self._proxy_port)
@@ -802,8 +814,11 @@ def _ensure_running(
     silent=False,
     mesh=False,
     mesh_tag=None,
-    enable_proxy_cache_for_wrappers=False,
     disable_native_cache=False,
+    disable_proxy_cache=False,
+    disable_matviews=False,
+    disable_sqloptimize=False,
+    disable_auto_indexes=False,
 ):
     global _cleanup_registered, _next_port
     with _lock:
@@ -834,8 +849,11 @@ def _ensure_running(
             silent=silent,
             mesh=mesh,
             mesh_tag=mesh_tag,
-            enable_proxy_cache_for_wrappers=enable_proxy_cache_for_wrappers,
             disable_native_cache=disable_native_cache,
+            disable_proxy_cache=disable_proxy_cache,
+            disable_matviews=disable_matviews,
+            disable_sqloptimize=disable_sqloptimize,
+            disable_auto_indexes=disable_auto_indexes,
         )
         _instances[upstream] = inst
         if not _cleanup_registered:
@@ -895,8 +913,11 @@ def start(
     silent=False,
     mesh=False,
     mesh_tag=None,
-    enable_proxy_cache_for_wrappers=False,
     disable_native_cache=False,
+    disable_proxy_cache=False,
+    disable_matviews=False,
+    disable_sqloptimize=False,
+    disable_auto_indexes=False,
 ):
     """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
     GoldLapel instance. Call wrapper methods on the returned instance
@@ -925,17 +946,20 @@ def start(
     - silent: suppress the startup banner
     - mesh: opt into the mesh at startup (HQ enforces license; denial is non-fatal)
     - mesh_tag: optional tag — instances sharing a tag cluster together
-    - enable_proxy_cache_for_wrappers: force the proxy to keep its proxy
-        cache on for wrapper-tagged connections. Default False — the proxy
-        auto-skips its cache for wrappers since they carry their own
-        native cache. Multi-pod fleet customers turn this on so the proxy
-        cache acts as a shared cache across pods/restarts.
     - disable_native_cache: turn off the wrapper's native cache without
         changing its configured size. Default False. When True, get()
         always returns None (cache miss), put() is a silent no-op, and
         the invalidation socket still connects so the dashboard sees a
         live wrapper with "0 hits, N misses" — clear "native cache off"
         signal.
+    - disable_proxy_cache: turn off the proxy's L2 cache (--disable-proxy-cache).
+        Default False.
+    - disable_matviews: skip materialized-view promotion (--disable-matviews).
+        Default False.
+    - disable_sqloptimize: skip SQL rewriting (--disable-sqloptimize).
+        Default False.
+    - disable_auto_indexes: skip automatic index creation (--disable-auto-indexes).
+        Default False.
 
     Promoted top-level concepts are rejected inside the `config` dict.
 
@@ -971,8 +995,11 @@ def start(
         silent=silent,
         mesh=mesh,
         mesh_tag=mesh_tag,
-        enable_proxy_cache_for_wrappers=enable_proxy_cache_for_wrappers,
         disable_native_cache=disable_native_cache,
+        disable_proxy_cache=disable_proxy_cache,
+        disable_matviews=disable_matviews,
+        disable_sqloptimize=disable_sqloptimize,
+        disable_auto_indexes=disable_auto_indexes,
     )
     return inst
 

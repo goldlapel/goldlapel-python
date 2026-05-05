@@ -284,6 +284,13 @@ class TestWrites:
 class MockCachedConn:
     _in_transaction = False
 
+    def __init__(self):
+        # Per-connection unsafe-GUC state — required by CachedCursor.execute
+        # to compute the L1 cache key. The real ConnectionGucState is cheap
+        # and stateless until a SET is observed, so we use it directly.
+        from goldlapel.cache import ConnectionGucState
+        self._guc_state = ConnectionGucState()
+
 
 class TestTransactions:
     def test_begin_disables_cache(self):
@@ -409,3 +416,217 @@ class TestEdgeCases:
         cc = CachedCursor(cursor, cache)
         with cc as c:
             assert c is cc
+
+
+# --- L1 state-hash: end-to-end via CachedCursor + CachedConnection ---
+#
+# Proves the wrapper's wire path actually folds the per-connection unsafe-GUC
+# state into the cache key. Without this, `SET app.user_id` on connection A
+# could leak rows to connection B when they execute identical SQL+params.
+
+
+class TestStateHashWiring:
+    def test_cached_connection_has_per_instance_guc_state(self):
+        # Each CachedConnection gets its own ConnectionGucState — process-
+        # wide state would defeat the point.
+        from goldlapel.cache import ConnectionGucState
+        a_real = MagicMock()
+        b_real = MagicMock()
+        cache = make_connected_cache()
+        a = CachedConnection(a_real, cache)
+        b = CachedConnection(b_real, cache)
+        assert isinstance(a._guc_state, ConnectionGucState)
+        assert isinstance(b._guc_state, ConnectionGucState)
+        assert a._guc_state is not b._guc_state
+
+    def test_set_observation_updates_connection_state(self):
+        # `SET app.user_id` on a CachedCursor must mutate the parent
+        # CachedConnection's state hash.
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cursor_real = conn.cursor()
+        cc_cursor = CachedCursor(cursor_real, cache, cc_conn)
+        baseline = cc_conn._guc_state.hash
+        cc_cursor.execute("SET app.user_id = '42'")
+        assert cc_conn._guc_state.hash != baseline
+
+    def test_safe_set_does_not_change_state_hash(self):
+        # Harmless GUC — observable on the cursor but state hash stays
+        # at its baseline.
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cursor_real = conn.cursor()
+        cc_cursor = CachedCursor(cursor_real, cache, cc_conn)
+        baseline = cc_conn._guc_state.hash
+        cc_cursor.execute("SET timezone = 'UTC'")
+        assert cc_conn._guc_state.hash == baseline
+
+    def test_two_connections_different_set_get_different_cache_slots(self):
+        # The full security guarantee: connection A sets app.user_id=42,
+        # connection B sets app.user_id=43, both run the SAME SELECT.
+        # Each must get its own cache slot — B reading after A's put must
+        # miss.
+        # Use a single shared NativeCache (singleton) — that's the real
+        # production layout — but two distinct CachedConnections.
+        conn_a, cursor_a = mock_conn(
+            description=(("name",),),
+            fetchall_result=[("alice",)],
+        )
+        conn_b, cursor_b = mock_conn(
+            description=(("name",),),
+            fetchall_result=[("bob",)],
+        )
+        cache = make_connected_cache()
+        cc_a = CachedConnection(conn_a, cache)
+        cc_b = CachedConnection(conn_b, cache)
+
+        cur_a = CachedCursor(cursor_a, cache, cc_a)
+        cur_b = CachedCursor(cursor_b, cache, cc_b)
+
+        # Connection A: set its RLS context, run the SELECT — populates
+        # the cache slot under hash_a.
+        cur_a.execute("SET app.user_id = '42'")
+        cur_a.execute("SELECT name FROM accounts")
+        # Connection A reads alice from its slot.
+        assert cur_a.fetchall() == [("alice",)]
+        # Reset cursor mock so we can detect whether B re-executes for real.
+        cursor_b.execute.reset_mock()
+
+        # Connection B: different RLS context. Identical SQL but the
+        # state hash differs → must MISS the cache and call into the
+        # real cursor.
+        cur_b.execute("SET app.user_id = '43'")
+        cur_b.execute("SELECT name FROM accounts")
+        # B must have re-executed (cache miss for its hash).
+        assert cursor_b.execute.call_args_list[-1][0][0] == "SELECT name FROM accounts"
+
+    def test_same_state_hash_hits_cache(self):
+        # Sanity check: when two connections have identical RLS context
+        # (both empty / both same), they share the cache slot — by
+        # design.
+        conn_a, cursor_a = mock_conn(
+            description=(("v",),),
+            fetchall_result=[(1,)],
+        )
+        conn_b, cursor_b = mock_conn(
+            description=(("v",),),
+            fetchall_result=[(2,)],  # would only be returned on cache miss
+        )
+        cache = make_connected_cache()
+        cc_a = CachedConnection(conn_a, cache)
+        cc_b = CachedConnection(conn_b, cache)
+
+        cur_a = CachedCursor(cursor_a, cache, cc_a)
+        cur_b = CachedCursor(cursor_b, cache, cc_b)
+
+        # A populates the cache.
+        cur_a.execute("SELECT v")
+        assert cur_a.fetchall() == [(1,)]
+
+        cursor_b.execute.reset_mock()
+        # B (no SETs, hash = 0 = same as A) must HIT the cache.
+        cur_b.execute("SELECT v")
+        assert cur_b.fetchall() == [(1,)]
+        # Cache hit: real cursor was never invoked on B's side.
+        cursor_b.execute.assert_not_called()
+
+    def test_multi_statement_set_then_select_keys_under_new_hash(self):
+        # Single-shot Q: `SET app.user_id='42'; SELECT ...`. The state
+        # update must take effect BEFORE the SELECT is evaluated, so the
+        # cache key reflects the new RLS context.
+        conn, cursor = mock_conn(
+            description=(("name",),),
+            fetchall_result=[("alice",)],
+        )
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        cur.execute("SET app.user_id = '42'; SELECT name FROM accounts")
+        # State hash moved.
+        assert cc_conn._guc_state.hash != 0
+
+    def test_reset_returns_state_to_baseline_so_cache_can_re_share(self):
+        # After `RESET app.user_id`, the connection's hash returns to 0.
+        # Subsequent reads can share slots with peer connections that
+        # never set the GUC — by design (correct security context).
+        conn, cursor = mock_conn(
+            description=(("v",),),
+            fetchall_result=[(1,)],
+        )
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        cur.execute("SET app.user_id = '42'")
+        assert cc_conn._guc_state.hash != 0
+        cur.execute("RESET app.user_id")
+        assert cc_conn._guc_state.hash == 0
+
+
+# --- L1 state-hash: AsyncCachedConnection wiring ---
+
+
+class TestAsyncStateHashWiring:
+    @pytest.mark.asyncio
+    async def test_async_connection_has_per_instance_guc_state(self):
+        from goldlapel.wrap import AsyncCachedConnection
+        from goldlapel.cache import ConnectionGucState
+        a_real = MagicMock()
+        a_real.fetch = MagicMock()
+        a_real.fetchrow = MagicMock()
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(a_real, cache)
+        b = AsyncCachedConnection(MagicMock(), cache)
+        assert isinstance(a._guc_state, ConnectionGucState)
+        assert a._guc_state is not b._guc_state
+
+    @pytest.mark.asyncio
+    async def test_async_execute_observes_set(self):
+        # asyncpg's `execute` returns status strings, not rows — so the
+        # path doesn't read the cache, but it MUST still observe SETs so
+        # subsequent fetch* calls key under the new hash.
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                return "SET"
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        baseline = a._guc_state.hash
+        await a.execute("SET app.user_id = '42'")
+        assert a._guc_state.hash != baseline
+
+    @pytest.mark.asyncio
+    async def test_async_fetch_after_set_keys_under_new_hash(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        # Track every (sql, params, state_hash) the cache sees. We also
+        # need fetch to actually return rows so .put gets called.
+        seen_puts = []
+        original_put = NativeCache.put
+
+        def spy_put(self, sql, params, rows, description, state_hash=0):
+            seen_puts.append((sql, params, state_hash))
+            return original_put(self, sql, params, rows, description, state_hash)
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                return [("alice",)]
+
+            async def execute(self, sql, *args):
+                return "SET"
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+
+        with patch.object(NativeCache, "put", spy_put):
+            await a.execute("SET app.user_id = '42'")
+            await a.fetch("SELECT name FROM accounts")
+
+        # The fetch's put landed on the cache with the post-SET hash.
+        assert any(
+            sql == "SELECT name FROM accounts" and state_hash != 0
+            for sql, _params, state_hash in seen_puts
+        ), f"Expected non-zero state_hash on fetch put, saw {seen_puts}"

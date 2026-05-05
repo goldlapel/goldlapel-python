@@ -345,10 +345,12 @@ class TestConfigToArgs:
         assert _config_to_args({"pool_size": 50}) == ["--pool-size", "50"]
 
     def test_boolean_true(self):
-        assert _config_to_args({"disable_matviews": True}) == ["--disable-matviews"]
+        # `disable_pool` is a representative still-in-config bool key —
+        # `disable_matviews` was promoted to a top-level kwarg.
+        assert _config_to_args({"disable_pool": True}) == ["--disable-pool"]
 
     def test_boolean_false(self):
-        assert _config_to_args({"disable_matviews": False}) == []
+        assert _config_to_args({"disable_pool": False}) == []
 
     def test_list_value(self):
         result = _config_to_args({"replica": ["url1", "url2"]})
@@ -439,7 +441,7 @@ class TestConfigKeys:
         keys = config_keys()
         assert isinstance(keys, set)
         assert "pool_size" in keys
-        assert "disable_matviews" in keys
+        assert "disable_pool" in keys
         assert "replica" in keys
 
     def test_config_keys_does_not_contain_promoted_top_level_keys(self):
@@ -449,6 +451,8 @@ class TestConfigKeys:
         for promoted in (
             "mode", "log_level", "dashboard_port", "invalidation_port",
             "config", "license", "client", "silent",
+            "disable_proxy_cache", "disable_matviews",
+            "disable_sqloptimize", "disable_auto_indexes",
         ):
             assert promoted not in keys
 
@@ -986,11 +990,12 @@ class TestMeshKwargs:
         assert "--mesh-tag" not in cmd
 
 
-class TestEnableProxyCacheForWrappersKwarg:
-    """`enable_proxy_cache_for_wrappers` overrides the proxy's per-connection
-    wrapper skip on the proxy cache. Default False — proxy auto-skips its
-    cache for wrapper-tagged conns. Multi-pod fleet customers set True so the
-    proxy cache is a shared cross-pod cache.
+class TestPromotedDisableFlags:
+    """Top-level disable kwargs that map 1:1 to proxy CLI flags. Each
+    defaults to False; True emits the corresponding `--disable-X` flag.
+    Promoted out of the structured `config` map for parity with
+    `disable_native_cache` — passing them through `config={...}` is a
+    hard error.
     """
 
     def setup_method(self):
@@ -999,64 +1004,175 @@ class TestEnableProxyCacheForWrappersKwarg:
     def teardown_method(self):
         _reset_module_state()
 
-    def test_enable_proxy_cache_for_wrappers_defaults_false(self):
+    # -- Stored attribute defaults / mutability ------------------------
+
+    def test_disable_proxy_cache_defaults_false(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._enable_proxy_cache_for_wrappers is False
+        assert gl._disable_proxy_cache is False
 
-    def test_enable_proxy_cache_for_wrappers_true_stored(self):
-        gl = GoldLapel(
-            "postgresql://localhost:5432/mydb",
-            enable_proxy_cache_for_wrappers=True,
-        )
-        assert gl._enable_proxy_cache_for_wrappers is True
+    def test_disable_proxy_cache_true_stored(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", disable_proxy_cache=True)
+        assert gl._disable_proxy_cache is True
 
-    def test_enable_proxy_cache_for_wrappers_in_config_map_rejected(self):
-        # Regression guard: enable_proxy_cache_for_wrappers is a top-level
-        # kwarg, not a config key.
+    def test_disable_matviews_defaults_false(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert gl._disable_matviews is False
+
+    def test_disable_matviews_true_stored(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", disable_matviews=True)
+        assert gl._disable_matviews is True
+
+    def test_disable_sqloptimize_defaults_false(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert gl._disable_sqloptimize is False
+
+    def test_disable_sqloptimize_true_stored(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", disable_sqloptimize=True)
+        assert gl._disable_sqloptimize is True
+
+    def test_disable_auto_indexes_defaults_false(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert gl._disable_auto_indexes is False
+
+    def test_disable_auto_indexes_true_stored(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", disable_auto_indexes=True)
+        assert gl._disable_auto_indexes is True
+
+    # -- Rejected from config map (atomic break) -----------------------
+
+    def test_disable_proxy_cache_in_config_map_rejected(self):
         with pytest.raises(ValueError, match="Unknown config keys"):
-            _config_to_args({"enable_proxy_cache_for_wrappers": True})
+            _config_to_args({"disable_proxy_cache": True})
 
-    def test_enable_proxy_cache_for_wrappers_not_in_config_keys(self):
+    def test_disable_matviews_in_config_map_rejected(self):
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"disable_matviews": True})
+
+    def test_disable_sqloptimize_in_config_map_rejected(self):
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"disable_sqloptimize": True})
+
+    def test_disable_auto_indexes_in_config_map_rejected(self):
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            _config_to_args({"disable_auto_indexes": True})
+
+    def test_disable_keys_not_in_config_keys(self):
         keys = config_keys()
-        assert "enable_proxy_cache_for_wrappers" not in keys
+        for promoted in (
+            "disable_proxy_cache", "disable_matviews",
+            "disable_sqloptimize", "disable_auto_indexes",
+        ):
+            assert promoted not in keys, (
+                f"{promoted} is now a top-level kwarg, must not be in config map"
+            )
+
+    # -- argv emission --------------------------------------------------
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_enable_proxy_cache_for_wrappers_flag_forwarded_to_binary(
+    def test_disable_proxy_cache_emits_flag(
         self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+        start("postgresql://host:5432/mydb", disable_proxy_cache=True, silent=True)
+        cmd = mock_popen.call_args[0][0]
+        assert "--disable-proxy-cache" in cmd
 
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_disable_matviews_emits_flag(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+        start("postgresql://host:5432/mydb", disable_matviews=True, silent=True)
+        cmd = mock_popen.call_args[0][0]
+        assert "--disable-matviews" in cmd
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_disable_sqloptimize_emits_flag(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+        start("postgresql://host:5432/mydb", disable_sqloptimize=True, silent=True)
+        cmd = mock_popen.call_args[0][0]
+        assert "--disable-sqloptimize" in cmd
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_disable_auto_indexes_emits_flag(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+        start("postgresql://host:5432/mydb", disable_auto_indexes=True, silent=True)
+        cmd = mock_popen.call_args[0][0]
+        assert "--disable-auto-indexes" in cmd
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_default_no_disable_flags(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        # Default state: none of the promoted flags should appear in argv.
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+        start("postgresql://host:5432/mydb", silent=True)
+        cmd = mock_popen.call_args[0][0]
+        for flag in (
+            "--disable-proxy-cache", "--disable-matviews",
+            "--disable-sqloptimize", "--disable-auto-indexes",
+        ):
+            assert flag not in cmd, f"{flag} unexpectedly present in default argv"
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_all_four_flags_compose(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
         start(
             "postgresql://host:5432/mydb",
-            enable_proxy_cache_for_wrappers=True,
+            disable_proxy_cache=True,
+            disable_matviews=True,
+            disable_sqloptimize=True,
+            disable_auto_indexes=True,
             silent=True,
         )
+        cmd = mock_popen.call_args[0][0]
+        for flag in (
+            "--disable-proxy-cache", "--disable-matviews",
+            "--disable-sqloptimize", "--disable-auto-indexes",
+        ):
+            assert flag in cmd
 
-        call_args, _ = mock_popen.call_args
-        cmd = call_args[0]
-        assert "--enable-proxy-cache-for-wrappers" in cmd, (
-            f"--enable-proxy-cache-for-wrappers missing from argv: {cmd}"
-        )
+    # -- enable_proxy_cache_for_wrappers regression — gone for good ----
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
-    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
-    @patch("goldlapel.proxy._wait_for_port", return_value=True)
-    @patch("goldlapel.proxy.subprocess.Popen")
-    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_enable_proxy_cache_for_wrappers_default_no_flag(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
-    ):
-        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
-
-        start("postgresql://host:5432/mydb", silent=True)
-
-        call_args, _ = mock_popen.call_args
-        cmd = call_args[0]
-        assert "--enable-proxy-cache-for-wrappers" not in cmd
+    def test_enable_proxy_cache_for_wrappers_kwarg_rejected(self):
+        # Atomic break (Model B): the wrapper-skip override flag was
+        # dropped on both sides. Passing the old kwarg now raises
+        # TypeError on the unknown keyword.
+        with pytest.raises(TypeError):
+            GoldLapel(
+                "postgresql://host:5432/mydb",
+                enable_proxy_cache_for_wrappers=True,
+            )
 
 
 class TestDisableNativeCacheKwarg:

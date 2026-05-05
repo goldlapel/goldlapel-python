@@ -47,12 +47,349 @@ _SQL_KEYWORDS = frozenset({
 })
 
 
-def _make_key(sql, params):
+# --- Per-connection GUC state tracking (L1 cache-key safety) ---
+#
+# Mirrors the proxy's `src/guc_state.rs` (Wave 2.5, "Option Y"). Custom-GUC-
+# driven RLS — `SET app.user_id = '42'; SELECT * FROM accounts;` where the
+# RLS policy reads `current_setting('app.user_id')` — can leak user A's
+# results to user B if the L1 native cache is keyed purely by SQL+params.
+# Each `CachedConnection` carries its own `ConnectionGucState`; the state
+# hash is folded into the cache key so two connections with different
+# unsafe-GUC values never share a cache slot.
+#
+# Classifier: a GUC name is **unsafe** if it's in the short hardcoded list
+# below OR contains a `.` (namespaced — `app.*`, `myapp.*`, etc., the
+# canonical pattern for custom RLS state). Match is case-insensitive.
+#
+# `SET LOCAL` is intentionally ignored for state-hash purposes: SET LOCAL
+# only takes effect inside a transaction, and the wrapper already bypasses
+# the cache for in-transaction reads (`_in_transaction`), so a SET LOCAL
+# never influences a cacheable response.
+
+_UNSAFE_GUC_SHORT_LIST = frozenset({
+    "search_path",
+    "role",
+    "session_authorization",
+    "default_transaction_isolation",
+    "default_transaction_read_only",
+    "transaction_isolation",
+    "row_security",
+})
+
+
+def is_unsafe_guc(name):
+    """Classify a GUC name as state-affecting (True) or harmless (False).
+
+    Case-insensitive. A GUC is unsafe if it's in the short hardcoded list
+    (search_path, role, session_authorization, default_transaction_*,
+    transaction_isolation, row_security) OR contains a `.` (namespaced —
+    app.*, myapp.*, etc.).
+    """
+    lower = name.lower()
+    if "." in lower:
+        return True
+    return lower in _UNSAFE_GUC_SHORT_LIST
+
+
+def split_statements(sql):
+    """Split a SQL string on top-level `;` characters, respecting single-
+    and double-quoted string literals (PG's doubled-quote escape `''`/`""`
+    handled). Returns each segment with surrounding whitespace trimmed;
+    empty segments dropped.
+
+    The lightest possible "statement splitter" — does not understand
+    dollar-quoted strings or comments. Good enough for splitting
+    `SET foo='a'; SELECT 1`-style multi-statement bodies, which is the
+    only reason it exists.
+    """
+    out = []
+    start = 0
+    quote = None
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if quote is not None:
+            if c == quote:
+                # PG's `''` and SQL-standard `""` doubled-quote escape.
+                if i + 1 < n and sql[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+        else:
+            if c == "'" or c == '"':
+                quote = c
+            elif c == ";":
+                segment = sql[start:i].strip()
+                if segment:
+                    out.append(segment)
+                start = i + 1
+        i += 1
+    tail = sql[start:].strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+# Marker for `SetCommand` kinds. Returned as a 4-tuple
+# `(kind, name, value)` from `parse_set_command` so callers can pattern-
+# match without paying for a class allocation per call. Kinds:
+#   "set"        — SET name = value (and SET SESSION ... variant)
+#   "set_local"  — SET LOCAL name = value (ignored for state hash)
+#   "reset"      — RESET name
+#   "reset_all"  — RESET ALL
+SET_KIND_SET = "set"
+SET_KIND_SET_LOCAL = "set_local"
+SET_KIND_RESET = "reset"
+SET_KIND_RESET_ALL = "reset_all"
+
+
+def _normalize_guc_name(token):
+    """Lowercase the GUC name and strip surrounding double quotes (PG
+    treats `"app.user_id"` and `app.user_id` as the same identifier
+    when it's a configuration parameter — we discard case anyway)."""
+    trimmed = token.strip('"')
+    if not trimmed:
+        return None
+    return trimmed.lower()
+
+
+def _strip_value_quotes(value):
+    """Strip a single layer of matching surrounding quotes (`'...'` or
+    `"..."`) from a value. Multi-token quoted values like `'foo bar'`
+    arrive as the joined string already; this just peels the outer
+    quotes."""
+    v = value.strip()
+    if len(v) >= 2:
+        first = v[0]
+        last = v[-1]
+        if (first == "'" and last == "'") or (first == '"' and last == '"'):
+            return v[1:-1]
+    return v
+
+
+def parse_set_command(sql):
+    """Parse a `SET` / `RESET` command out of a single SQL statement.
+
+    Recognises:
+    - `SET name = value`, `SET name TO value`
+    - `SET SESSION name = value`, `SET SESSION name TO value`
+    - `SET LOCAL name = value`, `SET LOCAL name TO value`
+    - `RESET name`
+    - `RESET ALL`
+
+    Returns `(kind, name, value)` where `kind` is one of `SET_KIND_*`.
+    For `RESET ALL`, returns `("reset_all", None, None)`. For `RESET name`,
+    returns `("reset", name, None)`. For SET / SET LOCAL, returns
+    `("set"|"set_local", name, value)`.
+
+    Returns `None` for anything else (including `SET TIME ZONE 'UTC'` —
+    the legacy two-word form. Timezone is harmless and the unusual
+    two-word GUC name doesn't fit the pattern; treating it as "not a
+    trackable SET" is correct because it doesn't affect cache safety).
+
+    Intentionally narrow — handles a single statement. For multi-
+    statement SQL, use `split_statements()` first and call this on each
+    segment.
+    """
+    s = sql.strip()
+    # Strip a trailing semicolon if present.
+    if s.endswith(";"):
+        s = s[:-1].rstrip()
+    if not s:
+        return None
+
+    tokens = s.split()
+    if not tokens:
+        return None
+    head = tokens[0]
+
+    # RESET branch.
+    if head.lower() == "reset":
+        if len(tokens) < 2:
+            return None
+        target = tokens[1]
+        # `RESET name` — anything after `name` is junk we don't expect.
+        if len(tokens) > 2:
+            return None
+        if target.lower() == "all":
+            return (SET_KIND_RESET_ALL, None, None)
+        name = _normalize_guc_name(target)
+        if name is None:
+            return None
+        return (SET_KIND_RESET, name, None)
+
+    if head.lower() != "set":
+        return None
+
+    # SET branch — check for optional LOCAL/SESSION modifier.
+    idx = 1
+    if idx >= len(tokens):
+        return None
+    modifier = tokens[idx].lower()
+    is_local = False
+    if modifier == "local":
+        is_local = True
+        idx += 1
+    elif modifier == "session":
+        idx += 1
+
+    if idx >= len(tokens):
+        return None
+    next_tok = tokens[idx]
+    idx += 1
+
+    # The next token may have an `=` glued onto it (e.g. `SET app.user='42'`).
+    glued_value = None
+    if "=" in next_tok:
+        eq_pos = next_tok.find("=")
+        name_token = next_tok[:eq_pos]
+        rest = next_tok[eq_pos + 1:]
+        glued_value = rest if rest else None
+    else:
+        name_token = next_tok
+
+    name = _normalize_guc_name(name_token)
+    if name is None:
+        return None
+
+    # Resolve the value string.
+    if glued_value is not None:
+        rest_after = " ".join(tokens[idx:])
+        if rest_after:
+            value_str = f"{glued_value} {rest_after}"
+        else:
+            value_str = glued_value
+    else:
+        if idx >= len(tokens):
+            return None
+        sep = tokens[idx]
+        idx += 1
+        if sep != "=" and sep.lower() != "to":
+            return None
+        if idx >= len(tokens):
+            # `SET foo =` / `SET foo TO` with no value.
+            return None
+        value_str = " ".join(tokens[idx:])
+
+    value = _strip_value_quotes(value_str.strip())
+    # Reject empty values (e.g. `SET foo = ''` would have a value of "" —
+    # but the original `value_str` is `''`, which `strip` leaves as `''`,
+    # which `_strip_value_quotes` peels to "". This is a real value (empty
+    # string) and we accept it, distinguishing from `SET foo =` which we
+    # reject above.).
+    if not value_str.strip():
+        return None
+
+    if is_local:
+        return (SET_KIND_SET_LOCAL, name, value)
+    return (SET_KIND_SET, name, value)
+
+
+class ConnectionGucState:
+    """Per-connection unsafe-GUC state tracker.
+
+    Stores values for unsafe GUCs only (harmless GUCs — timezone,
+    application_name, planner cost knobs, etc. — never enter the map and
+    never affect the hash). The state hash is recomputed on every
+    mutation and folded into L1 cache keys.
+
+    Hash is `0` for the empty (default) state, so a fresh connection's
+    state hash matches "no GUCs set" cache slots from peer connections —
+    which is the correct, secure default (any connection that has set an
+    unsafe GUC gets a non-zero hash).
+    """
+
+    __slots__ = ("_values", "_hash")
+
+    def __init__(self):
+        self._values = {}  # lowercased GUC name → raw value string
+        self._hash = 0
+
+    @property
+    def hash(self):
+        """Current state hash. `0` for empty state."""
+        return self._hash
+
+    def apply(self, cmd):
+        """Apply a parsed (kind, name, value) tuple from
+        `parse_set_command`. No-op for SetLocal (cache is bypassed in
+        transactions anyway), no-op for safe GUC names. Returns True
+        if the hash mutated."""
+        kind, name, value = cmd
+        if kind == SET_KIND_SET:
+            if is_unsafe_guc(name):
+                prev = self._values.get(name)
+                if prev != value:
+                    self._values[name] = value
+                    self._recompute_hash()
+                    return True
+            return False
+        if kind == SET_KIND_SET_LOCAL:
+            # Intentionally ignored (see class docstring).
+            return False
+        if kind == SET_KIND_RESET:
+            if is_unsafe_guc(name) and name in self._values:
+                del self._values[name]
+                self._recompute_hash()
+                return True
+            return False
+        if kind == SET_KIND_RESET_ALL:
+            if self._values:
+                self._values.clear()
+                self._recompute_hash()
+                return True
+            return False
+        return False
+
+    def observe_sql(self, sql):
+        """Observe a SQL string for SET / RESET commands and update
+        state accordingly. Multi-statement bodies are split on top-level
+        `;` (string literals respected) so a single Q like
+        `SET app.user_id = '42'; SELECT 1` still updates state. Returns
+        True if the hash mutated.
+        """
+        before = self._hash
+        # Fast path for the common single-statement case — avoid
+        # allocating the list from split_statements for every wire
+        # message that isn't a multi-statement body.
+        trimmed = sql.rstrip()
+        if trimmed.endswith(";"):
+            trimmed = trimmed[:-1]
+        if ";" not in trimmed:
+            cmd = parse_set_command(sql)
+            if cmd is not None:
+                self.apply(cmd)
+        else:
+            for stmt in split_statements(sql):
+                cmd = parse_set_command(stmt)
+                if cmd is not None:
+                    self.apply(cmd)
+        return self._hash != before
+
+    def _recompute_hash(self):
+        if not self._values:
+            self._hash = 0
+            return
+        # Sorted iteration → deterministic hash regardless of insertion
+        # order. Python's `hash()` is process-randomised, but the state
+        # hash never crosses process boundaries (it's only ever used as
+        # part of a local L1 cache key), so that's fine.
+        self._hash = hash(tuple(sorted(self._values.items())))
+
+
+def _make_key(sql, params, state_hash=0):
     if params is None:
-        return (sql, None)
-    if isinstance(params, dict):
-        return (sql, tuple(sorted(params.items())))
-    return (sql, tuple(params))
+        params_part = None
+    elif isinstance(params, dict):
+        params_part = tuple(sorted(params.items()))
+    else:
+        params_part = tuple(params)
+    # state_hash defaults to 0 — empty / fresh-connection state. Two
+    # connections that have never set an unsafe GUC share the same key
+    # for the same SQL+params (which is correct — they have identical
+    # security context).
+    return (sql, params_part, state_hash)
 
 
 def _detect_write(sql):
@@ -221,7 +558,7 @@ class NativeCache:
         self._state_cache_full = False
         self._initialized = True
 
-    def get(self, sql, params):
+    def get(self, sql, params, state_hash=0):
         if not self._enabled or not self._invalidation_connected:
             return None
         # Disabled mode: always miss, but still tick the counter so the
@@ -234,7 +571,7 @@ class NativeCache:
                 self.stats_misses += 1
             return None
         try:
-            key = _make_key(sql, params)
+            key = _make_key(sql, params, state_hash)
             hash(key)
         except TypeError:
             return None
@@ -247,7 +584,7 @@ class NativeCache:
             self.stats_misses += 1
             return None
 
-    def put(self, sql, params, rows, description):
+    def put(self, sql, params, rows, description, state_hash=0):
         if not self._enabled or not self._invalidation_connected:
             return
         # Disabled mode: silent no-op. We never store, so eviction can't
@@ -256,7 +593,7 @@ class NativeCache:
         if self._disabled:
             return
         try:
-            key = _make_key(sql, params)
+            key = _make_key(sql, params, state_hash)
             hash(key)
         except TypeError:
             return

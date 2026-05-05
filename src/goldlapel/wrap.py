@@ -1,6 +1,13 @@
 import atexit
 
-from goldlapel.cache import NativeCache, _detect_write, _DDL_SENTINEL, _TX_START, _TX_END
+from goldlapel.cache import (
+    NativeCache,
+    ConnectionGucState,
+    _detect_write,
+    _DDL_SENTINEL,
+    _TX_START,
+    _TX_END,
+)
 
 _cache = None
 _atexit_registered = False
@@ -59,6 +66,11 @@ class CachedConnection:
         object.__setattr__(self, "_real", real_conn)
         object.__setattr__(self, "_cache", cache)
         object.__setattr__(self, "_in_transaction", False)
+        # Per-connection unsafe-GUC state. Folded into the L1 cache key so
+        # two connections that have set different `app.user_id` (or any
+        # other unsafe GUC) never share a cache slot. See
+        # goldlapel.cache.ConnectionGucState for the full classifier rule.
+        object.__setattr__(self, "_guc_state", ConnectionGucState())
 
     def cursor(self, *args, **kwargs):
         real_cursor = self._real.cursor(*args, **kwargs)
@@ -104,6 +116,15 @@ class CachedCursor:
         object.__setattr__(self, "_cached_description", None)
         object.__setattr__(self, "_fetch_index", 0)
 
+        # Observe SET / RESET commands BEFORE any cache decision so a
+        # multi-statement Q like `SET app.user_id='42'; SELECT ...`
+        # updates state and then keys the SELECT under the new hash.
+        # observe_sql is fast-pathed for non-SET statements (no allocation
+        # when there's no `;` and no "SET"/"RESET" prefix to match).
+        if self._conn is not None:
+            self._conn._guc_state.observe_sql(sql)
+        state_hash = self._conn._guc_state.hash if self._conn is not None else 0
+
         # Transaction tracking (state on connection, not cursor)
         if _TX_START.match(sql):
             if self._conn is not None:
@@ -131,8 +152,8 @@ class CachedCursor:
         if getattr(self._real, "name", None):
             return self._real.execute(sql, params)
 
-        # Read path: check native cache
-        entry = self._cache.get(sql, params)
+        # Read path: check native cache (state_hash-keyed)
+        entry = self._cache.get(sql, params, state_hash)
         if entry is not None:
             object.__setattr__(self, "_cached_rows", entry.rows)
             object.__setattr__(self, "_cached_description", entry.description)
@@ -151,7 +172,7 @@ class CachedCursor:
                 return result  # fetchall failed, cursor state is gone, nothing we can do
             # Cache the result (best effort)
             try:
-                self._cache.put(sql, params, rows, desc)
+                self._cache.put(sql, params, rows, desc, state_hash)
             except Exception:
                 pass
             # Always serve from our copy since we consumed the cursor
@@ -200,6 +221,10 @@ class CachedCursor:
         return self._real.rowcount
 
     def executemany(self, sql, params_list):
+        # Observe in case the caller `executemany`s a `SET ...` (unusual
+        # but cheap to track and avoids stale cache slots if they do).
+        if self._conn is not None:
+            self._conn._guc_state.observe_sql(sql)
         write_table = _detect_write(sql)
         if write_table:
             if write_table == _DDL_SENTINEL:
@@ -244,8 +269,15 @@ class AsyncCachedConnection:
         object.__setattr__(self, "_real", real_conn)
         object.__setattr__(self, "_cache", cache)
         object.__setattr__(self, "_in_transaction", False)
+        # Per-connection unsafe-GUC state — see CachedConnection for the
+        # full rationale. Keyed into the L1 cache slot so SETs on this
+        # asyncpg connection don't leak cached rows to peer connections
+        # with different RLS context.
+        object.__setattr__(self, "_guc_state", ConnectionGucState())
 
     async def fetch(self, sql, *args):
+        self._guc_state.observe_sql(sql)
+        state_hash = self._guc_state.hash
         write_table = _detect_write(sql)
         if write_table:
             if write_table == _DDL_SENTINEL:
@@ -258,15 +290,17 @@ class AsyncCachedConnection:
             return await self._real.fetch(sql, *args)
 
         params = args if args else None
-        entry = self._cache.get(sql, params)
+        entry = self._cache.get(sql, params, state_hash)
         if entry is not None:
             return entry.rows
 
         rows = await self._real.fetch(sql, *args)
-        self._cache.put(sql, params, list(rows), None)
+        self._cache.put(sql, params, list(rows), None, state_hash)
         return rows
 
     async def fetchrow(self, sql, *args):
+        self._guc_state.observe_sql(sql)
+        state_hash = self._guc_state.hash
         write_table = _detect_write(sql)
         if write_table:
             if write_table == _DDL_SENTINEL:
@@ -279,16 +313,18 @@ class AsyncCachedConnection:
             return await self._real.fetchrow(sql, *args)
 
         params = args if args else None
-        entry = self._cache.get(sql, params)
+        entry = self._cache.get(sql, params, state_hash)
         if entry is not None:
             return entry.rows[0] if entry.rows else None
 
         row = await self._real.fetchrow(sql, *args)
         if row is not None:
-            self._cache.put(sql, params, [row], None)
+            self._cache.put(sql, params, [row], None, state_hash)
         return row
 
     async def fetchval(self, sql, *args, column=0):
+        self._guc_state.observe_sql(sql)
+        state_hash = self._guc_state.hash
         write_table = _detect_write(sql)
         if write_table:
             if write_table == _DDL_SENTINEL:
@@ -301,7 +337,7 @@ class AsyncCachedConnection:
             return await self._real.fetchval(sql, *args, column=column)
 
         params = args if args else None
-        entry = self._cache.get(sql, params)
+        entry = self._cache.get(sql, params, state_hash)
         if entry is not None:
             if entry.rows:
                 row = entry.rows[0]
@@ -314,6 +350,10 @@ class AsyncCachedConnection:
         return val
 
     async def execute(self, sql, *args):
+        # `execute` doesn't read into the cache (asyncpg's execute returns
+        # status strings, not rows), but we still observe SETs so a
+        # subsequent fetch* call sees the updated state hash.
+        self._guc_state.observe_sql(sql)
         write_table = _detect_write(sql)
         if write_table:
             if write_table == _DDL_SENTINEL:

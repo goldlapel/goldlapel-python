@@ -9,6 +9,7 @@ import pytest
 from goldlapel.cache import (
     NativeCache,
     CacheEntry,
+    ConnectionGucState,
     _detect_write,
     _extract_tables,
     _make_key,
@@ -18,6 +19,13 @@ from goldlapel.cache import (
     _EVICT_RATE_WINDOW,
     _TX_START,
     _TX_END,
+    is_unsafe_guc,
+    parse_set_command,
+    split_statements,
+    SET_KIND_SET,
+    SET_KIND_SET_LOCAL,
+    SET_KIND_RESET,
+    SET_KIND_RESET_ALL,
 )
 
 
@@ -44,23 +52,38 @@ def make_cache(max_entries=100, enabled=True, connected=True):
 # --- Cache key ---
 
 class TestMakeKey:
+    # Cache keys are 3-tuples: (sql, params, state_hash). The state_hash
+    # defaults to 0 (empty / fresh-connection state) for back-compat with
+    # call sites that haven't yet observed any unsafe SET commands.
     def test_none_params(self):
-        assert _make_key("SELECT 1", None) == ("SELECT 1", None)
+        assert _make_key("SELECT 1", None) == ("SELECT 1", None, 0)
 
     def test_tuple_params(self):
-        assert _make_key("SELECT $1", (42,)) == ("SELECT $1", (42,))
+        assert _make_key("SELECT $1", (42,)) == ("SELECT $1", (42,), 0)
 
     def test_list_params(self):
-        assert _make_key("SELECT $1", [42]) == ("SELECT $1", (42,))
+        assert _make_key("SELECT $1", [42]) == ("SELECT $1", (42,), 0)
 
     def test_dict_params(self):
         key = _make_key("SELECT %(id)s", {"id": 42, "name": "test"})
-        assert key == ("SELECT %(id)s", (("id", 42), ("name", "test")))
+        assert key == ("SELECT %(id)s", (("id", 42), ("name", "test")), 0)
 
     def test_dict_params_order_independent(self):
         k1 = _make_key("SELECT 1", {"b": 2, "a": 1})
         k2 = _make_key("SELECT 1", {"a": 1, "b": 2})
         assert k1 == k2
+
+    def test_state_hash_changes_key(self):
+        k0 = _make_key("SELECT 1", None, 0)
+        k1 = _make_key("SELECT 1", None, 12345)
+        assert k0 != k1, "Different state_hash must produce a different cache key"
+
+    def test_state_hash_default_is_zero(self):
+        # When omitted, state_hash is 0 — preserves identical keys for
+        # callers that haven't been updated to pass it through.
+        k_default = _make_key("SELECT 1", (1,))
+        k_explicit_zero = _make_key("SELECT 1", (1,), 0)
+        assert k_default == k_explicit_zero
 
 
 # --- Write detection ---
@@ -802,3 +825,382 @@ class TestDisableNativeCache:
         cache2 = NativeCache(disabled=False)
         assert cache2 is cache  # singleton
         assert cache._disabled is False
+
+
+# --- L1 state-hash: unsafe-GUC classifier ---
+#
+# Mirrors the proxy's `src/guc_state.rs::tests::is_unsafe_guc` shape. Custom
+# RLS state (anything namespaced via `.`) is unsafe by default; a short
+# hardcoded list covers the well-known core GUCs that change query results
+# without changing the SQL text. Match is case-insensitive everywhere.
+
+
+class TestIsUnsafeGuc:
+    def test_short_list_search_path(self):
+        assert is_unsafe_guc("search_path")
+
+    def test_short_list_role(self):
+        assert is_unsafe_guc("role")
+
+    def test_short_list_session_authorization(self):
+        assert is_unsafe_guc("session_authorization")
+
+    def test_short_list_default_transaction_isolation(self):
+        assert is_unsafe_guc("default_transaction_isolation")
+
+    def test_short_list_default_transaction_read_only(self):
+        assert is_unsafe_guc("default_transaction_read_only")
+
+    def test_short_list_transaction_isolation(self):
+        assert is_unsafe_guc("transaction_isolation")
+
+    def test_short_list_row_security(self):
+        assert is_unsafe_guc("row_security")
+
+    def test_short_list_case_insensitive(self):
+        assert is_unsafe_guc("ROLE")
+        assert is_unsafe_guc("Search_Path")
+        assert is_unsafe_guc("SEARCH_PATH")
+
+    def test_namespaced_unsafe(self):
+        # Any GUC with a `.` in the name is treated as unsafe — the canonical
+        # custom-RLS pattern (`SET app.user_id = '42'` / read via
+        # current_setting('app.user_id')).
+        assert is_unsafe_guc("app.user_id")
+        assert is_unsafe_guc("myapp.tenant")
+        assert is_unsafe_guc("rls.account")
+        assert is_unsafe_guc("a.b.c")  # arbitrarily nested
+        assert is_unsafe_guc("APP.USER")
+
+    def test_safe_gucs(self):
+        # Harmless GUCs — they don't change query results, so they don't
+        # need to enter the cache key.
+        assert not is_unsafe_guc("timezone")
+        assert not is_unsafe_guc("application_name")
+        assert not is_unsafe_guc("statement_timeout")
+        assert not is_unsafe_guc("work_mem")
+        assert not is_unsafe_guc("client_encoding")
+        assert not is_unsafe_guc("DateStyle")
+
+
+# --- L1 state-hash: SET / RESET parser ---
+
+
+class TestParseSetCommand:
+    # -- shapes --
+
+    def test_set_eq_quoted(self):
+        assert parse_set_command("SET foo = 'bar'") == (SET_KIND_SET, "foo", "bar")
+
+    def test_set_to_quoted(self):
+        assert parse_set_command("SET foo TO 'bar'") == (SET_KIND_SET, "foo", "bar")
+
+    def test_set_unquoted(self):
+        assert parse_set_command("SET foo = 42") == (SET_KIND_SET, "foo", "42")
+
+    def test_set_session_modifier(self):
+        # SESSION is the default — same effect as bare SET.
+        assert parse_set_command("SET SESSION foo = 'bar'") == (SET_KIND_SET, "foo", "bar")
+
+    def test_set_local_modifier(self):
+        assert parse_set_command("SET LOCAL foo = 'bar'") == (SET_KIND_SET_LOCAL, "foo", "bar")
+
+    def test_reset_named(self):
+        assert parse_set_command("RESET foo") == (SET_KIND_RESET, "foo", None)
+
+    def test_reset_all(self):
+        assert parse_set_command("RESET ALL") == (SET_KIND_RESET_ALL, None, None)
+
+    # -- case + whitespace + semicolon --
+
+    def test_case_insensitive_keywords(self):
+        assert parse_set_command("set foo = 'bar'") == (SET_KIND_SET, "foo", "bar")
+        assert parse_set_command("Set Local foo To 'bar'") == (SET_KIND_SET_LOCAL, "foo", "bar")
+        assert parse_set_command("reset all") == (SET_KIND_RESET_ALL, None, None)
+
+    def test_lowercases_guc_name(self):
+        # GUC names are stored lowercased so `SET App.User_ID` and
+        # `SET app.user_id` collapse onto the same state slot.
+        assert parse_set_command("SET App.User_ID = '42'") == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_tolerates_trailing_semicolon(self):
+        assert parse_set_command("SET foo = 'bar';") == (SET_KIND_SET, "foo", "bar")
+        assert parse_set_command("RESET foo ;") == (SET_KIND_RESET, "foo", None)
+
+    def test_tolerates_extra_whitespace(self):
+        assert parse_set_command("   SET    foo   =   'bar'   ") == (SET_KIND_SET, "foo", "bar")
+
+    def test_glued_equals(self):
+        # Some clients send `SET name=value` with no spaces.
+        assert parse_set_command("SET app.user_id='42'") == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_double_quoted_value(self):
+        assert parse_set_command('SET foo = "bar"') == (SET_KIND_SET, "foo", "bar")
+
+    def test_double_quoted_name(self):
+        # `"app.user_id"` is a quoted identifier — same value as bare.
+        assert parse_set_command('SET "app.user_id" = \'42\'') == (SET_KIND_SET, "app.user_id", "42")
+
+    # -- rejects --
+
+    def test_rejects_non_set_statements(self):
+        assert parse_set_command("SELECT 1") is None
+        assert parse_set_command("BEGIN") is None
+        assert parse_set_command("UPDATE t SET x = 1") is None
+
+    def test_rejects_empty(self):
+        assert parse_set_command("") is None
+        assert parse_set_command("   ") is None
+        assert parse_set_command(";") is None
+
+    def test_rejects_set_without_value(self):
+        assert parse_set_command("SET foo =") is None
+        assert parse_set_command("SET foo TO") is None
+        assert parse_set_command("SET foo") is None
+
+    def test_rejects_reset_with_garbage(self):
+        # `RESET foo bar` — second token after RESET is unexpected.
+        assert parse_set_command("RESET foo bar") is None
+
+    def test_rejects_set_time_zone_two_word_form(self):
+        # The legacy `SET TIME ZONE 'UTC'` form is not modelled — timezone
+        # is harmless and the unusual two-word GUC name doesn't fit. We
+        # return None so the caller treats it as not-a-trackable-SET (i.e.
+        # cache-safe), which is correct.
+        assert parse_set_command("SET TIME ZONE 'UTC'") is None
+
+
+# --- L1 state-hash: top-level statement splitter ---
+
+
+class TestSplitStatements:
+    def test_simple_two_statements(self):
+        assert split_statements("SET foo = '42'; SELECT 1") == ["SET foo = '42'", "SELECT 1"]
+
+    def test_drops_empty_segments(self):
+        # Trailing `;`, leading `;`, doubled `;;` all produce empty
+        # segments which we drop.
+        assert split_statements("; SET foo = '42';;SELECT 1;") == [
+            "SET foo = '42'", "SELECT 1",
+        ]
+
+    def test_respects_single_quotes(self):
+        # The `;` inside the literal must NOT split the statement.
+        assert split_statements("SET foo = 'a;b'; SELECT 1") == [
+            "SET foo = 'a;b'", "SELECT 1",
+        ]
+
+    def test_respects_double_quotes(self):
+        assert split_statements('SET "app;guc" = \'x\'; SELECT 1') == [
+            'SET "app;guc" = \'x\'', "SELECT 1",
+        ]
+
+    def test_handles_doubled_quote_escape(self):
+        # PG escapes a literal `'` inside a string by doubling: `''`.
+        assert split_statements("SET foo = 'it''s; ok'; SELECT 1") == [
+            "SET foo = 'it''s; ok'", "SELECT 1",
+        ]
+
+    def test_single_statement_pass_through(self):
+        assert split_statements("SET foo = '42'") == ["SET foo = '42'"]
+
+    def test_empty(self):
+        assert split_statements("") == []
+        assert split_statements("   ") == []
+        assert split_statements(";;;") == []
+
+
+# --- L1 state-hash: ConnectionGucState ---
+
+
+class TestConnectionGucState:
+    def test_empty_state_hash_is_zero(self):
+        s = ConnectionGucState()
+        assert s.hash == 0
+
+    def test_safe_set_does_not_change_hash(self):
+        s = ConnectionGucState()
+        s.observe_sql("SET timezone = 'UTC'")
+        assert s.hash == 0
+        s.observe_sql("SET application_name = 'foo'")
+        assert s.hash == 0
+        s.observe_sql("SET statement_timeout = 5000")
+        assert s.hash == 0
+
+    def test_unsafe_set_changes_hash(self):
+        s = ConnectionGucState()
+        h0 = s.hash
+        s.observe_sql("SET app.user_id = '42'")
+        assert s.hash != h0
+
+    def test_same_unsafe_set_yields_same_hash_on_two_states(self):
+        # Two independent connections that have applied the same unsafe
+        # SET converge on the same hash → cache slot can be safely shared.
+        a = ConnectionGucState()
+        b = ConnectionGucState()
+        a.observe_sql("SET app.user_id = '42'")
+        b.observe_sql("SET app.user_id = '42'")
+        assert a.hash == b.hash
+
+    def test_different_unsafe_values_yield_different_hashes(self):
+        # The whole point — two connections with different `app.user_id`
+        # values must NOT share a cache slot.
+        a = ConnectionGucState()
+        b = ConnectionGucState()
+        a.observe_sql("SET app.user_id = '42'")
+        b.observe_sql("SET app.user_id = '43'")
+        assert a.hash != b.hash
+
+    def test_insertion_order_does_not_matter(self):
+        # State hash must be order-independent (sorted dict / map iteration).
+        a = ConnectionGucState()
+        a.observe_sql("SET app.user_id = '42'")
+        a.observe_sql("SET app.tenant = 'alpha'")
+
+        b = ConnectionGucState()
+        b.observe_sql("SET app.tenant = 'alpha'")
+        b.observe_sql("SET app.user_id = '42'")
+
+        assert a.hash == b.hash
+
+    def test_reset_returns_hash_to_baseline(self):
+        s = ConnectionGucState()
+        baseline = s.hash
+        s.observe_sql("SET app.user_id = '42'")
+        assert s.hash != baseline
+        s.observe_sql("RESET app.user_id")
+        assert s.hash == baseline
+
+    def test_reset_all_clears_all_unsafe_state(self):
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        s.observe_sql("SET search_path TO 'tenant_a'")
+        s.observe_sql("SET role = 'app_user'")
+        assert s.hash != 0
+        s.observe_sql("RESET ALL")
+        assert s.hash == 0
+
+    def test_set_local_does_not_change_hash(self):
+        # SET LOCAL is intentionally ignored for state-hash purposes —
+        # the wrapper bypasses the cache for in-transaction reads anyway.
+        s = ConnectionGucState()
+        s.observe_sql("SET LOCAL app.user_id = '42'")
+        assert s.hash == 0
+
+    def test_observe_sql_returns_change_flag(self):
+        s = ConnectionGucState()
+        assert s.observe_sql("SET app.user_id = '42'") is True
+        assert s.observe_sql("SELECT 1") is False
+        assert s.observe_sql("SET timezone = 'UTC'") is False
+        assert s.observe_sql("RESET app.user_id") is True
+
+    def test_reset_safe_guc_is_noop(self):
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        h = s.hash
+        s.observe_sql("RESET timezone")  # safe — should not perturb.
+        assert s.hash == h
+
+    def test_overwrite_unsafe_value_changes_hash(self):
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        h1 = s.hash
+        s.observe_sql("SET app.user_id = '43'")
+        assert s.hash != h1
+
+    def test_reapply_same_value_does_not_re_emit(self):
+        # Setting the same value twice should be observably stable —
+        # `observe_sql` returns False on the second application because
+        # the hash didn't move.
+        s = ConnectionGucState()
+        assert s.observe_sql("SET app.user_id = '42'") is True
+        assert s.observe_sql("SET app.user_id = '42'") is False
+
+    def test_observe_multi_statement_applies_all_sets(self):
+        # Real-world pattern: client batches a SET with the query.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'; SELECT * FROM accounts")
+        assert s.hash != 0
+
+    def test_observe_multi_statement_two_unsafe_sets_match_separate(self):
+        a = ConnectionGucState()
+        a.observe_sql("SET app.user_id = '42'")
+        a.observe_sql("SET app.tenant = 'alpha'")
+
+        b = ConnectionGucState()
+        b.observe_sql("SET app.user_id = '42'; SET app.tenant = 'alpha'")
+
+        assert a.hash == b.hash
+
+    def test_observe_multi_statement_with_quoted_semicolon(self):
+        # The `;` inside the value must not be treated as a statement
+        # separator.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.tenant = 'has;semicolon'; SELECT 1")
+        assert s.hash != 0
+
+
+# --- L1 state-hash: cache key correctness ---
+#
+# These exercise the contract end-to-end on the cache. The key invariant:
+# two cache writes with identical SQL+params but different state_hash
+# values must map to different slots, so reads from the wrong-hash side
+# never see the other slot's rows. Mirrors the security guarantee the
+# proxy gives at L2.
+
+
+class TestL1CacheStateHash:
+    def test_different_state_hash_different_slot(self):
+        cache = make_cache()
+        # User A writes their row under hash 111.
+        cache.put("SELECT * FROM accounts", None, [("alice",)], None, 111)
+        # User B reads with their own hash 222 — must miss.
+        assert cache.get("SELECT * FROM accounts", None, 222) is None
+
+    def test_same_state_hash_hits(self):
+        cache = make_cache()
+        cache.put("SELECT * FROM accounts", None, [("alice",)], None, 111)
+        entry = cache.get("SELECT * FROM accounts", None, 111)
+        assert entry is not None
+        assert entry.rows == [("alice",)]
+
+    def test_default_state_hash_zero_isolated_from_nonzero(self):
+        cache = make_cache()
+        # Caller that hasn't passed state_hash uses default (0).
+        cache.put("SELECT 1", None, [(1,)], None)
+        # Caller with a non-zero hash reading the same SQL must miss —
+        # they're a different security context.
+        assert cache.get("SELECT 1", None, 999) is None
+
+    def test_two_states_two_slots_no_cross_contamination(self):
+        cache = make_cache()
+        cache.put("SELECT * FROM accounts", None, [("alice",)], None, 111)
+        cache.put("SELECT * FROM accounts", None, [("bob",)], None, 222)
+        # Each side reads only its own row.
+        assert cache.get("SELECT * FROM accounts", None, 111).rows == [("alice",)]
+        assert cache.get("SELECT * FROM accounts", None, 222).rows == [("bob",)]
+
+    def test_state_hash_zero_is_shared_baseline(self):
+        # Two fresh-state callers (both hash=0) share their cache slots —
+        # this is correct: a connection that has never set an unsafe GUC
+        # has the same security context as any other such connection.
+        cache = make_cache()
+        cache.put("SELECT 1", None, [(1,)], None, 0)
+        assert cache.get("SELECT 1", None, 0).rows == [(1,)]
+        # Default arg path also lands on the same slot.
+        assert cache.get("SELECT 1", None).rows == [(1,)]
+
+    def test_invalidate_table_clears_across_state_hashes(self):
+        # Table-level invalidation walks the table_index, which doesn't
+        # carry the state_hash — so it correctly flushes ALL state-hash
+        # variants of a table when the data underneath changes (single
+        # source of truth: a write to `accounts` invalidates every
+        # cached SELECT on accounts regardless of which RLS context
+        # populated it).
+        cache = make_cache()
+        cache.put("SELECT * FROM accounts", None, [("alice",)], None, 111)
+        cache.put("SELECT * FROM accounts", None, [("bob",)], None, 222)
+        cache.invalidate_table("accounts")
+        assert cache.get("SELECT * FROM accounts", None, 111) is None
+        assert cache.get("SELECT * FROM accounts", None, 222) is None
+
