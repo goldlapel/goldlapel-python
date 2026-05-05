@@ -24,9 +24,9 @@ from goldlapel.proxy import (
 
 
 # The proxy URL gets `application_name=goldlapel:python:<version>` appended so
-# the proxy can classify wrapper-vs-raw traffic and skip L2 cache for wrappers
-# (which already have their own L1 cache). The marker is suppressed if the
-# user already set application_name (URL or PGAPPNAME).
+# the proxy can classify wrapper-vs-raw traffic and skip its proxy cache for
+# wrappers (which already have their own native cache). The marker is
+# suppressed if the user already set application_name (URL or PGAPPNAME).
 _APP_NAME_SUFFIX = f"application_name=goldlapel:python:{_wrapper_version()}"
 
 
@@ -211,9 +211,9 @@ class TestMakeProxyUrl:
 
 
 class TestApplicationNameMarker:
-    """L2-router architecture: wrappers identify themselves to the proxy via
-    PG `application_name`, so the proxy can gate L2 result cache (wrappers
-    have their own L1; raw clients don't)."""
+    """Proxy-cache router architecture: wrappers identify themselves to the
+    proxy via PG `application_name`, so the proxy can gate its proxy cache
+    (wrappers have their own native cache; raw clients don't)."""
 
     @pytest.fixture(autouse=True)
     def _no_pgappname(self):
@@ -986,10 +986,11 @@ class TestMeshKwargs:
         assert "--mesh-tag" not in cmd
 
 
-class TestEnableL2ForWrappersKwarg:
-    """`enable_l2_for_wrappers` overrides the proxy's per-connection L2 wrapper
-    skip. Default False — proxy auto-skips L2 for wrapper-tagged conns.
-    Multi-pod fleet customers set True so L2 is a shared cross-pod cache.
+class TestEnableProxyCacheForWrappersKwarg:
+    """`enable_proxy_cache_for_wrappers` overrides the proxy's per-connection
+    wrapper skip on the proxy cache. Default False — proxy auto-skips its
+    cache for wrapper-tagged conns. Multi-pod fleet customers set True so the
+    proxy cache is a shared cross-pod cache.
     """
 
     def setup_method(self):
@@ -998,43 +999,47 @@ class TestEnableL2ForWrappersKwarg:
     def teardown_method(self):
         _reset_module_state()
 
-    def test_enable_l2_for_wrappers_defaults_false(self):
+    def test_enable_proxy_cache_for_wrappers_defaults_false(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._enable_l2_for_wrappers is False
+        assert gl._enable_proxy_cache_for_wrappers is False
 
-    def test_enable_l2_for_wrappers_true_stored(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", enable_l2_for_wrappers=True)
-        assert gl._enable_l2_for_wrappers is True
+    def test_enable_proxy_cache_for_wrappers_true_stored(self):
+        gl = GoldLapel(
+            "postgresql://localhost:5432/mydb",
+            enable_proxy_cache_for_wrappers=True,
+        )
+        assert gl._enable_proxy_cache_for_wrappers is True
 
-    def test_enable_l2_for_wrappers_in_config_map_rejected(self):
-        # Regression guard: enable_l2_for_wrappers is a top-level kwarg, not a config key.
+    def test_enable_proxy_cache_for_wrappers_in_config_map_rejected(self):
+        # Regression guard: enable_proxy_cache_for_wrappers is a top-level
+        # kwarg, not a config key.
         with pytest.raises(ValueError, match="Unknown config keys"):
-            _config_to_args({"enable_l2_for_wrappers": True})
+            _config_to_args({"enable_proxy_cache_for_wrappers": True})
 
-    def test_enable_l2_for_wrappers_not_in_config_keys(self):
+    def test_enable_proxy_cache_for_wrappers_not_in_config_keys(self):
         keys = config_keys()
-        assert "enable_l2_for_wrappers" not in keys
+        assert "enable_proxy_cache_for_wrappers" not in keys
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_enable_l2_for_wrappers_flag_forwarded_to_binary(
+    def test_enable_proxy_cache_for_wrappers_flag_forwarded_to_binary(
         self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         start(
             "postgresql://host:5432/mydb",
-            enable_l2_for_wrappers=True,
+            enable_proxy_cache_for_wrappers=True,
             silent=True,
         )
 
         call_args, _ = mock_popen.call_args
         cmd = call_args[0]
-        assert "--enable-l2-for-wrappers" in cmd, (
-            f"--enable-l2-for-wrappers missing from argv: {cmd}"
+        assert "--enable-proxy-cache-for-wrappers" in cmd, (
+            f"--enable-proxy-cache-for-wrappers missing from argv: {cmd}"
         )
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
@@ -1042,7 +1047,7 @@ class TestEnableL2ForWrappersKwarg:
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_enable_l2_for_wrappers_default_no_flag(
+    def test_enable_proxy_cache_for_wrappers_default_no_flag(
         self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
@@ -1051,12 +1056,12 @@ class TestEnableL2ForWrappersKwarg:
 
         call_args, _ = mock_popen.call_args
         cmd = call_args[0]
-        assert "--enable-l2-for-wrappers" not in cmd
+        assert "--enable-proxy-cache-for-wrappers" not in cmd
 
 
-class TestDisableL1Kwarg:
-    """`disable_l1` is a wrapper-side flag — flips the NativeCache into
-    no-op mode without changing any proxy CLI args. Default False.
+class TestDisableNativeCacheKwarg:
+    """`disable_native_cache` is a wrapper-side flag — flips the NativeCache
+    into no-op mode without changing any proxy CLI args. Default False.
     """
 
     def setup_method(self):
@@ -1065,69 +1070,73 @@ class TestDisableL1Kwarg:
     def teardown_method(self):
         _reset_module_state()
 
-    def test_disable_l1_defaults_false(self):
+    def test_disable_native_cache_defaults_false(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._disable_l1 is False
+        assert gl._disable_native_cache is False
 
-    def test_disable_l1_true_stored(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", disable_l1=True)
-        assert gl._disable_l1 is True
+    def test_disable_native_cache_true_stored(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb", disable_native_cache=True)
+        assert gl._disable_native_cache is True
 
-    def test_disable_l1_in_config_map_rejected(self):
-        # Regression guard: disable_l1 is a top-level kwarg, not a config key.
+    def test_disable_native_cache_in_config_map_rejected(self):
+        # Regression guard: disable_native_cache is a top-level kwarg, not
+        # a config key.
         with pytest.raises(ValueError, match="Unknown config keys"):
-            _config_to_args({"disable_l1": True})
+            _config_to_args({"disable_native_cache": True})
 
-    def test_disable_l1_not_in_config_keys(self):
+    def test_disable_native_cache_not_in_config_keys(self):
         keys = config_keys()
-        assert "disable_l1" not in keys
+        assert "disable_native_cache" not in keys
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_disable_l1_does_not_emit_cli_flag(
+    def test_disable_native_cache_does_not_emit_cli_flag(
         self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
     ):
-        # disable_l1 is wrapper-internal — the Rust binary doesn't need
-        # to know. Make sure we don't accidentally send a phantom flag.
+        # disable_native_cache is wrapper-internal — the Rust binary doesn't
+        # need to know. Make sure we don't accidentally send a phantom flag.
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
-        start("postgresql://host:5432/mydb", disable_l1=True, silent=True)
+        start("postgresql://host:5432/mydb", disable_native_cache=True, silent=True)
 
         call_args, _ = mock_popen.call_args
         cmd = call_args[0]
         # No flag with this concept in the spawned argv.
-        assert not any("disable-l1" in str(arg) or "disable_l1" in str(arg) for arg in cmd)
-        assert not any("--no-l1" in str(arg) for arg in cmd)
+        assert not any(
+            "disable-native-cache" in str(arg) or "disable_native_cache" in str(arg)
+            for arg in cmd
+        )
+        assert not any("--no-native-cache" in str(arg) for arg in cmd)
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_disable_l1_forwarded_to_wrap(
+    def test_disable_native_cache_forwarded_to_wrap(
         self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
     ):
-        # The wrapper side: gl.start() must pass `disable_l1=True` through
-        # to wrap() so the NativeCache singleton is initialized in
+        # The wrapper side: gl.start() must pass `disable_native_cache=True`
+        # through to wrap() so the NativeCache singleton is initialized in
         # disabled mode.
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
-        start("postgresql://host:5432/mydb", disable_l1=True, silent=True)
+        start("postgresql://host:5432/mydb", disable_native_cache=True, silent=True)
 
-        # wrap() is called with disable_l1=True
+        # wrap() is called with disable_native_cache=True
         assert mock_wrap.called
         _, kwargs = mock_wrap.call_args
-        assert kwargs.get("disable_l1") is True
+        assert kwargs.get("disable_native_cache") is True
 
     @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_disable_l1_default_passes_false_to_wrap(
+    def test_disable_native_cache_default_passes_false_to_wrap(
         self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
@@ -1136,4 +1145,4 @@ class TestDisableL1Kwarg:
 
         assert mock_wrap.called
         _, kwargs = mock_wrap.call_args
-        assert kwargs.get("disable_l1") is False
+        assert kwargs.get("disable_native_cache") is False

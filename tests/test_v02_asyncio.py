@@ -483,10 +483,10 @@ class TestAsyncStartupBanner:
             _reset_proxy_state()
 
 
-class TestAsyncDisableL1:
-    """`disable_l1` is plumbed through the async factory the same way as
-    the sync surface — stored on the underlying GoldLapel and forwarded
-    to wrap() at internal-conn open time."""
+class TestAsyncDisableNativeCache:
+    """`disable_native_cache` is plumbed through the async factory the same
+    way as the sync surface — stored on the underlying GoldLapel and
+    forwarded to wrap() at internal-conn open time."""
 
     def _base_patches(self):
         fake_asyncpg = MagicMock()
@@ -496,16 +496,19 @@ class TestAsyncDisableL1:
         fake_asyncpg.connect = AsyncMock(return_value=fake_raw)
         return fake_asyncpg
 
-    def test_async_disable_l1_defaults_false(self):
+    def test_async_disable_native_cache_defaults_false(self):
         gl = AsyncGoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._sync._disable_l1 is False
+        assert gl._sync._disable_native_cache is False
 
-    def test_async_disable_l1_true_stored(self):
-        gl = AsyncGoldLapel("postgresql://localhost:5432/mydb", disable_l1=True)
-        assert gl._sync._disable_l1 is True
+    def test_async_disable_native_cache_true_stored(self):
+        gl = AsyncGoldLapel(
+            "postgresql://localhost:5432/mydb",
+            disable_native_cache=True,
+        )
+        assert gl._sync._disable_native_cache is True
 
     @pytest.mark.asyncio
-    async def test_async_disable_l1_forwarded_to_wrap(self):
+    async def test_async_disable_native_cache_forwarded_to_wrap(self):
         _reset_proxy_state()
         try:
             fake_asyncpg = self._base_patches()
@@ -524,16 +527,16 @@ class TestAsyncDisableL1:
                  patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
                 await gl_async.start(
                     "postgresql://host:5432/mydb",
-                    disable_l1=True,
+                    disable_native_cache=True,
                     silent=True,
                 )
             assert wrap_calls, "wrap() was not called"
-            assert wrap_calls[0].get("disable_l1") is True
+            assert wrap_calls[0].get("disable_native_cache") is True
         finally:
             _reset_proxy_state()
 
     @pytest.mark.asyncio
-    async def test_async_disable_l1_default_passes_false_to_wrap(self):
+    async def test_async_disable_native_cache_default_passes_false_to_wrap(self):
         _reset_proxy_state()
         try:
             fake_asyncpg = self._base_patches()
@@ -552,6 +555,6 @@ class TestAsyncDisableL1:
                  patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
                 await gl_async.start("postgresql://host:5432/mydb", silent=True)
             assert wrap_calls, "wrap() was not called"
-            assert wrap_calls[0].get("disable_l1") is False
+            assert wrap_calls[0].get("disable_native_cache") is False
         finally:
             _reset_proxy_state()

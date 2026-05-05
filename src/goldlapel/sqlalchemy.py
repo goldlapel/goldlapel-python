@@ -35,7 +35,7 @@ def _start_proxy(url, kwargs):
     dashboard_port = kwargs.pop("goldlapel_dashboard_port", None)
     log_level = kwargs.pop("goldlapel_log_level", None)
     mode = kwargs.pop("goldlapel_mode", None)
-    l1_cache = kwargs.pop("goldlapel_l1_cache", True)
+    native_cache = kwargs.pop("goldlapel_native_cache", True)
     clean_url, dialect = _strip_dialect(_url_to_str(url))
     inst = goldlapel.start(
         clean_url,
@@ -60,7 +60,7 @@ def _start_proxy(url, kwargs):
         resolved_port = proxy_port if proxy_port is not None else goldlapel.DEFAULT_PROXY_PORT
         inv_port = resolved_port + 2
 
-    return _restore_dialect(proxy_url, dialect), inv_port, l1_cache
+    return _restore_dialect(proxy_url, dialect), inv_port, native_cache
 
 
 def _make_creator(proxy_url, invalidation_port, user_creator=None):
@@ -92,9 +92,9 @@ def _make_creator(proxy_url, invalidation_port, user_creator=None):
 
 
 def create_engine(url, **kwargs):
-    proxy, inv_port, l1_cache = _start_proxy(url, kwargs)
+    proxy, inv_port, native_cache = _start_proxy(url, kwargs)
 
-    if l1_cache:
+    if native_cache:
         # Strip dialect for the creator — it needs a plain postgresql:// URL
         plain_proxy = _DIALECT_RE.sub(r'\1\3', proxy)
         user_creator = kwargs.pop("creator", None)
@@ -104,10 +104,10 @@ def create_engine(url, **kwargs):
 
 
 def create_async_engine(url, **kwargs):
-    # L1 native cache is not yet supported for async engines.
-    # Queries go through the GL proxy (L2 cache).
+    # The native cache is not yet supported for async engines.
+    # Queries go through the GL proxy (proxy cache).
     from sqlalchemy.ext.asyncio import create_async_engine as _sa_create_async_engine
-    proxy, _inv_port, _l1_cache = _start_proxy(url, kwargs)
+    proxy, _inv_port, _native_cache = _start_proxy(url, kwargs)
 
     return _sa_create_async_engine(proxy, **kwargs)
 

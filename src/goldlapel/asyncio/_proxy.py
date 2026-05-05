@@ -111,8 +111,8 @@ class AsyncGoldLapel:
         silent=False,
         mesh=False,
         mesh_tag=None,
-        enable_l2_for_wrappers=False,
-        disable_l1=False,
+        enable_proxy_cache_for_wrappers=False,
+        disable_native_cache=False,
     ):
         # Piggyback on the sync GoldLapel for subprocess/lifecycle state so
         # `using(conn)` / ContextVar semantics and stop-on-exit are identical.
@@ -132,8 +132,8 @@ class AsyncGoldLapel:
             silent=silent,
             mesh=mesh,
             mesh_tag=mesh_tag,
-            enable_l2_for_wrappers=enable_l2_for_wrappers,
-            disable_l1=disable_l1,
+            enable_proxy_cache_for_wrappers=enable_proxy_cache_for_wrappers,
+            disable_native_cache=disable_native_cache,
         )
         self._conn = None  # AsyncCachedConnection (wraps asyncpg.Connection)
 
@@ -227,8 +227,8 @@ class AsyncGoldLapel:
                 cmd.append("--mesh")
             if sync._mesh_tag is not None:
                 cmd += ["--mesh-tag", sync._mesh_tag]
-            if sync._enable_l2_for_wrappers:
-                cmd.append("--enable-l2-for-wrappers")
+            if sync._enable_proxy_cache_for_wrappers:
+                cmd.append("--enable-proxy-cache-for-wrappers")
             cmd += _config_to_args(sync._config) + sync._extra_args
 
             _kill_orphan_on_port(sync._proxy_port)
@@ -286,7 +286,7 @@ class AsyncGoldLapel:
             self._conn = wrap(
                 raw,
                 invalidation_port=self._sync._invalidation_port,
-                disable_l1=self._sync._disable_l1,
+                disable_native_cache=self._sync._disable_native_cache,
             )
         except BaseException:
             # Kill subprocess + close any half-open asyncpg conn before raising.
@@ -555,7 +555,7 @@ async def _actual_start(upstream, **kwargs):
             inst._conn = wrap(
                 raw,
                 invalidation_port=inst._sync._invalidation_port,
-                disable_l1=inst._sync._disable_l1,
+                disable_native_cache=inst._sync._disable_native_cache,
             )
         return inst
     except Exception:
@@ -627,8 +627,8 @@ def start(
     silent=False,
     mesh=False,
     mesh_tag=None,
-    enable_l2_for_wrappers=False,
-    disable_l1=False,
+    enable_proxy_cache_for_wrappers=False,
+    disable_native_cache=False,
 ):
     """Factory: spawn a Gold Lapel proxy and return an AsyncGoldLapel instance.
 
@@ -666,6 +666,6 @@ def start(
         silent=silent,
         mesh=mesh,
         mesh_tag=mesh_tag,
-        enable_l2_for_wrappers=enable_l2_for_wrappers,
-        disable_l1=disable_l1,
+        enable_proxy_cache_for_wrappers=enable_proxy_cache_for_wrappers,
+        disable_native_cache=disable_native_cache,
     )

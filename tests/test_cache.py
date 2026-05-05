@@ -453,7 +453,7 @@ class TestThreadSafety:
         assert not errors
 
 
-# --- L1 telemetry: counters + snapshot ---
+# --- native cache telemetry: counters + snapshot ---
 
 class TestEvictionsCounter:
     def test_evictions_counter_starts_zero(self):
@@ -504,7 +504,7 @@ class TestSnapshotShape:
         assert a == b
 
 
-# --- L1 telemetry: state-change emission via real socket ---
+# --- native cache telemetry: state-change emission via real socket ---
 
 def _wait_for(predicate, timeout=2.0, interval=0.02):
     deadline = time.time() + timeout
@@ -641,7 +641,7 @@ class TestStateChangeEmission:
         cache._process_signal("$:bogus")
 
 
-# --- L1 telemetry: eviction-rate state changes ---
+# --- native cache telemetry: eviction-rate state changes ---
 
 class TestEvictionRateStateChange:
     def test_cache_full_fires_when_evictions_dominate(self):
@@ -667,7 +667,7 @@ class TestEvictionRateStateChange:
         assert not any("cache_full" in e for e in emissions)
 
 
-# --- L1 telemetry: process_request ---
+# --- native cache telemetry: process_request ---
 
 class TestProcessRequest:
     def test_request_snapshot_emits_response(self):
@@ -697,13 +697,13 @@ class TestProcessRequest:
         assert r_lines == []
 
 
-# --- L1 explicit-disable knob (`disable_l1`) ---
+# --- native cache explicit-disable knob (`disable_native_cache`) ---
 
-class TestDisableL1:
-    """`disable_l1=True` makes NativeCache a no-op pass-through: get()
-    always returns None, put() is silent. Counters still tick so the
+class TestDisableNativeCache:
+    """`disable_native_cache=True` makes NativeCache a no-op pass-through:
+    get() always returns None, put() is silent. Counters still tick so the
     dashboard sees a connected wrapper with "0 hits, N misses" — clear
-    "L1 off" signal — and the snapshot carries `l1_disabled: true`."""
+    "native cache off" signal — and the snapshot carries `disabled: true`."""
 
     def test_disabled_default_false(self):
         cache = make_cache()
@@ -736,8 +736,8 @@ class TestDisableL1:
         assert cache.get("SELECT 1", None) is None
 
     def test_disabled_put_does_not_evict(self):
-        # With disable_l1 on we never store — so we never evict either.
-        # stats_evictions stays 0, which the dashboard reads as
+        # With disable_native_cache on we never store — so we never evict
+        # either. stats_evictions stays 0, which the dashboard reads as
         # "no churn" (true: there's nothing to churn).
         cache = make_cache(max_entries=2)
         cache._disabled = True
@@ -758,8 +758,8 @@ class TestDisableL1:
         assert cache.stats_misses == 1
 
     def test_disabled_invalidate_table_still_works(self):
-        # Even with disable_l1 on, invalidate_table is a no-op in
-        # practice (cache is empty) — but should not crash if the
+        # Even with disable_native_cache on, invalidate_table is a no-op
+        # in practice (cache is empty) — but should not crash if the
         # proxy sends an `I:<table>` signal. Counter does not bump
         # because no keys were affected.
         cache = make_cache()
@@ -767,16 +767,16 @@ class TestDisableL1:
         cache.invalidate_table("orders")
         assert cache.stats_invalidations == 0
 
-    def test_snapshot_includes_l1_disabled_true(self):
+    def test_snapshot_includes_disabled_true(self):
         cache = make_cache()
         cache._disabled = True
         snap = cache._build_snapshot()
-        assert snap["l1_disabled"] is True
+        assert snap["disabled"] is True
 
-    def test_snapshot_includes_l1_disabled_false(self):
+    def test_snapshot_includes_disabled_false(self):
         cache = make_cache()
         snap = cache._build_snapshot()
-        assert snap["l1_disabled"] is False
+        assert snap["disabled"] is False
 
     def test_disabled_snapshot_counters_reflect_misses_only(self):
         cache = make_cache()
@@ -790,7 +790,7 @@ class TestDisableL1:
         assert snap["misses"] == 5
         assert snap["evictions"] == 0
         assert snap["current_size_entries"] == 0
-        assert snap["l1_disabled"] is True
+        assert snap["disabled"] is True
 
     def test_construct_with_disabled_kwarg(self):
         # Singleton: first construction wins on most state, but `disabled`

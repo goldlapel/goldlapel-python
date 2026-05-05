@@ -246,7 +246,7 @@ class TestProxyStartFailureFallback:
 class TestGetNewConnection:
     @patch("goldlapel.django.base.goldlapel")
     @patch("goldlapel.django.base.PgDatabaseWrapper.get_new_connection")
-    def test_wraps_connection_with_l1_cache(self, mock_super, mock_gl):
+    def test_wraps_connection_with_native_cache(self, mock_super, mock_gl):
         mock_gl.DEFAULT_PROXY_PORT = GOLDLAPEL_DEFAULT_PROXY_PORT
         mock_conn = MagicMock()
         mock_super.return_value = mock_conn

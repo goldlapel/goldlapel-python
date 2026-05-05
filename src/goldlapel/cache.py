@@ -11,7 +11,7 @@ from importlib import metadata as _metadata
 
 _DDL_SENTINEL = "__ddl__"
 
-# --- L1 telemetry tuning ---
+# --- native cache telemetry tuning ---
 #
 # Demand-driven model (2026-05-02): the wrapper has NO background timer.
 # Cache counters increment on cache ops (free); state-change events are
@@ -172,12 +172,12 @@ class NativeCache:
         self._table_index = {}
         self._max_entries = int(os.environ.get("GOLDLAPEL_NATIVE_CACHE_SIZE", "32768"))
         self._enabled = os.environ.get("GOLDLAPEL_NATIVE_CACHE", "true").lower() != "false"
-        # Explicit L1 disable: get() always misses, put() is a no-op.
+        # Explicit native-cache disable: get() always misses, put() is a no-op.
         # Distinct from _enabled (env-var on/off) and _invalidation_connected
         # (transport state). When disabled, counters still tick so the
         # dashboard sees "wrapper connected, 0 hits, N misses" — a clear
-        # signal that L1 is intentionally off rather than the wrapper
-        # being silent.
+        # signal that the native cache is intentionally off rather than the
+        # wrapper being silent.
         self._disabled = bool(disabled)
         self._lock = threading.Lock()
         self._invalidation_connected = False
@@ -188,7 +188,7 @@ class NativeCache:
         self.stats_hits = 0
         self.stats_misses = 0
         self.stats_invalidations = 0
-        # L1 telemetry (2026-05-02). Eviction counter — was missing
+        # native cache telemetry (2026-05-02). Eviction counter — was missing
         # before; bumped in `_evict_one`. Configurable opt-out: set
         # GOLDLAPEL_REPORT_STATS=false to disable all snapshot replies
         # and state-change emissions (cache continues to function).
@@ -225,8 +225,8 @@ class NativeCache:
         if not self._enabled or not self._invalidation_connected:
             return None
         # Disabled mode: always miss, but still tick the counter so the
-        # dashboard sees "wrapper alive, 0 hits, N misses" — i.e. L1 is
-        # explicitly off, not silent. Skip key computation entirely (no
+        # dashboard sees "wrapper alive, 0 hits, N misses" — i.e. the
+        # native cache is explicitly off, not silent. Skip key computation (no
         # point) — even unhashable params bump the miss counter, which
         # is the desired signal: we attempted a get, the cache said no.
         if self._disabled:
@@ -251,7 +251,7 @@ class NativeCache:
         if not self._enabled or not self._invalidation_connected:
             return
         # Disabled mode: silent no-op. We never store, so eviction can't
-        # fire, so stats_evictions stays at 0 — another clear "L1 off"
+        # fire, so stats_evictions stays at 0 — another clear "native cache off"
         # signal in the dashboard snapshot.
         if self._disabled:
             return
@@ -404,7 +404,7 @@ class NativeCache:
                         del self._table_index[table]
         self.stats_evictions += 1
 
-    # ---- L1 telemetry: sliding windows ----
+    # ---- native cache telemetry: sliding windows ----
 
     def _record_eviction_locked(self, evicted):
         """Record a put() outcome (1 evicted, 0 inserted). Caller holds `_lock`.
@@ -417,10 +417,10 @@ class NativeCache:
             self._recent_evictions[self._recent_evictions_idx] = evicted
             self._recent_evictions_idx = (self._recent_evictions_idx + 1) % _EVICT_RATE_WINDOW
 
-    # ---- L1 telemetry: snapshot + state-change emission ----
+    # ---- native cache telemetry: snapshot + state-change emission ----
 
     def _build_snapshot(self):
-        """Build the L1 snapshot dict the proxy aggregates per-tick.
+        """Build the native-cache snapshot dict the proxy aggregates per-tick.
 
         All counters + cache size read in a single critical section so
         the snapshot is internally consistent (no torn reads where, e.g.,
@@ -439,10 +439,11 @@ class NativeCache:
                 "current_size_entries": len(self._cache),
                 "capacity_entries": self._max_entries,
             }
-            # `l1_disabled` is a forward-compat field for the dashboard.
+            # `disabled` is a forward-compat field for the dashboard.
             # Always emit so consumers can rely on its presence — Manor
-            # display is free to ignore it today.
-            snap["l1_disabled"] = self._disabled
+            # display is free to ignore it today. Nested under
+            # native_cache.wrappers[] on the wire, so context disambiguates.
+            snap["disabled"] = self._disabled
             return snap
 
     def _send_line(self, line):

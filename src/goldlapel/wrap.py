@@ -32,14 +32,14 @@ def _detect_invalidation_port():
         return 7934
 
 
-def wrap(conn, invalidation_port=None, disable_l1=False):
+def wrap(conn, invalidation_port=None, disable_native_cache=False):
     global _cache, _atexit_registered
-    # Pass `disable_l1` through on every wrap() call. NativeCache is a
-    # singleton; on first construction it stores the flag, and on every
+    # Pass `disable_native_cache` through on every wrap() call. NativeCache
+    # is a singleton; on first construction it stores the flag, and on every
     # later call (a second start(), or this same start() opening a new
     # conn) the __init__ short-circuit re-binds `_disabled` so the most
     # recent caller's intent wins.
-    _cache = NativeCache(disabled=disable_l1)
+    _cache = NativeCache(disabled=disable_native_cache)
     if invalidation_port is None:
         invalidation_port = _detect_invalidation_port()
     if not _cache._invalidation_thread or not _cache._invalidation_thread.is_alive():
@@ -131,7 +131,7 @@ class CachedCursor:
         if getattr(self._real, "name", None):
             return self._real.execute(sql, params)
 
-        # Read path: check L1 cache
+        # Read path: check native cache
         entry = self._cache.get(sql, params)
         if entry is not None:
             object.__setattr__(self, "_cached_rows", entry.rows)
