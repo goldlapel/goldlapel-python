@@ -769,20 +769,23 @@ class TestMultiStatementTxBookkeeping:
         cc.execute("INSERT INTO orders VALUES (1); COMMIT")
         assert mock_cc._in_transaction is False
 
-    def test_savepoint_release_round_trip(self):
+    def test_savepoint_release_round_trip_stays_in_tx(self):
         conn, cursor = mock_conn()
         cache = make_connected_cache()
         mock_cc = MockCachedConn()
         cc = CachedCursor(cursor, cache, mock_cc)
         cc.execute("BEGIN")
-        # `SAVEPOINT ... ; RELEASE ...` — by spec, RELEASE flips to out-of-tx
-        # (conservative single-token classifier; false positive bypasses
-        # cache, which is safe).
+        # SAVEPOINT/RELEASE are intra-transaction markers — RELEASE
+        # SAVEPOINT does NOT end the outer transaction, it just commits
+        # a nested savepoint. The wrapper must stay in_transaction=True
+        # so subsequent reads still bypass the cache (server is still
+        # in-tx). Flipping to False here would let stale reads slip
+        # through (read-your-own-writes violation).
         cc.execute("SAVEPOINT s1; INSERT INTO orders VALUES (1); RELEASE s1")
+        assert mock_cc._in_transaction is True
+        # Only an explicit COMMIT/ROLLBACK ends the tx.
+        cc.execute("COMMIT")
         assert mock_cc._in_transaction is False
-        # And invalidation still fires:
-        # (precondition: cache had an entry — set it up to assert the
-        # write took effect).
 
     def test_plain_select_no_tx_change(self):
         conn, cursor = mock_conn(

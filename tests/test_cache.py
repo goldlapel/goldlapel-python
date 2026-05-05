@@ -274,14 +274,49 @@ class TestUpdateTxState:
         assert new_tx is False
         assert had_marker is True
 
-    def test_savepoint_release_ends_out_of_tx_per_spec(self):
-        # Per spec classification: SAVEPOINT → tx=true, RELEASE → tx=false.
-        # (RELEASE SAVEPOINT inside a real tx is a no-op on the actual
-        # transaction, but the conservative single-token classifier treats
-        # it as a tx-end marker. Acceptable trade-off: false positives
-        # bypass the cache, which is safe.)
+    def test_savepoint_release_inside_tx_stays_in_tx(self):
+        # SAVEPOINT/RELEASE are intra-transaction markers — neither ends
+        # the outer transaction. `RELEASE SAVEPOINT` commits a nested
+        # savepoint but leaves the enclosing tx open server-side. The
+        # wrapper must agree, otherwise subsequent in-tx reads would
+        # route through the cache while the server is still in-tx
+        # (stale-reads / read-your-own-writes violation).
         new_tx, had_marker = update_tx_state(
             True, "SAVEPOINT s1; INSERT INTO t VALUES (1); RELEASE s1"
+        )
+        assert new_tx is True
+        assert had_marker is False
+
+    def test_savepoint_alone_no_change(self):
+        # Standalone `SAVEPOINT` — server errors if not already in a tx,
+        # so wrapper state is already True when this fires. Either way:
+        # don't flip, don't mark as a tx-boundary.
+        new_tx, had_marker = update_tx_state(True, "SAVEPOINT s1")
+        assert new_tx is True
+        assert had_marker is False
+        new_tx, had_marker = update_tx_state(False, "SAVEPOINT s1")
+        assert new_tx is False
+        assert had_marker is False
+
+    def test_release_alone_no_change(self):
+        # `RELEASE SAVEPOINT name` does NOT end the outer tx. Wrapper
+        # must stay in_transaction=True so subsequent reads still bypass
+        # the cache (server is still in-tx).
+        new_tx, had_marker = update_tx_state(True, "RELEASE s1")
+        assert new_tx is True
+        assert had_marker is False
+        new_tx, had_marker = update_tx_state(True, "RELEASE SAVEPOINT s1")
+        assert new_tx is True
+        assert had_marker is False
+
+    def test_begin_savepoint_release_commit_full_cycle(self):
+        # Full lifecycle: BEGIN; SAVEPOINT; SELECT; RELEASE; SELECT;
+        # COMMIT. Only BEGIN and COMMIT are real boundaries — the
+        # SAVEPOINT and RELEASE in the middle leave state alone, and
+        # the trailing COMMIT closes the tx.
+        new_tx, had_marker = update_tx_state(
+            False,
+            "BEGIN; SAVEPOINT s; SELECT 1; RELEASE s; SELECT 2; COMMIT",
         )
         assert new_tx is False
         assert had_marker is True

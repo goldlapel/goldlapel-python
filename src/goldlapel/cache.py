@@ -41,8 +41,17 @@ _TX_END = re.compile(r"^\s*(COMMIT|ROLLBACK|END)\b", re.IGNORECASE)
 # matters: a segment whose first keyword is in `_TX_END_KEYWORDS` ends the
 # transaction; one in `_TX_START_KEYWORDS` opens it; anything else leaves
 # state unchanged.
-_TX_START_KEYWORDS = frozenset({"BEGIN", "START", "SAVEPOINT"})
-_TX_END_KEYWORDS = frozenset({"COMMIT", "ROLLBACK", "RELEASE", "END"})
+#
+# SAVEPOINT and RELEASE are intentionally NOT classified as boundary
+# keywords. `SAVEPOINT` errors outside a transaction (so the wrapper's
+# `_in_transaction` is already True when it appears — a flip would be a
+# no-op). `RELEASE SAVEPOINT` does NOT end the outer transaction; it
+# just commits a nested savepoint, and the outer tx continues. Treating
+# RELEASE as `_in_transaction = False` would let subsequent in-tx reads
+# route through the cache while the server is still in-tx, producing
+# stale reads / read-your-own-writes violations.
+_TX_START_KEYWORDS = frozenset({"BEGIN", "START"})
+_TX_END_KEYWORDS = frozenset({"COMMIT", "ROLLBACK", "END"})
 
 _TABLE_PATTERN = re.compile(
     r"\b(?:FROM|JOIN)\s+(?:ONLY\s+)?(?:(\w+)\.)?(\w+)",
@@ -444,9 +453,11 @@ def update_tx_state(in_transaction, sql):
 
     Walks each top-level statement in `sql` (string-literal-aware splitter)
     and folds per-segment first-keyword classification:
-    - `BEGIN` / `START` / `SAVEPOINT` → in_transaction = True
-    - `COMMIT` / `ROLLBACK` / `RELEASE` / `END` → in_transaction = False
-    - Anything else → leaves state unchanged.
+    - `BEGIN` / `START` → in_transaction = True
+    - `COMMIT` / `ROLLBACK` / `END` → in_transaction = False
+    - Anything else (including `SAVEPOINT` and `RELEASE`, which are
+      intra-transaction markers that don't change the outer tx state) →
+      leaves state unchanged.
 
     Returns `(new_state, had_tx_marker)`:
     - `new_state` — the final tx state (boolean) after walking all segments.
