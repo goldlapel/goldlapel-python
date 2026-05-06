@@ -94,6 +94,21 @@ _UNSAFE_GUC_SHORT_LIST = frozenset({
     "default_transaction_read_only",
     "transaction_isolation",
     "row_security",
+    # Output-format / locale GUCs — these do NOT change which rows the
+    # server returns, but they DO change how those rows are textually
+    # rendered on the wire (DateStyle, TimeZone, IntervalStyle, bytea_output,
+    # lc_*). Two connections with the same SQL but different DateStyle would
+    # otherwise share a cache slot and the second connection would observe
+    # the first connection's rendering — a correctness gap, even if not an
+    # RLS leak. Cheap to fold into the state hash; covers a real footgun.
+    "datestyle",
+    "intervalstyle",
+    "timezone",
+    "bytea_output",
+    "lc_messages",
+    "lc_monetary",
+    "lc_numeric",
+    "lc_time",
 })
 
 
@@ -101,9 +116,18 @@ def is_unsafe_guc(name):
     """Classify a GUC name as state-affecting (True) or harmless (False).
 
     Case-insensitive. A GUC is unsafe if it's in the short hardcoded list
-    (search_path, role, session_authorization, default_transaction_*,
-    transaction_isolation, row_security) OR contains a `.` (namespaced —
-    app.*, myapp.*, etc.).
+    OR contains a `.` (namespaced — `app.*`, `myapp.*`, etc.). The
+    hardcoded list covers two classes of GUC:
+
+    - Identity / authorization / RLS-relevant: `search_path`, `role`,
+      `session_authorization`, `default_transaction_*`,
+      `transaction_isolation`, `row_security`. Affect WHICH rows
+      the server returns.
+    - Output-format / locale: `DateStyle`, `IntervalStyle`, `TimeZone`,
+      `bytea_output`, `lc_messages`, `lc_monetary`, `lc_numeric`,
+      `lc_time`. Affect HOW returned rows are textually rendered. Two
+      connections sharing a cache slot under different DateStyle would
+      otherwise observe each other's rendering — a correctness gap.
     """
     lower = name.lower()
     if "." in lower:
@@ -187,17 +211,35 @@ def split_statements(sql):
     return out
 
 
-# Marker for `SetCommand` kinds. Returned as a 4-tuple
-# `(kind, name, value)` from `parse_set_command` so callers can pattern-
-# match without paying for a class allocation per call. Kinds:
-#   "set"        — SET name = value (and SET SESSION ... variant)
-#   "set_local"  — SET LOCAL name = value (ignored for state hash)
-#   "reset"      — RESET name
-#   "reset_all"  — RESET ALL
+# Marker for `SetCommand` kinds. Returned as a 3-tuple `(kind, name, value)`
+# from `parse_set_command` so callers can pattern-match without paying for a
+# class allocation per call. Kinds:
+#   "set"          — SET name = value (and SET SESSION ... variant) AND
+#                    SELECT [pg_catalog.]set_config(name, value, false) — the
+#                    function form is treated identically to a SET because
+#                    PG's docs explicitly document them as equivalent (the
+#                    Supabase / PostgREST canonical RLS-context shape:
+#                    `SELECT set_config('app.user_id', '42', false)`).
+#   "set_local"    — SET LOCAL name = value AND set_config(..., true) —
+#                    ignored for state hash.
+#   "reset"        — RESET name
+#   "reset_all"    — RESET ALL  AND  DISCARD ALL
+#   "discard_other"— DISCARD PLANS / SEQUENCES / TEMP / TEMPORARY. Recorded as
+#                    a parsed command (so callers know a DISCARD was observed
+#                    and can clear the `dirty` flag on the state) but does
+#                    NOT mutate the state-hash map — these subcommands don't
+#                    touch GUCs.
 SET_KIND_SET = "set"
 SET_KIND_SET_LOCAL = "set_local"
 SET_KIND_RESET = "reset"
 SET_KIND_RESET_ALL = "reset_all"
+SET_KIND_DISCARD_OTHER = "discard_other"
+
+
+# `DISCARD <subcommand>` recognized values. PG accepts ALL / PLANS /
+# SEQUENCES / TEMP / TEMPORARY (the last two are aliases). Anything else is
+# a syntax error server-side; the parser returns None for unknown forms.
+_DISCARD_SUBCOMMANDS_OTHER = frozenset({"PLANS", "SEQUENCES", "TEMP", "TEMPORARY"})
 
 
 def _normalize_guc_name(token):
@@ -208,6 +250,198 @@ def _normalize_guc_name(token):
     if not trimmed:
         return None
     return trimmed.lower()
+
+
+# `SELECT set_config('name', 'value', is_local)` parser. Tightly scoped:
+# only the canonical 3-arg shape with literal arguments. Anything weirder
+# (param placeholders, computed expressions) returns None and falls through
+# to the post-call verify path — the connection gets marked dirty there
+# instead, which is cheaper than trying to parse arbitrary expressions on
+# the hot path.
+_SET_CONFIG_RE = re.compile(
+    r"""
+    ^\s*SELECT\s+
+    (?:pg_catalog\s*\.\s*)?           # optional pg_catalog. qualifier
+    set_config\s*\(\s*
+    ('(?:[^']|'')*'|"(?:[^"]|"")*")   # arg 1: GUC name (single or double quoted literal)
+    \s*,\s*
+    ('(?:[^']|'')*'|"(?:[^"]|"")*")   # arg 2: value literal (same shape)
+    \s*,\s*
+    (true|false|t|f|on|off|0|1|'(?:true|false|t|f|on|off|0|1|yes|no|y|n)')  # arg 3: is_local boolean
+    \s*\)\s*;?\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _parse_quoted_literal(tok):
+    """Peel a single layer of `'...'` / `"..."` quotes from a literal,
+    handling PG's doubled-quote escape (`''` → `'`, `""` → `"`). Caller
+    has already validated the literal shape via `_SET_CONFIG_RE`."""
+    if len(tok) < 2:
+        return tok
+    q = tok[0]
+    if q != "'" and q != '"':
+        return tok
+    body = tok[1:-1]
+    return body.replace(q + q, q)
+
+
+def _coerce_bool_literal(tok):
+    """Map a SET_CONFIG-style boolean literal (matched by `_SET_CONFIG_RE`)
+    to True / False. Accepts both bare and quoted forms."""
+    raw = tok.strip().lower()
+    if raw.startswith("'") and raw.endswith("'"):
+        raw = raw[1:-1]
+    return raw in ("true", "t", "on", "1", "yes", "y")
+
+
+def _parse_set_config_call(sql):
+    """Parse `SELECT [pg_catalog.]set_config('name', 'value', is_local)`.
+
+    Returns `(SET_KIND_SET, name, value)` for `is_local=false`,
+    `(SET_KIND_SET_LOCAL, name, value)` for `is_local=true`, or `None` if
+    the SQL doesn't match the canonical 3-literal-arg shape.
+
+    The Supabase / PostgREST canonical RLS-context shape lands here:
+        SELECT set_config('app.user_id', '42', false)
+    Their query also typically uses positional params (`$1`, `$2`, `$3`),
+    which we deliberately don't try to parse — when the args aren't
+    literals the connection is marked dirty by the
+    `is_top_level_function_call` heuristic instead and a post-call verify
+    fires to reconstruct state. That path is correct, just slightly more
+    expensive (one extra round-trip per SET).
+    """
+    m = _SET_CONFIG_RE.match(sql)
+    if m is None:
+        return None
+    name_lit, value_lit, bool_lit = m.group(1), m.group(2), m.group(3)
+    name = _normalize_guc_name(_parse_quoted_literal(name_lit))
+    if name is None:
+        return None
+    value = _parse_quoted_literal(value_lit)
+    is_local = _coerce_bool_literal(bool_lit)
+    if is_local:
+        return (SET_KIND_SET_LOCAL, name, value)
+    return (SET_KIND_SET, name, value)
+
+
+# `SELECT <ident>(...)` at statement-level (not embedded in a SELECT-list /
+# WHERE / etc.). The whole statement is a single function call. Used to
+# trigger the post-call verify path — function bodies might do server-side
+# `SET` we couldn't observe on the wire, so we re-read pg_settings after
+# the call returns.
+#
+# Captures `<ident>` as group 1 — including an optional schema-qualifier
+# (`pg_catalog.set_config`, `myschema.refresh_state`). The post-call
+# verify ignores `set_config` itself (already parsed inline) and a small
+# whitelist of well-known stateless builtins (`now()`, `version()`, ...) —
+# see `_VERIFY_SAFE_BUILTINS`. Anything user-defined or unrecognised
+# triggers the verify.
+_TOP_LEVEL_FUNCTION_RE = re.compile(
+    r"""
+    ^\s*SELECT\s+
+    (?:pg_catalog\s*\.\s*)?           # optional pg_catalog.
+    ([a-zA-Z_][a-zA-Z0-9_]*           # identifier
+        (?:\s*\.\s*[a-zA-Z_][a-zA-Z0-9_]*)?  # optional schema-qualified second part
+    )
+    \s*\(                              # opening paren
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+# Builtins that don't read or mutate session state — safe to skip the
+# post-call verify. Conservative list: anything that touches `current_setting`
+# / `set_config` / triggers / SECURITY DEFINER procedures is excluded.
+_VERIFY_SAFE_BUILTINS = frozenset({
+    "now", "current_timestamp", "current_date", "current_time",
+    "version", "current_user", "session_user", "user", "current_database",
+    "pg_backend_pid", "txid_current", "pg_current_xact_id",
+    "set_config",  # the inline parser already captured the mutation
+})
+
+
+def is_top_level_function_call(sql):
+    """Return True iff `sql` is a top-level `SELECT <ident>(...)` whose
+    function body could plausibly mutate session state.
+
+    Used to trigger the async post-call verify path (item #6 in the RLS
+    hardening spec). The match is intentionally conservative — it scans
+    only the leading text and gives False for any SQL that's clearly
+    something else (a SELECT-list, a SELECT FROM, etc.).
+
+    The returned function name is matched against `_VERIFY_SAFE_BUILTINS`;
+    well-known stateless builtins (`now()`, `version()`, ...) skip the
+    verify because they can't possibly mutate state. This avoids a
+    pg_settings round-trip after every `SELECT now()`. Anything
+    user-defined or unrecognised triggers the verify — the cost is a
+    handful of microseconds against the ~1ms verify and is fully
+    backgrounded relative to the user's hot path.
+    """
+    if not sql:
+        return False
+    s = sql.lstrip()
+    if not s:
+        return False
+    m = _TOP_LEVEL_FUNCTION_RE.match(s)
+    if m is None:
+        return False
+    # Reject a SELECT that has a FROM clause AFTER the function call —
+    # `SELECT my_func() FROM tbl` is a SELECT-list call, not a top-level
+    # function. We check this by walking the raw text after the matched
+    # opening `(` for a balanced closing `)` and then looking for FROM.
+    func_name = m.group(1)
+    # Strip schema qualifier for the safe-builtins check.
+    bare = func_name.split(".")[-1].strip().lower()
+    open_paren = m.end() - 1  # the `(` is the last char of the match
+    rest_after_call = _scan_past_balanced_paren(s, open_paren)
+    if rest_after_call is None:
+        # Unbalanced parens — not a clean top-level call.
+        return False
+    tail = rest_after_call.strip()
+    if tail.startswith(";"):
+        tail = tail[1:].strip()
+    # Anything after the function call other than EOF / `;` indicates the
+    # call is embedded in a larger statement (e.g. `SELECT f() FROM t`).
+    if tail:
+        return False
+    if bare in _VERIFY_SAFE_BUILTINS:
+        return False
+    return True
+
+
+def _scan_past_balanced_paren(s, open_idx):
+    """Given `s` and `s[open_idx] == '('`, return the substring of `s`
+    after the matching balanced `)`. Returns None if the parens are
+    unbalanced. String literals are respected (PG `''` / `""` doubled-
+    escapes also handled).
+    """
+    if open_idx >= len(s) or s[open_idx] != "(":
+        return None
+    depth = 1
+    i = open_idx + 1
+    n = len(s)
+    quote = None
+    while i < n:
+        c = s[i]
+        if quote is not None:
+            if c == quote:
+                if i + 1 < n and s[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+        else:
+            if c == "'" or c == '"':
+                quote = c
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return s[i + 1:]
+        i += 1
+    return None
 
 
 def _strip_value_quotes(value):
@@ -225,7 +459,8 @@ def _strip_value_quotes(value):
 
 
 def parse_set_command(sql):
-    """Parse a `SET` / `RESET` command out of a single SQL statement.
+    """Parse a `SET` / `RESET` / `DISCARD` / `SELECT set_config(...)` command
+    out of a single SQL statement.
 
     Recognises:
     - `SET name = value`, `SET name TO value`
@@ -233,16 +468,24 @@ def parse_set_command(sql):
     - `SET LOCAL name = value`, `SET LOCAL name TO value`
     - `RESET name`
     - `RESET ALL`
+    - `DISCARD ALL` — equivalent to `RESET ALL` for state-hash purposes
+      (and additionally clears the `dirty` flag — see ConnectionGucState)
+    - `DISCARD PLANS` / `DISCARD SEQUENCES` / `DISCARD TEMP` / `DISCARD
+      TEMPORARY` — returns `("discard_other", None, None)`. These don't
+      change GUC state but observing them lets the wrapper clear the
+      `dirty` flag if it was set by a prior unsafe SET.
+    - `SELECT set_config('name', 'value', is_local)` and
+      `SELECT pg_catalog.set_config(...)` — the canonical Supabase /
+      PostgREST RLS-context shape, equivalent to a regular SET (or SET
+      LOCAL when is_local=true). Per PG docs, set_config(...) is the
+      function-form equivalent of SET / SET LOCAL.
 
     Returns `(kind, name, value)` where `kind` is one of `SET_KIND_*`.
-    For `RESET ALL`, returns `("reset_all", None, None)`. For `RESET name`,
-    returns `("reset", name, None)`. For SET / SET LOCAL, returns
-    `("set"|"set_local", name, value)`.
-
     Returns `None` for anything else (including `SET TIME ZONE 'UTC'` —
-    the legacy two-word form. Timezone is harmless and the unusual
-    two-word GUC name doesn't fit the pattern; treating it as "not a
-    trackable SET" is correct because it doesn't affect cache safety).
+    the legacy two-word form. Timezone is tracked via the one-word
+    `timezone` GUC; the two-word grammar doesn't fit our parser.
+    Returning None here is safe because the connection is marked dirty
+    via the verify-on-checkout path if the unusual form ever lands).
 
     Intentionally narrow — handles a single statement. For multi-
     statement SQL, use `split_statements()` first and call this on each
@@ -259,9 +502,32 @@ def parse_set_command(sql):
     if not tokens:
         return None
     head = tokens[0]
+    head_lower = head.lower()
+
+    # DISCARD branch — `DISCARD ALL` clears the entire session state and is
+    # treated identically to `RESET ALL` for the state-hash. The other
+    # subcommands (PLANS / SEQUENCES / TEMP / TEMPORARY) don't touch GUCs
+    # but ARE relevant for the verify-on-checkout `dirty` flag — observing
+    # them tells us the connection has been recycled by its pool, so any
+    # uncertainty from prior unsafe SETs is moot.
+    if head_lower == "discard":
+        if len(tokens) != 2:
+            return None
+        sub = tokens[1].rstrip(";").upper()
+        if sub == "ALL":
+            return (SET_KIND_RESET_ALL, None, None)
+        if sub in _DISCARD_SUBCOMMANDS_OTHER:
+            return (SET_KIND_DISCARD_OTHER, None, None)
+        return None
+
+    # SELECT set_config(...) / SELECT pg_catalog.set_config(...) — function
+    # form of SET. Delegated to a dedicated parser so the SET path stays
+    # tightly scoped to keyword-prefixed grammars.
+    if head_lower == "select":
+        return _parse_set_config_call(s)
 
     # RESET branch.
-    if head.lower() == "reset":
+    if head_lower == "reset":
         if len(tokens) < 2:
             return None
         target = tokens[1]
@@ -275,7 +541,7 @@ def parse_set_command(sql):
             return None
         return (SET_KIND_RESET, name, None)
 
-    if head.lower() != "set":
+    if head_lower != "set":
         return None
 
     # SET branch — check for optional LOCAL/SESSION modifier.
@@ -345,27 +611,72 @@ def parse_set_command(sql):
 class ConnectionGucState:
     """Per-connection unsafe-GUC state tracker.
 
-    Stores values for unsafe GUCs only (harmless GUCs — timezone,
-    application_name, planner cost knobs, etc. — never enter the map and
-    never affect the hash). The state hash is recomputed on every
-    mutation and folded into L1 cache keys.
+    Stores values for unsafe GUCs only (harmless GUCs — application_name,
+    planner cost knobs, etc. — never enter the map and never affect the
+    hash). The state hash is recomputed on every mutation and folded into
+    L1 cache keys.
 
     Hash is `0` for the empty (default) state, so a fresh connection's
     state hash matches "no GUCs set" cache slots from peer connections —
     which is the correct, secure default (any connection that has set an
     unsafe GUC gets a non-zero hash).
+
+    The `dirty` flag is the verify-on-checkout fallback (item #5 in the
+    RLS hardening spec). It's set when an unsafe SET is observed and
+    cleared when a DISCARD is observed (or when verify completes). Pool
+    integrations that don't issue DISCARD on release can call
+    `maybe_verify(conn)` / `await maybe_verify_async(conn)` on checkout
+    to reconcile state by reading `pg_settings`. The default behaviour
+    is no-op — the proxy + L1 still get the state hash via observe_sql,
+    and verify only runs when explicitly invoked.
     """
 
-    __slots__ = ("_values", "_hash")
+    __slots__ = ("_values", "_hash", "_dirty", "_discards_observed")
 
     def __init__(self):
         self._values = {}  # lowercased GUC name → raw value string
         self._hash = 0
+        # Set True the first time an unsafe SET is observed on this
+        # connection. Cleared when (a) a DISCARD is observed, OR (b)
+        # `maybe_verify(...)` completes successfully. The flag exists
+        # so a custom-pool checkout can issue ONE pg_settings round-trip
+        # only when there's actual uncertainty about state.
+        self._dirty = False
+        # Counter incremented on every observed DISCARD (including
+        # DISCARD ALL). Used to detect "no DISCARD observed since the
+        # connection became dirty" — `maybe_verify` reads the counter at
+        # entry and skips work if it's nonzero (a DISCARD already
+        # reconciled state for us).
+        self._discards_observed = 0
 
     @property
     def hash(self):
         """Current state hash. `0` for empty state."""
         return self._hash
+
+    @property
+    def dirty(self):
+        """True iff an unsafe SET has been observed and not yet
+        reconciled by a DISCARD or a successful verify. Pool integrations
+        with non-DISCARD reset strategies can read this to decide whether
+        to invoke `maybe_verify` on checkout."""
+        return self._dirty
+
+    @property
+    def discards_observed(self):
+        """Monotonic counter of DISCARD commands observed (any subcommand,
+        including DISCARD ALL). Read by `maybe_verify` to decide whether
+        the dirty-flag suspicion is already reconciled."""
+        return self._discards_observed
+
+    def mark_dirty(self):
+        """Force-set the dirty flag. Used by the post-call verify path —
+        when we see a `SELECT <user_func>(...)` we don't know whether
+        the function body did a server-side SET, so we mark dirty so the
+        next checkout reconciles state. The async post-call verify
+        (`schedule_post_call_verify`) is preferred when an event loop
+        is available; this is the synchronous fallback."""
+        self._dirty = True
 
     def apply(self, cmd):
         """Apply a parsed (kind, name, value) tuple from
@@ -375,6 +686,11 @@ class ConnectionGucState:
         kind, name, value = cmd
         if kind == SET_KIND_SET:
             if is_unsafe_guc(name):
+                # Mark dirty regardless of whether the value changed —
+                # a re-SET to the same value still lands on the wire and
+                # is a "we saw an unsafe SET" signal. The dirty flag is
+                # cheap and the next DISCARD / verify clears it.
+                self._dirty = True
                 prev = self._values.get(name)
                 if prev != value:
                     self._values[name] = value
@@ -391,19 +707,33 @@ class ConnectionGucState:
                 return True
             return False
         if kind == SET_KIND_RESET_ALL:
+            # DISCARD ALL routes here too — clear EVERYTHING (state map +
+            # dirty flag). The connection has been fully reset by the
+            # pool / by the user; no remaining uncertainty.
+            self._discards_observed += 1
+            self._dirty = False
             if self._values:
                 self._values.clear()
                 self._recompute_hash()
                 return True
             return False
+        if kind == SET_KIND_DISCARD_OTHER:
+            # DISCARD PLANS / SEQUENCES / TEMP / TEMPORARY — doesn't touch
+            # GUCs, so the state map is unchanged. But it's a DISCARD,
+            # which is a strong signal the pool reset the connection;
+            # clear the dirty flag and bump the counter so verify-on-
+            # checkout knows the suspicion has been reconciled.
+            self._discards_observed += 1
+            self._dirty = False
+            return False
         return False
 
     def observe_sql(self, sql):
-        """Observe a SQL string for SET / RESET commands and update
-        state accordingly. Multi-statement bodies are split on top-level
-        `;` (string literals respected) so a single Q like
-        `SET app.user_id = '42'; SELECT 1` still updates state. Returns
-        True if the hash mutated.
+        """Observe a SQL string for SET / RESET / DISCARD / set_config()
+        commands and update state accordingly. Multi-statement bodies are
+        split on top-level `;` (string literals respected) so a single Q
+        like `SET app.user_id = '42'; SELECT 1` still updates state.
+        Returns True if the hash mutated.
         """
         before = self._hash
         # Fast path for the common single-statement case — avoid
@@ -432,6 +762,98 @@ class ConnectionGucState:
         # hash never crosses process boundaries (it's only ever used as
         # part of a local L1 cache key), so that's fine.
         self._hash = hash(tuple(sorted(self._values.items())))
+
+    # ---- verify-on-checkout: rebuild state map from pg_settings ----
+
+    def _ingest_pg_settings_rows(self, rows):
+        """Replace the unsafe-GUC state map from a list of `(name, value)`
+        rows produced by `SELECT name, setting FROM pg_settings WHERE
+        source='session'`. Rows whose `name` is safe-by-classifier are
+        ignored. Updates the hash, clears `dirty`, but does NOT bump
+        `_discards_observed` — verify is a wrapper-side reconciliation,
+        not a wire-observed DISCARD.
+        """
+        new_values = {}
+        for row in rows:
+            # Tolerate both 2-tuple and Mapping-like rows (asyncpg.Record
+            # supports __getitem__ by both index and column name; psycopg
+            # cursors yield tuples). We only care about the first two
+            # positional fields.
+            try:
+                name = row[0]
+                value = row[1]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if name is None:
+                continue
+            normalized = _normalize_guc_name(str(name))
+            if normalized is None:
+                continue
+            if not is_unsafe_guc(normalized):
+                continue
+            new_values[normalized] = "" if value is None else str(value)
+        self._values = new_values
+        self._dirty = False
+        self._recompute_hash()
+
+    def maybe_verify(self, real_conn):
+        """Sync verify-on-checkout. Reads pg_settings on `real_conn` and
+        rebuilds the state map. No-op if `dirty` is False or if at least
+        one DISCARD has been observed since the dirty span began.
+
+        Errors are swallowed — the spec is "NEVER fail the user's query
+        if verify itself errors". On error we leave `dirty=True` so a
+        future verify attempt can retry.
+
+        Returns True if a verify ran and succeeded; False otherwise.
+        """
+        if not self._dirty:
+            return False
+        # Discards-observed snapshot at dirty-mark time is implicit: any
+        # DISCARD between mark_dirty and now would have cleared the
+        # dirty flag in `apply`, so reaching here means there's been
+        # no DISCARD since dirty was set.
+        try:
+            cursor = real_conn.cursor()
+            try:
+                cursor.execute(_VERIFY_SQL)
+                rows = cursor.fetchall()
+            finally:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            self._ingest_pg_settings_rows(rows)
+            return True
+        except Exception:
+            return False
+
+    async def maybe_verify_async(self, real_conn):
+        """Async verify-on-checkout. Same shape as `maybe_verify` but
+        uses asyncpg's `fetch()` API. No-op if not dirty. Errors swallowed.
+
+        Returns True if a verify ran and succeeded; False otherwise.
+        """
+        if not self._dirty:
+            return False
+        try:
+            rows = await real_conn.fetch(_VERIFY_SQL)
+            # asyncpg.Record exposes positional indexing — convert to a
+            # uniform `(name, value)` shape for `_ingest_pg_settings_rows`.
+            normalised = [(r[0], r[1]) for r in rows]
+            self._ingest_pg_settings_rows(normalised)
+            return True
+        except Exception:
+            return False
+
+
+# The pg_settings query used by both verify paths. `source = 'session'`
+# means "set on this connection by SET / set_config()" and excludes
+# server-default / client-startup-time values — that's exactly the slice
+# we'd otherwise have observed on the wire.
+_VERIFY_SQL = (
+    "SELECT name, setting FROM pg_settings WHERE source = 'session'"
+)
 
 
 def _make_key(sql, params, state_hash=0):

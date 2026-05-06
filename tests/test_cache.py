@@ -20,6 +20,7 @@ from goldlapel.cache import (
     _EVICT_RATE_WINDOW,
     _TX_START,
     _TX_END,
+    is_top_level_function_call,
     is_unsafe_guc,
     parse_set_command,
     split_statements,
@@ -28,6 +29,7 @@ from goldlapel.cache import (
     SET_KIND_SET_LOCAL,
     SET_KIND_RESET,
     SET_KIND_RESET_ALL,
+    SET_KIND_DISCARD_OTHER,
 )
 
 
@@ -1114,14 +1116,56 @@ class TestIsUnsafeGuc:
         assert is_unsafe_guc("APP.USER")
 
     def test_safe_gucs(self):
-        # Harmless GUCs — they don't change query results, so they don't
-        # need to enter the cache key.
-        assert not is_unsafe_guc("timezone")
+        # Harmless GUCs — they don't change query results AND they don't
+        # change how results are textually rendered on the wire. Safe to
+        # leave out of the cache key.
         assert not is_unsafe_guc("application_name")
         assert not is_unsafe_guc("statement_timeout")
         assert not is_unsafe_guc("work_mem")
         assert not is_unsafe_guc("client_encoding")
-        assert not is_unsafe_guc("DateStyle")
+
+    # -- output-format / locale GUCs are unsafe --
+    #
+    # These don't change which rows the server returns, but they DO change
+    # how those rows are rendered on the wire. Two connections sharing a
+    # cache slot under the same SQL would observe each other's rendering;
+    # treat them as state-affecting. Same posture as the proxy's L2
+    # classifier (`src/guc_state.rs`).
+
+    def test_datestyle_unsafe(self):
+        assert is_unsafe_guc("DateStyle")
+        assert is_unsafe_guc("datestyle")
+        assert is_unsafe_guc("DATESTYLE")
+
+    def test_intervalstyle_unsafe(self):
+        assert is_unsafe_guc("IntervalStyle")
+        assert is_unsafe_guc("intervalstyle")
+
+    def test_timezone_unsafe(self):
+        # `timezone` (one word, lower) — tracked. The legacy two-word form
+        # `SET TIME ZONE 'UTC'` is unparsable by `parse_set_command` and
+        # returns None there (see test_rejects_set_time_zone_two_word_form),
+        # but the classifier itself flags `timezone` as unsafe.
+        assert is_unsafe_guc("timezone")
+        assert is_unsafe_guc("TimeZone")
+        assert is_unsafe_guc("TIMEZONE")
+
+    def test_bytea_output_unsafe(self):
+        assert is_unsafe_guc("bytea_output")
+        assert is_unsafe_guc("BYTEA_OUTPUT")
+
+    def test_lc_messages_unsafe(self):
+        assert is_unsafe_guc("lc_messages")
+        assert is_unsafe_guc("LC_MESSAGES")
+
+    def test_lc_monetary_unsafe(self):
+        assert is_unsafe_guc("lc_monetary")
+
+    def test_lc_numeric_unsafe(self):
+        assert is_unsafe_guc("lc_numeric")
+
+    def test_lc_time_unsafe(self):
+        assert is_unsafe_guc("lc_time")
 
 
 # --- L1 state-hash: SET / RESET parser ---
@@ -1261,11 +1305,11 @@ class TestConnectionGucState:
 
     def test_safe_set_does_not_change_hash(self):
         s = ConnectionGucState()
-        s.observe_sql("SET timezone = 'UTC'")
-        assert s.hash == 0
         s.observe_sql("SET application_name = 'foo'")
         assert s.hash == 0
         s.observe_sql("SET statement_timeout = 5000")
+        assert s.hash == 0
+        s.observe_sql("SET work_mem = '64MB'")
         assert s.hash == 0
 
     def test_unsafe_set_changes_hash(self):
@@ -1332,14 +1376,14 @@ class TestConnectionGucState:
         s = ConnectionGucState()
         assert s.observe_sql("SET app.user_id = '42'") is True
         assert s.observe_sql("SELECT 1") is False
-        assert s.observe_sql("SET timezone = 'UTC'") is False
+        assert s.observe_sql("SET application_name = 'foo'") is False
         assert s.observe_sql("RESET app.user_id") is True
 
     def test_reset_safe_guc_is_noop(self):
         s = ConnectionGucState()
         s.observe_sql("SET app.user_id = '42'")
         h = s.hash
-        s.observe_sql("RESET timezone")  # safe — should not perturb.
+        s.observe_sql("RESET work_mem")  # safe — should not perturb.
         assert s.hash == h
 
     def test_overwrite_unsafe_value_changes_hash(self):
@@ -1474,4 +1518,496 @@ class TestL1CacheStateHash:
         cache.invalidate_table("accounts")
         assert cache.get("SELECT * FROM accounts", None, 111) is None
         assert cache.get("SELECT * FROM accounts", None, 222) is None
+
+
+# --- DISCARD parsing + state effects ---
+#
+# DISCARD is the protocol-level "reset this connection" surface PG offers.
+# `DISCARD ALL` is the canonical pool-on-release statement (asyncpg /
+# psycopg / SQLAlchemy default). Recognizing it inline lets the wrapper
+# clear its state map without an extra round-trip.
+
+
+class TestDiscardParsing:
+    def test_discard_all_parses_as_reset_all(self):
+        # Same kind as `RESET ALL` — both clear the entire session state.
+        assert parse_set_command("DISCARD ALL") == (SET_KIND_RESET_ALL, None, None)
+
+    def test_discard_all_case_insensitive(self):
+        assert parse_set_command("discard all") == (SET_KIND_RESET_ALL, None, None)
+        assert parse_set_command("Discard ALL") == (SET_KIND_RESET_ALL, None, None)
+
+    def test_discard_all_trailing_semicolon(self):
+        assert parse_set_command("DISCARD ALL;") == (SET_KIND_RESET_ALL, None, None)
+
+    def test_discard_plans_no_op_for_state(self):
+        # Recognized as a "DISCARD other" command — distinct kind so the
+        # state machine can clear the dirty flag, but doesn't touch the
+        # state map (DISCARD PLANS only clears the prepared-statement
+        # cache server-side, no GUC reset).
+        assert parse_set_command("DISCARD PLANS") == (SET_KIND_DISCARD_OTHER, None, None)
+
+    def test_discard_sequences_no_op_for_state(self):
+        assert parse_set_command("DISCARD SEQUENCES") == (SET_KIND_DISCARD_OTHER, None, None)
+
+    def test_discard_temp_no_op_for_state(self):
+        assert parse_set_command("DISCARD TEMP") == (SET_KIND_DISCARD_OTHER, None, None)
+
+    def test_discard_temporary_no_op_for_state(self):
+        # `TEMPORARY` is the long-form alias of `TEMP`.
+        assert parse_set_command("DISCARD TEMPORARY") == (SET_KIND_DISCARD_OTHER, None, None)
+
+    def test_discard_unknown_subcommand_returns_none(self):
+        # `DISCARD FOO` is a syntax error server-side. Parser is
+        # conservative: returns None so the wrapper treats it as
+        # "not a trackable command" and the dirty flag persists.
+        assert parse_set_command("DISCARD FOO") is None
+
+    def test_discard_no_subcommand_returns_none(self):
+        assert parse_set_command("DISCARD") is None
+
+
+class TestDiscardStateEffects:
+    def test_discard_all_clears_state_map(self):
+        # Mirrors the RESET ALL behaviour — state map empties, hash
+        # returns to 0. Plus: dirty flag clears.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        s.observe_sql("SET app.tenant = 'alpha'")
+        assert s.hash != 0
+        assert s.dirty is True
+        s.observe_sql("DISCARD ALL")
+        assert s.hash == 0
+        assert s.dirty is False
+
+    def test_discard_other_does_not_change_hash(self):
+        # DISCARD PLANS / SEQUENCES / TEMP — touch nothing in pg_settings,
+        # so the state map is unchanged.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        h_before = s.hash
+        for cmd in ("DISCARD PLANS", "DISCARD SEQUENCES", "DISCARD TEMP", "DISCARD TEMPORARY"):
+            s.observe_sql(cmd)
+            assert s.hash == h_before, f"{cmd} must not perturb the state hash"
+
+    def test_discard_other_clears_dirty_flag(self):
+        # DISCARD PLANS / SEQUENCES / TEMP are still strong "the pool
+        # reset this connection" signals, so observing one clears the
+        # dirty flag — even though the GUC state map is unchanged.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        assert s.dirty is True
+        s.observe_sql("DISCARD PLANS")
+        assert s.dirty is False
+        # Re-mark and try the others.
+        s.observe_sql("SET app.user_id = '42'")
+        assert s.dirty is True
+        s.observe_sql("DISCARD SEQUENCES")
+        assert s.dirty is False
+
+    def test_discard_other_increments_observed_counter(self):
+        # The discards-observed counter is monotonic across all DISCARD
+        # forms — pool integrations / verify paths can read it to confirm
+        # at least one DISCARD was seen since the last dirty mark.
+        s = ConnectionGucState()
+        assert s.discards_observed == 0
+        s.observe_sql("DISCARD PLANS")
+        assert s.discards_observed == 1
+        s.observe_sql("DISCARD ALL")
+        assert s.discards_observed == 2
+
+    def test_set_then_discard_then_set_keys_under_post_discard_hash(self):
+        # Lifecycle: SET (hash=h1, dirty=True) → DISCARD ALL (hash=0,
+        # dirty=False) → SET different value (hash=h2, dirty=True). Each
+        # phase produces an independent slot.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        h1 = s.hash
+        s.observe_sql("DISCARD ALL")
+        assert s.hash == 0
+        s.observe_sql("SET app.user_id = '99'")
+        h2 = s.hash
+        assert h2 != 0
+        assert h2 != h1
+
+
+# --- set_config() function form ---
+#
+# `SELECT set_config('app.user_id', '42', false)` is the Supabase /
+# PostgREST canonical RLS-context shape (and PG's docs document it as
+# directly equivalent to SET / SET LOCAL). The wrapper must fold it
+# into the state hash inline so the very-next SELECT keys correctly.
+
+
+class TestSetConfigParsing:
+    def test_set_config_session_level(self):
+        # is_local=false → behaves like a regular SET.
+        assert parse_set_command(
+            "SELECT set_config('app.user_id', '42', false)"
+        ) == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_set_config_local(self):
+        # is_local=true → behaves like SET LOCAL (ignored for state hash).
+        assert parse_set_command(
+            "SELECT set_config('app.user_id', '42', true)"
+        ) == (SET_KIND_SET_LOCAL, "app.user_id", "42")
+
+    def test_set_config_pg_catalog_qualifier(self):
+        # The schema-qualified form is what asyncpg sometimes emits
+        # under-the-hood for safety.
+        assert parse_set_command(
+            "SELECT pg_catalog.set_config('app.user_id', '42', false)"
+        ) == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_set_config_pg_catalog_with_whitespace(self):
+        assert parse_set_command(
+            "SELECT pg_catalog . set_config('app.user_id', '42', false)"
+        ) == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_set_config_case_insensitive(self):
+        assert parse_set_command(
+            "select SET_CONFIG('app.user_id', '42', FALSE)"
+        ) == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_set_config_lowercases_name(self):
+        # Same as the SET path — `App.User_ID` → `app.user_id`.
+        assert parse_set_command(
+            "SELECT set_config('App.User_ID', '42', false)"
+        ) == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_set_config_value_with_apostrophe_doubled_escape(self):
+        # PG escapes `'` inside a single-quoted literal by doubling.
+        cmd = parse_set_command(
+            "SELECT set_config('app.greeting', 'it''s ok', false)"
+        )
+        assert cmd == (SET_KIND_SET, "app.greeting", "it's ok")
+
+    def test_set_config_quoted_bool_true(self):
+        # `'true'` quoted form is also accepted — PG coerces.
+        assert parse_set_command(
+            "SELECT set_config('app.user_id', '42', 'true')"
+        ) == (SET_KIND_SET_LOCAL, "app.user_id", "42")
+
+    def test_set_config_quoted_bool_false(self):
+        assert parse_set_command(
+            "SELECT set_config('app.user_id', '42', 'false')"
+        ) == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_set_config_t_alias(self):
+        # PG accepts `t` / `f` / `on` / `off` / `1` / `0`.
+        assert parse_set_command(
+            "SELECT set_config('app.user_id', '42', t)"
+        ) == (SET_KIND_SET_LOCAL, "app.user_id", "42")
+
+    def test_set_config_param_placeholders_returns_none(self):
+        # We deliberately don't try to parse `$1`-style positional params
+        # — the connection gets marked dirty by the post-call verify
+        # heuristic instead, which is correct (a verify will reconcile
+        # state).
+        assert parse_set_command(
+            "SELECT set_config($1, $2, $3)"
+        ) is None
+
+    def test_set_config_with_trailing_semicolon(self):
+        assert parse_set_command(
+            "SELECT set_config('app.user_id', '42', false);"
+        ) == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_other_select_function_returns_none(self):
+        # `SELECT now()` — a stateless builtin — must NOT parse as a
+        # set_config call. The post-call verify path handles unknown
+        # functions separately.
+        assert parse_set_command("SELECT now()") is None
+
+    def test_set_config_double_quoted_name(self):
+        # PG accepts `"app.user_id"` as a quoted identifier-as-string;
+        # set_config just takes the literal text.
+        assert parse_set_command(
+            'SELECT set_config("app.user_id", \'42\', false)'
+        ) == (SET_KIND_SET, "app.user_id", "42")
+
+
+class TestSetConfigStateEffects:
+    def test_set_config_session_changes_state_hash(self):
+        s = ConnectionGucState()
+        baseline = s.hash
+        s.observe_sql("SELECT set_config('app.user_id', '42', false)")
+        assert s.hash != baseline
+
+    def test_set_config_local_does_not_change_state_hash(self):
+        s = ConnectionGucState()
+        s.observe_sql("SELECT set_config('app.user_id', '42', true)")
+        assert s.hash == 0
+
+    def test_set_config_matches_set_hash(self):
+        # Two paths to the same end state must produce the SAME hash —
+        # otherwise a SET and a set_config of the same value would key
+        # under different cache slots, fragmenting the cache for no
+        # security reason.
+        a = ConnectionGucState()
+        b = ConnectionGucState()
+        a.observe_sql("SET app.user_id = '42'")
+        b.observe_sql("SELECT set_config('app.user_id', '42', false)")
+        assert a.hash == b.hash
+
+    def test_pg_catalog_set_config_matches_bare_set(self):
+        a = ConnectionGucState()
+        b = ConnectionGucState()
+        a.observe_sql("SET app.user_id = '42'")
+        b.observe_sql("SELECT pg_catalog.set_config('app.user_id', '42', false)")
+        assert a.hash == b.hash
+
+    def test_set_config_session_marks_dirty(self):
+        s = ConnectionGucState()
+        s.observe_sql("SELECT set_config('app.user_id', '42', false)")
+        assert s.dirty is True
+
+
+# --- Top-level function-call detection (post-call verify trigger) ---
+
+
+class TestIsTopLevelFunctionCall:
+    def test_simple_function_call(self):
+        # A bare `SELECT my_func()` with no FROM / WHERE / etc. is a
+        # statement-level function call — the candidate shape for
+        # post-call verify.
+        assert is_top_level_function_call("SELECT my_func()") is True
+
+    def test_call_with_args(self):
+        assert is_top_level_function_call("SELECT my_func(1, 2, 'three')") is True
+
+    def test_schema_qualified_call(self):
+        assert is_top_level_function_call("SELECT public.my_func()") is True
+
+    def test_call_with_trailing_semicolon(self):
+        assert is_top_level_function_call("SELECT my_func();") is True
+
+    def test_select_with_from_returns_false(self):
+        # A SELECT that has a FROM clause is a normal query, not a
+        # statement-level function call.
+        assert is_top_level_function_call("SELECT my_func() FROM tbl") is False
+
+    def test_select_column_returns_false(self):
+        assert is_top_level_function_call("SELECT name FROM accounts") is False
+
+    def test_select_constant_returns_false(self):
+        assert is_top_level_function_call("SELECT 1") is False
+
+    def test_safe_builtin_returns_false(self):
+        # Stateless builtins skip the verify (no possible state mutation).
+        assert is_top_level_function_call("SELECT now()") is False
+        assert is_top_level_function_call("SELECT current_timestamp()") is False
+        assert is_top_level_function_call("SELECT version()") is False
+
+    def test_set_config_returns_false(self):
+        # `set_config` is in the safe-builtins list — the inline parser
+        # already captured the mutation, no verify needed.
+        assert is_top_level_function_call(
+            "SELECT set_config('app.user_id', '42', false)"
+        ) is False
+
+    def test_pg_catalog_set_config_returns_false(self):
+        assert is_top_level_function_call(
+            "SELECT pg_catalog.set_config('app.user_id', '42', false)"
+        ) is False
+
+    def test_unbalanced_parens_returns_false(self):
+        # Defensive — a malformed call shouldn't trip the verify path.
+        assert is_top_level_function_call("SELECT my_func(") is False
+
+    def test_function_with_string_containing_paren(self):
+        # Balanced-paren scanner respects string literals so a `)` inside
+        # a string doesn't close the call early.
+        assert is_top_level_function_call(
+            "SELECT my_func('text with ) inside')"
+        ) is True
+
+    def test_case_insensitive_select(self):
+        assert is_top_level_function_call("select my_func()") is True
+
+    def test_leading_whitespace(self):
+        assert is_top_level_function_call("   \n SELECT my_func()") is True
+
+    def test_empty_returns_false(self):
+        assert is_top_level_function_call("") is False
+        assert is_top_level_function_call("   ") is False
+
+    def test_not_select_returns_false(self):
+        assert is_top_level_function_call("CALL my_proc()") is False
+        assert is_top_level_function_call("UPDATE t SET x = 1") is False
+
+
+# --- Verify-on-checkout: pg_settings reconciliation ---
+
+
+class TestMaybeVerifySync:
+    """Sync verify reconstructs the unsafe-GUC state map from a
+    `SELECT name, setting FROM pg_settings WHERE source='session'`
+    round-trip. Used by pool integrations whose drivers don't issue
+    DISCARD ALL on release."""
+
+    def _fake_conn(self, rows):
+        """Mock a sync conn whose `cursor().fetchall()` returns `rows`."""
+        from unittest.mock import MagicMock
+        cursor = MagicMock()
+        cursor.fetchall.return_value = rows
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        return conn, cursor
+
+    def test_no_op_when_not_dirty(self):
+        s = ConnectionGucState()
+        conn, cursor = self._fake_conn([("app.user_id", "42")])
+        # Not dirty — verify should skip the round-trip.
+        ran = s.maybe_verify(conn)
+        assert ran is False
+        cursor.execute.assert_not_called()
+
+    def test_runs_when_dirty(self):
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        assert s.dirty is True
+        conn, cursor = self._fake_conn([("app.user_id", "42")])
+        ran = s.maybe_verify(conn)
+        assert ran is True
+        # Verify cleared dirty flag.
+        assert s.dirty is False
+        # Verify hit pg_settings.
+        cursor.execute.assert_called_once()
+        sql_used = cursor.execute.call_args[0][0]
+        assert "pg_settings" in sql_used
+        assert "source = 'session'" in sql_used
+
+    def test_overwrites_state_with_pg_settings_view(self):
+        # Server says `app.tenant=alpha` is set; wrapper had
+        # `app.user_id=42` in its map. After verify, the server view wins.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        conn, _ = self._fake_conn([("app.tenant", "alpha")])
+        s.maybe_verify(conn)
+        # Hash should reflect the new (verified) state — not the old one.
+        peer = ConnectionGucState()
+        peer.observe_sql("SET app.tenant = 'alpha'")
+        assert s.hash == peer.hash
+
+    def test_skips_safe_gucs_in_pg_settings_rows(self):
+        # pg_settings returns ALL session-set GUCs, including harmless
+        # ones we explicitly don't track. Filter them out to keep the
+        # state map tightly scoped.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        conn, _ = self._fake_conn([
+            ("app.user_id", "42"),
+            ("application_name", "myapp"),  # safe — must be ignored
+            ("statement_timeout", "1000"),  # safe — must be ignored
+            ("work_mem", "64MB"),           # safe — must be ignored
+        ])
+        s.maybe_verify(conn)
+        # Hash should match a peer connection that ONLY set app.user_id=42.
+        peer = ConnectionGucState()
+        peer.observe_sql("SET app.user_id = '42'")
+        assert s.hash == peer.hash
+
+    def test_swallows_errors_and_keeps_dirty(self):
+        # If verify itself errors, the dirty flag persists for a
+        # future retry. The user's query must NOT see the verify error.
+        from unittest.mock import MagicMock
+        conn = MagicMock()
+        conn.cursor.side_effect = RuntimeError("boom")
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        ran = s.maybe_verify(conn)
+        assert ran is False
+        assert s.dirty is True  # still dirty, retry on next checkout
+
+    def test_no_discard_observed_means_verify_runs(self):
+        # The `discards_observed` counter is part of the `dirty` story —
+        # if a DISCARD lands between the SET and the verify, the dirty
+        # flag would already be cleared. Direct test that verify only
+        # fires when there's been no DISCARD since dirty was set.
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        s.observe_sql("DISCARD ALL")  # clears dirty
+        conn, cursor = self._fake_conn([])
+        ran = s.maybe_verify(conn)
+        assert ran is False
+        cursor.execute.assert_not_called()
+
+
+# --- Async post-call verify (item #6) ---
+
+
+class TestPostCallVerifyAsync:
+    """The async post-call verify fires after the user's response is
+    dispatched, never blocking the user's hot path. State map is
+    reconciled from pg_settings; failures mark the connection dirty
+    without surfacing to the user."""
+
+    @pytest.mark.asyncio
+    async def test_async_verify_reconciles_state(self):
+        from unittest.mock import AsyncMock
+        # Simulate a connection whose `fetch()` returns the verify rows
+        # in the asyncpg shape (Record-like; ours just accepts any
+        # tuple-like).
+        conn = AsyncMock()
+        conn.fetch.return_value = [
+            ("app.user_id", "999"),  # post-call value (function set this)
+        ]
+        s = ConnectionGucState()
+        s.mark_dirty()
+        ran = await s.maybe_verify_async(conn)
+        assert ran is True
+        # Hash now reflects the post-call value.
+        peer = ConnectionGucState()
+        peer.observe_sql("SET app.user_id = '999'")
+        assert s.hash == peer.hash
+        assert s.dirty is False
+
+    @pytest.mark.asyncio
+    async def test_async_verify_errors_swallowed(self):
+        from unittest.mock import AsyncMock
+        conn = AsyncMock()
+        conn.fetch.side_effect = RuntimeError("connection blew up")
+        s = ConnectionGucState()
+        s.mark_dirty()
+        # Must not raise.
+        ran = await s.maybe_verify_async(conn)
+        assert ran is False
+        assert s.dirty is True  # ready to retry
+
+    @pytest.mark.asyncio
+    async def test_async_verify_skipped_when_not_dirty(self):
+        from unittest.mock import AsyncMock
+        conn = AsyncMock()
+        s = ConnectionGucState()
+        ran = await s.maybe_verify_async(conn)
+        assert ran is False
+        conn.fetch.assert_not_called()
+
+
+# --- mark_dirty (post-call function-call dirty signal) ---
+
+
+class TestMarkDirty:
+    def test_mark_dirty_idempotent(self):
+        s = ConnectionGucState()
+        assert s.dirty is False
+        s.mark_dirty()
+        assert s.dirty is True
+        s.mark_dirty()
+        assert s.dirty is True
+
+    def test_mark_dirty_does_not_change_hash(self):
+        s = ConnectionGucState()
+        s.observe_sql("SET app.user_id = '42'")
+        h = s.hash
+        s.mark_dirty()
+        assert s.hash == h
+
+    def test_mark_dirty_cleared_by_discard(self):
+        s = ConnectionGucState()
+        s.mark_dirty()
+        assert s.dirty is True
+        s.observe_sql("DISCARD ALL")
+        assert s.dirty is False
 
