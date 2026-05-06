@@ -116,6 +116,7 @@ class AsyncGoldLapel:
         disable_matviews=False,
         disable_sqloptimize=False,
         disable_auto_indexes=False,
+        aggressive_verify="auto",
     ):
         # Piggyback on the sync GoldLapel for subprocess/lifecycle state so
         # `using(conn)` / ContextVar semantics and stop-on-exit are identical.
@@ -140,6 +141,7 @@ class AsyncGoldLapel:
             disable_matviews=disable_matviews,
             disable_sqloptimize=disable_sqloptimize,
             disable_auto_indexes=disable_auto_indexes,
+            aggressive_verify=aggressive_verify,
         )
         self._conn = None  # AsyncCachedConnection (wraps asyncpg.Connection)
 
@@ -299,6 +301,8 @@ class AsyncGoldLapel:
                 raw,
                 invalidation_port=self._sync._invalidation_port,
                 disable_native_cache=self._sync._disable_native_cache,
+                aggressive_verify=self._sync._aggressive_verify,
+                db_key=self._sync._upstream,
             )
         except BaseException:
             # Kill subprocess + close any half-open asyncpg conn before raising.
@@ -568,6 +572,8 @@ async def _actual_start(upstream, **kwargs):
                 raw,
                 invalidation_port=inst._sync._invalidation_port,
                 disable_native_cache=inst._sync._disable_native_cache,
+                aggressive_verify=inst._sync._aggressive_verify,
+                db_key=inst._sync._upstream,
             )
         return inst
     except Exception:
@@ -644,6 +650,7 @@ def start(
     disable_matviews=False,
     disable_sqloptimize=False,
     disable_auto_indexes=False,
+    aggressive_verify="auto",
 ):
     """Factory: spawn a Gold Lapel proxy and return an AsyncGoldLapel instance.
 
@@ -686,4 +693,5 @@ def start(
         disable_matviews=disable_matviews,
         disable_sqloptimize=disable_sqloptimize,
         disable_auto_indexes=disable_auto_indexes,
+        aggressive_verify=aggressive_verify,
     )

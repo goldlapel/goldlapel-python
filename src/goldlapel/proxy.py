@@ -371,6 +371,7 @@ class GoldLapel:
         disable_matviews=False,
         disable_sqloptimize=False,
         disable_auto_indexes=False,
+        aggressive_verify="auto",
     ):
         self._upstream = upstream
         self._proxy_port = proxy_port if proxy_port is not None else DEFAULT_PROXY_PORT
@@ -427,6 +428,14 @@ class GoldLapel:
         self._disable_matviews = bool(disable_matviews)
         self._disable_sqloptimize = bool(disable_sqloptimize)
         self._disable_auto_indexes = bool(disable_auto_indexes)
+        # Smart aggressive-verify mode (closes the trigger-internal-SET
+        # correctness gap). "auto" detects per-database whether any user
+        # trigger could SET / RESET / DISCARD / set_config server-side
+        # and enables post-DML verify when it does. "on" forces-on, "off"
+        # is the escape hatch. Validated eagerly so a typo surfaces at
+        # construction, not at first wire op.
+        from goldlapel.wrap import _normalize_aggressive_verify
+        self._aggressive_verify = _normalize_aggressive_verify(aggressive_verify)
 
         # Validate structured-config keys eagerly so a test that constructs
         # without spawning still catches bad keys.
@@ -614,10 +623,16 @@ class GoldLapel:
                 from goldlapel.wrap import wrap
                 # invalidation_port is resolved at construction: either the
                 # explicit kwarg or proxy_port + 2.
+                # `db_key=upstream` keys the trigger-detection cache by
+                # the upstream URL — every connection to the same db
+                # shares the cached detection result, so we pay one
+                # round-trip per database, not per-connection.
                 self._conn = wrap(
                     raw_conn,
                     invalidation_port=self._invalidation_port,
                     disable_native_cache=self._disable_native_cache,
+                    aggressive_verify=self._aggressive_verify,
+                    db_key=self._upstream,
                 )
             except BaseException:
                 # Kill the subprocess we just spawned; leaked running processes = port
@@ -819,6 +834,7 @@ def _ensure_running(
     disable_matviews=False,
     disable_sqloptimize=False,
     disable_auto_indexes=False,
+    aggressive_verify="auto",
 ):
     global _cleanup_registered, _next_port
     with _lock:
@@ -854,6 +870,7 @@ def _ensure_running(
             disable_matviews=disable_matviews,
             disable_sqloptimize=disable_sqloptimize,
             disable_auto_indexes=disable_auto_indexes,
+            aggressive_verify=aggressive_verify,
         )
         _instances[upstream] = inst
         if not _cleanup_registered:
@@ -918,6 +935,7 @@ def start(
     disable_matviews=False,
     disable_sqloptimize=False,
     disable_auto_indexes=False,
+    aggressive_verify="auto",
 ):
     """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
     GoldLapel instance. Call wrapper methods on the returned instance
@@ -960,6 +978,16 @@ def start(
         Default False.
     - disable_auto_indexes: skip automatic index creation (--disable-auto-indexes).
         Default False.
+    - aggressive_verify: smart auto-enable post-DML verify mode for the
+        trigger-internal-SET correctness gap. Triggers can `SET` /
+        `RESET` / `DISCARD` / `set_config()` server-side without surfacing
+        on the client wire, leaving the wrapper's per-connection state
+        diverged from server reality. One of:
+          * "auto" (default) — detect once per database via a `pg_trigger`
+            scan; enable verify when any user trigger references those
+            commands. Zero tax on clean schemas.
+          * "on" — force-on (skip detection).
+          * "off" — escape hatch; accept the correctness gap.
 
     Promoted top-level concepts are rejected inside the `config` dict.
 
@@ -1000,6 +1028,7 @@ def start(
         disable_matviews=disable_matviews,
         disable_sqloptimize=disable_sqloptimize,
         disable_auto_indexes=disable_auto_indexes,
+        aggressive_verify=aggressive_verify,
     )
     return inst
 
@@ -1028,6 +1057,8 @@ def connect(upstream=None):
         conn,
         invalidation_port=inst.invalidation_port,
         disable_native_cache=inst._disable_native_cache,
+        aggressive_verify=inst._aggressive_verify,
+        db_key=inst._upstream,
     )
 
 

@@ -261,7 +261,12 @@ class TestGetNewConnection:
         wrapper._gl_active = True
         result = DatabaseWrapper.get_new_connection(wrapper, {"host": "127.0.0.1"})
 
-        mock_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=GOLDLAPEL_DEFAULT_PROXY_PORT + 2)
+        mock_gl.wrap.assert_called_once_with(
+            mock_conn,
+            invalidation_port=GOLDLAPEL_DEFAULT_PROXY_PORT + 2,
+            aggressive_verify="auto",
+            db_key="postgresql://u:p@h:5432/db",
+        )
         assert result == mock_gl.wrap.return_value
 
     @patch("goldlapel.django.base.goldlapel")
@@ -280,7 +285,12 @@ class TestGetNewConnection:
         wrapper._gl_active = True
         DatabaseWrapper.get_new_connection(wrapper, {"host": "127.0.0.1"})
 
-        mock_gl.wrap.assert_called_once_with(mock_super.return_value, invalidation_port=9999)
+        mock_gl.wrap.assert_called_once_with(
+            mock_super.return_value,
+            invalidation_port=9999,
+            aggressive_verify="auto",
+            db_key="postgresql://u:p@h:5432/db",
+        )
 
     @patch("goldlapel.django.base.goldlapel")
     @patch("goldlapel.django.base.PgDatabaseWrapper.get_new_connection")
@@ -298,7 +308,12 @@ class TestGetNewConnection:
         wrapper._gl_active = True
         DatabaseWrapper.get_new_connection(wrapper, {"host": "127.0.0.1"})
 
-        mock_gl.wrap.assert_called_once_with(mock_super.return_value, invalidation_port=8002)
+        mock_gl.wrap.assert_called_once_with(
+            mock_super.return_value,
+            invalidation_port=8002,
+            aggressive_verify="auto",
+            db_key="postgresql://u:p@h:5432/db",
+        )
 
     @patch("goldlapel.django.base.goldlapel")
     @patch("goldlapel.django.base.PgDatabaseWrapper.get_new_connection")

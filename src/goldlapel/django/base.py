@@ -53,6 +53,7 @@ class DatabaseWrapper(PgDatabaseWrapper):
         for key in (
             "dashboard_port", "invalidation_port", "log_level", "mode",
             "license", "config_file", "config", "extra_args", "silent",
+            "aggressive_verify",
         ):
             if key in gl_opts:
                 start_kwargs[key] = gl_opts[key]
@@ -79,4 +80,15 @@ class DatabaseWrapper(PgDatabaseWrapper):
             return conn
         gl_opts = self.settings_dict.get("OPTIONS", {}).get("goldlapel", {})
         inv_port = gl_opts.get("invalidation_port", self._gl_proxy_port + 2)
-        return goldlapel.wrap(conn, invalidation_port=inv_port)
+        # Smart aggressive-verify: forward from Django OPTIONS so the
+        # canonical `aggressive_verify="auto"` default applies. The
+        # upstream URL keys the trigger-detection cache so all Django
+        # connections to the same database share one detection round-trip.
+        aggressive_verify = gl_opts.get("aggressive_verify", "auto")
+        upstream = _build_upstream_url(self.settings_dict)
+        return goldlapel.wrap(
+            conn,
+            invalidation_port=inv_port,
+            aggressive_verify=aggressive_verify,
+            db_key=upstream,
+        )

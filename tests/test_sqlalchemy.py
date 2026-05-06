@@ -90,7 +90,7 @@ class TestCreateEngine:
         engine = create_engine("postgresql://user:pass@host:5432/db")
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None, aggressive_verify="auto"
         )
         # creator kwarg injected for the native cache
         assert mock_sa.call_count == 1
@@ -109,7 +109,7 @@ class TestCreateEngine:
         create_engine("postgresql+asyncpg://user:pass@host:5432/db")
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None, aggressive_verify="auto"
         )
         assert mock_sa.call_args[0] == ("postgresql+asyncpg://localhost:7932/mydb",)
 
@@ -123,7 +123,7 @@ class TestCreateEngine:
         create_engine("postgresql://host/db", goldlapel_proxy_port=9000)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=9000, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://host/db", proxy_port=9000, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None, aggressive_verify="auto"
         )
         # goldlapel_port must not leak to SQLAlchemy
         sa_kwargs = mock_sa.call_args[1]
@@ -140,7 +140,7 @@ class TestCreateEngine:
         create_engine("postgresql://host/db", goldlapel_extra_args=extra)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=extra
+            "postgresql://host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=extra, aggressive_verify="auto"
         )
         sa_kwargs = mock_sa.call_args[1]
         assert "goldlapel_extra_args" not in sa_kwargs
@@ -156,7 +156,7 @@ class TestCreateEngine:
         create_engine("postgresql://host/db", goldlapel_config=cfg)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=cfg, extra_args=None
+            "postgresql://host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=cfg, extra_args=None, aggressive_verify="auto"
         )
         # goldlapel_config must not leak to SQLAlchemy
         sa_kwargs = mock_sa.call_args[1]
@@ -186,7 +186,7 @@ class TestCreateEngine:
         create_engine(url)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:s3cret@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:s3cret@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None, aggressive_verify="auto"
         )
 
     @patch("goldlapel.sqlalchemy.goldlapel")
@@ -202,7 +202,7 @@ class TestCreateEngine:
         create_engine(url)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:s3cret@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:s3cret@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None, aggressive_verify="auto"
         )
 
 
@@ -218,7 +218,7 @@ class TestCreateAsyncEngine:
         engine = create_async_engine("postgresql+asyncpg://user:pass@host:5432/db")
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None, aggressive_verify="auto"
         )
         mock_sa_async.assert_called_once_with("postgresql+asyncpg://localhost:7932/mydb")
         assert engine is mock_sa_async.return_value
@@ -234,7 +234,7 @@ class TestCreateAsyncEngine:
         create_async_engine("postgresql+asyncpg://host/db", goldlapel_config=cfg)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=cfg, extra_args=None
+            "postgresql://host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=cfg, extra_args=None, aggressive_verify="auto"
         )
         # goldlapel_config must not leak to SQLAlchemy
         mock_sa_async.assert_called_once_with("postgresql+asyncpg://localhost:7932/mydb")
@@ -275,7 +275,7 @@ class TestInit:
         init(url="postgresql://new@host/db")
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://new@host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://new@host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None, aggressive_verify="auto"
         )
 
     def test_raises_when_no_url(self, monkeypatch):
@@ -303,7 +303,7 @@ class TestInit:
         init()
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None, aggressive_verify="auto"
         )
         assert os.environ["DATABASE_URL"] == "postgresql+asyncpg://localhost:7932/mydb"
 
@@ -317,7 +317,7 @@ class TestInit:
         init(url="postgresql://host/db", config=cfg)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=cfg, extra_args=None
+            "postgresql://host/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=cfg, extra_args=None, aggressive_verify="auto"
         )
 
     @patch("goldlapel.sqlalchemy.goldlapel")
@@ -330,7 +330,7 @@ class TestInit:
         init(url=url)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:s3cret@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:s3cret@host:5432/db", proxy_port=None, dashboard_port=None, invalidation_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None, aggressive_verify="auto"
         )
 
 
@@ -429,7 +429,12 @@ class TestNativeCache:
         # Call the creator to verify it wraps user_creator's result
         result = creator()
         user_creator.assert_called_once()
-        mock_gl.wrap.assert_called_once_with(user_conn, invalidation_port=7934)
+        mock_gl.wrap.assert_called_once_with(
+            user_conn,
+            invalidation_port=7934,
+            aggressive_verify="auto",
+            db_key="postgresql://host/db",
+        )
 
     def test_make_creator_calls_wrap(self):
         mock_conn = MagicMock()
@@ -441,7 +446,7 @@ class TestNativeCache:
             result = creator()
 
         user_creator.assert_called_once()
-        mock_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=7934)
+        mock_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=7934, aggressive_verify="auto", db_key=None)
         assert result == "wrapped"
 
     def test_make_creator_uses_psycopg_when_available(self):
@@ -497,7 +502,7 @@ class TestNativeCache:
             mock_conn = MagicMock()
             test_creator = _make_creator(PROXY_URL, 7934, lambda: mock_conn)
             test_creator()
-            inner_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=7934)
+            inner_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=7934, aggressive_verify="auto", db_key=None)
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
@@ -515,7 +520,7 @@ class TestNativeCache:
             mock_conn = MagicMock()
             test_creator = _make_creator(PROXY_URL, 9999, lambda: mock_conn)
             test_creator()
-            inner_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=9999)
+            inner_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=9999, aggressive_verify="auto", db_key=None)
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
@@ -534,7 +539,7 @@ class TestNativeCache:
             mock_conn = MagicMock()
             test_creator = _make_creator(PROXY_URL, 5555, lambda: mock_conn)
             test_creator()
-            inner_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=5555)
+            inner_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=5555, aggressive_verify="auto", db_key=None)
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
@@ -553,7 +558,7 @@ class TestNativeCache:
             mock_conn = MagicMock()
             test_creator = _make_creator("postgresql://localhost:9000/mydb", 9002, lambda: mock_conn)
             test_creator()
-            inner_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=9002)
+            inner_gl.wrap.assert_called_once_with(mock_conn, invalidation_port=9002, aggressive_verify="auto", db_key=None)
 
 
 class TestNativeCacheAsyncEngine:
