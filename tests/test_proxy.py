@@ -1262,3 +1262,107 @@ class TestDisableNativeCacheKwarg:
         assert mock_wrap.called
         _, kwargs = mock_wrap.call_args
         assert kwargs.get("disable_native_cache") is False
+
+
+class TestAggressiveVerifyKwarg:
+    """Smart aggressive-verify mode is a top-level kwarg on
+    `GoldLapel(...)` / `goldlapel.start(...)`. Validates eagerly,
+    forwards to wrap() with the upstream URL as `db_key=` so all
+    connections to the same db share the trigger-detection cache.
+    """
+
+    def setup_method(self):
+        _reset_module_state()
+
+    def teardown_method(self):
+        _reset_module_state()
+
+    def test_aggressive_verify_defaults_to_auto(self):
+        gl = GoldLapel("postgresql://localhost:5432/mydb")
+        assert gl._aggressive_verify == "auto"
+
+    def test_aggressive_verify_on_stored(self):
+        gl = GoldLapel(
+            "postgresql://localhost:5432/mydb", aggressive_verify="on",
+        )
+        assert gl._aggressive_verify == "on"
+
+    def test_aggressive_verify_off_stored(self):
+        gl = GoldLapel(
+            "postgresql://localhost:5432/mydb", aggressive_verify="off",
+        )
+        assert gl._aggressive_verify == "off"
+
+    def test_aggressive_verify_invalid_raises(self):
+        with pytest.raises(ValueError, match="aggressive_verify must be one of"):
+            GoldLapel(
+                "postgresql://localhost:5432/mydb",
+                aggressive_verify="bogus",
+            )
+
+    def test_aggressive_verify_not_in_config_keys(self):
+        # Top-level kwarg, not a structured `config={...}` key.
+        keys = config_keys()
+        assert "aggressive_verify" not in keys
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_aggressive_verify_does_not_emit_cli_flag(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        # Wrapper-internal — the Rust binary doesn't need to know.
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start(
+            "postgresql://host:5432/mydb",
+            aggressive_verify="on", silent=True,
+        )
+
+        call_args, _ = mock_popen.call_args
+        cmd = call_args[0]
+        assert not any(
+            "aggressive-verify" in str(arg) or "aggressive_verify" in str(arg)
+            for arg in cmd
+        )
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_aggressive_verify_forwarded_to_wrap(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start(
+            "postgresql://host:5432/mydb",
+            aggressive_verify="on", silent=True,
+        )
+
+        assert mock_wrap.called
+        _, kwargs = mock_wrap.call_args
+        assert kwargs.get("aggressive_verify") == "on"
+        # Upstream URL is the db_key — every connection to the same
+        # db shares the trigger-detection cache.
+        assert kwargs.get("db_key") == "postgresql://host:5432/mydb"
+
+    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_aggressive_verify_default_auto_forwarded(
+        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    ):
+        # No explicit kwarg — default "auto" must reach wrap().
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host:5432/mydb", silent=True)
+
+        assert mock_wrap.called
+        _, kwargs = mock_wrap.call_args
+        assert kwargs.get("aggressive_verify") == "auto"
