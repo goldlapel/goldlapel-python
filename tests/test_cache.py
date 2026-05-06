@@ -2011,3 +2011,241 @@ class TestMarkDirty:
         s.observe_sql("DISCARD ALL")
         assert s.dirty is False
 
+
+# --- Pending-mutation API (Wave 2 SET-actually-applied) ---
+
+
+class TestPreparePending:
+    """`prepare_pending` parses a SQL body into an ordered event list
+    without mutating connection state. The ConnectionGucState only
+    actually moves once `apply_pending` is called (after the dispatch
+    resolves). That separation is the basis for "don't apply if the
+    server errored on the SET"."""
+
+    def test_empty_sql_returns_empty_batch(self):
+        from goldlapel.cache import prepare_pending
+        assert prepare_pending("").is_empty
+        assert prepare_pending("   ").is_empty
+
+    def test_plain_select_returns_empty_batch(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending("SELECT 1")
+        assert b.is_empty
+        assert not b.has_set_segments
+
+    def test_set_returns_set_event(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending("SET app.user_id = '42'")
+        assert not b.is_empty
+        assert b.has_set_segments
+        assert b.events[0][0] == "set"
+        kind, name, value = b.events[0][1]
+        assert (kind, name, value) == (SET_KIND_SET, "app.user_id", "42")
+
+    def test_reset_returns_set_event(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending("RESET app.user_id")
+        assert b.events[0][0] == "set"
+        kind, name, _value = b.events[0][1]
+        assert kind == SET_KIND_RESET
+        assert name == "app.user_id"
+
+    def test_discard_all_returns_set_event(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending("DISCARD ALL")
+        assert b.events[0][0] == "set"
+        kind, _, _ = b.events[0][1]
+        assert kind == SET_KIND_RESET_ALL
+
+    def test_set_config_returns_set_event(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending("SELECT set_config('app.user_id', '42', false)")
+        assert b.events[0][0] == "set"
+
+    def test_begin_returns_tx_start(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending("BEGIN")
+        assert b.events[0][0] == "tx_start"
+
+    def test_commit_returns_tx_commit(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending("COMMIT")
+        assert b.events[0][0] == "tx_commit"
+
+    def test_rollback_returns_tx_rollback(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending("ROLLBACK")
+        assert b.events[0][0] == "tx_rollback"
+
+    def test_multi_statement_set_then_select_orders_events(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending("SET app.user_id = '42'; SELECT 1")
+        assert [e[0] for e in b.events] == ["set", "other"]
+
+    def test_begin_set_rollback_classification(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending(
+            "BEGIN; SET app.user_id = '42'; ROLLBACK"
+        )
+        assert [e[0] for e in b.events] == [
+            "tx_start", "set", "tx_rollback",
+        ]
+
+    def test_begin_set_commit_classification(self):
+        from goldlapel.cache import prepare_pending
+        b = prepare_pending(
+            "BEGIN; SET app.user_id = '42'; COMMIT"
+        )
+        assert [e[0] for e in b.events] == [
+            "tx_start", "set", "tx_commit",
+        ]
+
+
+class TestApplyPending:
+    """`apply_pending` commits or discards a pending batch against a
+    ConnectionGucState based on the dispatch's success/failure. Honors
+    sub-tx ROLLBACK semantics on success; preserves leading SETs on
+    error in mixed-body cases."""
+
+    def _state(self):
+        return ConnectionGucState()
+
+    def test_empty_batch_is_noop(self):
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending("SELECT 1")
+        apply_pending(s, b, True)
+        assert s.hash == 0
+        assert s.dirty is False
+
+    def test_set_success_applies(self):
+        # The canonical correct path: SET reaches the server, succeeds,
+        # apply_pending(success=True) commits the mutation.
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending("SET app.user_id = '42'")
+        apply_pending(s, b, True)
+        assert s.hash != 0
+        peer = self._state()
+        peer.observe_sql("SET app.user_id = '42'")
+        assert s.hash == peer.hash
+
+    def test_set_failure_does_not_apply(self):
+        # The Wave 2 fix: server errors on `SET role='nonexistent'` →
+        # apply_pending(success=False) leaves wrapper state at baseline.
+        # Pre-fix the wrapper would have applied optimistically and
+        # diverged from server reality.
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending("SET role = 'nonexistent_role'")
+        apply_pending(s, b, False)
+        assert s.hash == 0
+        assert s.dirty is False
+
+    def test_multi_statement_set_then_failing_query_applies_set(self):
+        # Mixed-body: SET landed before the trailing query errored.
+        # Per the Wave 2 spec, the SET should still apply because under
+        # simple-Q statement-at-a-time semantics, an earlier SET reaches
+        # the server before the later statement raises.
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending(
+            "SET app.user_id = '42'; SELECT bad_query"
+        )
+        apply_pending(s, b, False)
+        assert s.hash != 0
+        peer = self._state()
+        peer.observe_sql("SET app.user_id = '42'")
+        assert s.hash == peer.hash
+
+    def test_pure_set_only_failure_discards_all(self):
+        # If the body is purely SETs and execute raised, one of the
+        # SETs is what failed. We can't tell which, so discard all
+        # pending mutations to stay safe.
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending(
+            "SET app.user_id = '42'; SET app.tenant = 'alpha'"
+        )
+        apply_pending(s, b, False)
+        assert s.hash == 0
+
+    def test_begin_set_rollback_success_discards_set(self):
+        # `BEGIN; SET; ROLLBACK` end-to-end succeeds (no exception),
+        # but the SET was rolled back server-side. apply_pending honors
+        # the sub-tx by walking events and dropping the SET on ROLLBACK.
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending(
+            "BEGIN; SET app.user_id = '42'; ROLLBACK"
+        )
+        apply_pending(s, b, True)
+        assert s.hash == 0
+
+    def test_begin_set_commit_success_applies_set(self):
+        # `BEGIN; SET; COMMIT` succeeds and commits the SET. State
+        # should reflect the SET post-call.
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending(
+            "BEGIN; SET app.user_id = '42'; COMMIT"
+        )
+        apply_pending(s, b, True)
+        peer = self._state()
+        peer.observe_sql("SET app.user_id = '42'")
+        assert s.hash == peer.hash
+
+    def test_begin_set_no_terminator_applies_buffered(self):
+        # Body ends inside a sub-tx (BEGIN; SET, no COMMIT/ROLLBACK).
+        # apply_pending applies the buffered SETs — the wrapper
+        # bypasses cache while in_transaction is True so an over-eager
+        # application is harmless inside the tx, and a future COMMIT
+        # call would not need a re-apply (state is already there).
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending("BEGIN; SET app.user_id = '42'")
+        apply_pending(s, b, True)
+        assert s.hash != 0
+
+    def test_discard_all_success_clears_state(self):
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        s.observe_sql("SET app.user_id = '42'")
+        b = prepare_pending("DISCARD ALL")
+        apply_pending(s, b, True)
+        assert s.hash == 0
+        assert s.dirty is False
+
+    def test_discard_all_failure_preserves_state(self):
+        # Rare — DISCARD ALL inside a transaction errors server-side.
+        # The wrapper must NOT clear state on failure or it diverges
+        # from server reality.
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        s.observe_sql("SET app.user_id = '42'")
+        baseline = s.hash
+        b = prepare_pending("DISCARD ALL")
+        apply_pending(s, b, False)
+        assert s.hash == baseline
+
+    def test_set_failure_does_not_set_dirty(self):
+        # If the SET errored server-side, no actual unsafe mutation
+        # landed on the connection. The dirty flag should NOT be set
+        # — there's no state divergence to reconcile.
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending("SET app.user_id = '42'")
+        apply_pending(s, b, False)
+        assert s.dirty is False
+
+    def test_set_success_sets_dirty(self):
+        # Successful SET — the dirty flag is set so a future
+        # checkout-verify (for "unknown" pool drivers) reconciles state
+        # via pg_settings.
+        from goldlapel.cache import prepare_pending, apply_pending
+        s = self._state()
+        b = prepare_pending("SET app.user_id = '42'")
+        apply_pending(s, b, True)
+        assert s.dirty is True
+
+

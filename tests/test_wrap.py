@@ -1477,3 +1477,276 @@ class TestAsyncPostCallVerify:
         # And no new wire calls landed (driver was trusted, so pre-call
         # verify was skipped too).
         assert captured == []
+
+
+# --- SET-actually-applied (Wave 2): wrap.py defers state mutation ---
+
+
+class TestSetActuallyAppliedSync:
+    """Wave 2 fix: the sync wrapper defers per-connection GUC state
+    mutation until AFTER the dispatch resolves. A server-side error on
+    the SET (e.g. invalid role, unknown GUC namespace) must NOT leave
+    wrapper state diverged from server reality.
+
+    Tests use a real CachedConnection so the apply_pending plumbing is
+    end-to-end exercised (not just the cache.py-level apply_pending tests).
+    """
+
+    def _make_failing_cursor(self):
+        # A real-cursor mock whose execute() raises on the first call,
+        # mimicking psycopg's behaviour when the server returns an
+        # ErrorResponse on a SET (e.g. `SET role = 'nonexistent'`).
+        from unittest.mock import MagicMock
+        cursor = MagicMock()
+        cursor.description = None
+        cursor.name = None
+        cursor.arraysize = 1
+        cursor.execute.side_effect = RuntimeError(
+            'role "nonexistent_role" does not exist'
+        )
+        return cursor
+
+    def test_set_success_applies_state(self):
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        baseline = cc_conn._guc_state.hash
+        cur.execute("SET app.user_id = '42'")
+        assert cc_conn._guc_state.hash != baseline
+        assert cc_conn._guc_state.dirty is True
+
+    def test_set_error_does_not_apply_state(self):
+        # The bug we're fixing: pre-Wave 2 the SET applied optimistically.
+        # After Wave 2, a raised execute leaves state at baseline.
+        conn = mock_conn()[0]
+        cache = make_connected_cache()
+        cursor = self._make_failing_cursor()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        baseline_hash = cc_conn._guc_state.hash
+        with pytest.raises(RuntimeError):
+            cur.execute("SET role = 'nonexistent_role'")
+        # State unchanged — no optimistic mutation.
+        assert cc_conn._guc_state.hash == baseline_hash
+        # Dirty flag also stays False — no actual unsafe SET landed.
+        assert cc_conn._guc_state.dirty is False
+
+    def test_multi_statement_set_then_failing_query_applies_set(self):
+        # `SET app.user_id='42'; SELECT bad_query` — execute raises on the
+        # SELECT, but the leading SET landed before the trailing statement
+        # erred. Wrapper state should reflect the SET.
+        conn = mock_conn()[0]
+        cache = make_connected_cache()
+        cursor = self._make_failing_cursor()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        baseline = cc_conn._guc_state.hash
+        with pytest.raises(RuntimeError):
+            cur.execute(
+                "SET app.user_id = '42'; SELECT bad_query"
+            )
+        assert cc_conn._guc_state.hash != baseline
+
+    def test_discard_all_success_clears_state(self):
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        cur.execute("SET app.user_id = '42'")
+        assert cc_conn._guc_state.hash != 0
+        cur.execute("DISCARD ALL")
+        assert cc_conn._guc_state.hash == 0
+
+    def test_discard_all_error_preserves_state(self):
+        # DISCARD ALL inside an explicit transaction errors server-side.
+        # Wrapper state must NOT clear on the error. Pre-set state
+        # directly on the GucState (bypassing the verify-on-checkout
+        # path that an unknown-driver MagicMock would trigger off the
+        # dirty flag) so the test isolates the apply_pending(False)
+        # behavior for DISCARD ALL.
+        from goldlapel.wrap import _DRIVER_PSYCOPG_SYNC
+        conn = mock_conn()[0]
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        # Pretend the driver is recognized so pre-call verify is gated off.
+        object.__setattr__(cc_conn, "_driver", _DRIVER_PSYCOPG_SYNC)
+        bad_cursor = self._make_failing_cursor()
+        bad = CachedCursor(bad_cursor, cache, cc_conn)
+        # Prime state with an unsafe SET (separate cursor that succeeds).
+        ok_cursor = mock_conn()[1]
+        ok = CachedCursor(ok_cursor, cache, cc_conn)
+        ok.execute("SET app.user_id = '42'")
+        post_set = cc_conn._guc_state.hash
+        assert post_set != 0
+        # Now dispatch DISCARD ALL through the failing cursor.
+        with pytest.raises(RuntimeError):
+            bad.execute("DISCARD ALL")
+        # State unchanged — DISCARD ALL did not land on the server.
+        assert cc_conn._guc_state.hash == post_set
+
+    def test_begin_set_rollback_reverts_state(self):
+        # Multi-statement BEGIN; SET; ROLLBACK — succeeds end-to-end, but
+        # the SET was rolled back server-side. Wrapper state must NOT
+        # carry the SET past this call.
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        cur.execute("BEGIN; SET app.user_id = '42'; ROLLBACK")
+        assert cc_conn._guc_state.hash == 0
+        # Tx state also converged out of tx.
+        assert cc_conn._in_transaction is False
+
+    def test_begin_set_commit_persists_state(self):
+        conn, cursor = mock_conn()
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        cur.execute("BEGIN; SET app.user_id = '42'; COMMIT")
+        assert cc_conn._guc_state.hash != 0
+        assert cc_conn._in_transaction is False
+
+    def test_executemany_set_error_does_not_apply(self):
+        from unittest.mock import MagicMock
+        cursor = MagicMock()
+        cursor.executemany.side_effect = RuntimeError("boom")
+        cursor.description = None
+        cursor.name = None
+        cursor.arraysize = 1
+        conn = mock_conn()[0]
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        with pytest.raises(RuntimeError):
+            cur.executemany("SET app.user_id = '42'", [()])
+        assert cc_conn._guc_state.hash == 0
+
+
+class TestSetActuallyAppliedAsync:
+    """Async parity for the Wave 2 SET-actually-applied fix. Mirrors the
+    sync coverage across fetch / fetchrow / fetchval / execute paths."""
+
+    @pytest.mark.asyncio
+    async def test_async_execute_set_success_applies(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                return "SET"
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        baseline = a._guc_state.hash
+        await a.execute("SET app.user_id = '42'")
+        assert a._guc_state.hash != baseline
+
+    @pytest.mark.asyncio
+    async def test_async_execute_set_error_does_not_apply(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                raise RuntimeError(
+                    'role "nonexistent_role" does not exist'
+                )
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        baseline = a._guc_state.hash
+        with pytest.raises(RuntimeError):
+            await a.execute("SET role = 'nonexistent_role'")
+        assert a._guc_state.hash == baseline
+        assert a._guc_state.dirty is False
+
+    @pytest.mark.asyncio
+    async def test_async_fetch_set_error_does_not_apply(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                raise RuntimeError("server-side SET error")
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        baseline = a._guc_state.hash
+        with pytest.raises(RuntimeError):
+            await a.fetch("SET role = 'nonexistent_role'")
+        assert a._guc_state.hash == baseline
+
+    @pytest.mark.asyncio
+    async def test_async_fetchrow_set_error_does_not_apply(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def fetchrow(self, sql, *args):
+                raise RuntimeError("server-side SET error")
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        baseline = a._guc_state.hash
+        with pytest.raises(RuntimeError):
+            await a.fetchrow("SET role = 'nonexistent_role'")
+        assert a._guc_state.hash == baseline
+
+    @pytest.mark.asyncio
+    async def test_async_fetchval_set_error_does_not_apply(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def fetchval(self, sql, *args, column=0):
+                raise RuntimeError("server-side SET error")
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        baseline = a._guc_state.hash
+        with pytest.raises(RuntimeError):
+            await a.fetchval("SET role = 'nonexistent_role'")
+        assert a._guc_state.hash == baseline
+
+    @pytest.mark.asyncio
+    async def test_async_multi_statement_set_then_failing_query_applies_set(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                # Server processed the SET, then errored on the SELECT.
+                raise RuntimeError("syntax error at or near \"bad_query\"")
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        baseline = a._guc_state.hash
+        with pytest.raises(RuntimeError):
+            await a.execute(
+                "SET app.user_id = '42'; SELECT bad_query"
+            )
+        # SET landed before the trailing query; wrapper state mirrors that.
+        assert a._guc_state.hash != baseline
+
+    @pytest.mark.asyncio
+    async def test_async_begin_set_rollback_reverts_state(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                return "ROLLBACK"
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.execute("BEGIN; SET app.user_id = '42'; ROLLBACK")
+        assert a._guc_state.hash == 0
+        assert a._in_transaction is False
+
+    @pytest.mark.asyncio
+    async def test_async_begin_set_commit_persists_state(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                return "COMMIT"
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.execute("BEGIN; SET app.user_id = '42'; COMMIT")
+        assert a._guc_state.hash != 0
+        assert a._in_transaction is False

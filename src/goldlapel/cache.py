@@ -608,6 +608,216 @@ def parse_set_command(sql):
     return (SET_KIND_SET, name, value)
 
 
+# --- Pending-mutation events (Wave 2 SET-actually-applied) ---
+#
+# Background. Earlier, the wrapper applied SET / RESET / DISCARD / set_config
+# mutations to per-connection GUC state OPTIMISTICALLY — at the moment the
+# SQL was observed on its way to the server. If the server then errored
+# (e.g. `SET role = 'badrole'` failed because the role doesn't exist), the
+# wrapper-side state diverged from server reality and the next L1 cache
+# lookup keyed under a state hash that didn't match the server.
+#
+# Fix. Defer state mutation until after the dispatch returns. The hot path
+# parses pending mutations from `prepare_pending(sql)`, dispatches the user's
+# query, then calls `apply_pending(state, batch, success=...)` based on
+# whether the dispatch raised.
+#
+# Multi-statement intent. The events list preserves segment order plus
+# tx-boundary markers. The apply-step honors sub-tx semantics:
+#   - `BEGIN; SET app.x='1'; ROLLBACK` succeeds end-to-end, but the SET
+#     was rolled back server-side. apply_pending discards the SET.
+#   - `BEGIN; SET app.x='1'; COMMIT` succeeds and commits the SET. Apply.
+#   - `SET app.x='1'; SELECT bad_query` errors. Under simple-Q
+#     statement-at-a-time semantics, the leading SETs landed before the
+#     erroring statement; apply them. (A pure-SET-only body that errors
+#     means the SET is what failed; discard.)
+#
+# Tests live in test_cache.py (TestPendingBatch / TestApplyPending) and
+# test_wrap.py (TestSetActuallyApplied{Sync,Async}).
+
+_EVENT_SET = "set"
+_EVENT_TX_START = "tx_start"
+_EVENT_TX_COMMIT = "tx_commit"
+_EVENT_TX_ROLLBACK = "tx_rollback"
+_EVENT_OTHER = "other"
+
+
+class _PendingBatch:
+    """A parsed multi-segment SQL body's mutation events, ready to be
+    applied or discarded once the server's response is known.
+
+    `events` is an ordered list of one of:
+        ("set", (kind, name, value))   — a parsed SET/RESET/DISCARD command
+        ("tx_start", None)             — BEGIN / START
+        ("tx_commit", None)            — COMMIT / END
+        ("tx_rollback", None)          — ROLLBACK
+        ("other", None)                — any other segment
+
+    Treated as immutable by callers — `apply_pending` reads but does not
+    mutate. The `__slots__` keeps the per-call allocation tight.
+    """
+    __slots__ = ("events",)
+
+    def __init__(self, events):
+        self.events = events
+
+    @property
+    def is_empty(self):
+        return not self.events
+
+    @property
+    def has_set_segments(self):
+        for ev in self.events:
+            if ev[0] == _EVENT_SET:
+                return True
+        return False
+
+
+# Empty-batch sentinel — returned from `prepare_pending` when there's
+# nothing state-relevant in the body. Avoids per-call allocation for the
+# overwhelmingly common case of a plain SELECT / INSERT / etc.
+_EMPTY_BATCH = _PendingBatch(())
+
+
+def _classify_segment(segment):
+    """Classify a single segment as one of the pending-batch event kinds.
+    Returns one of `(_EVENT_SET, parsed_cmd)`, `(_EVENT_TX_START, None)`,
+    `(_EVENT_TX_COMMIT, None)`, `(_EVENT_TX_ROLLBACK, None)`, or
+    `(_EVENT_OTHER, None)`.
+
+    SET-like segments take precedence — `parse_set_command` recognises
+    SET / RESET / RESET ALL / DISCARD ALL / DISCARD <other> /
+    SELECT [pg_catalog.]set_config(...). Anything it doesn't recognise
+    falls through to the tx-marker first-keyword classifier.
+    """
+    cmd = parse_set_command(segment)
+    if cmd is not None:
+        return (_EVENT_SET, cmd)
+    s = segment.lstrip()
+    if not s:
+        return (_EVENT_OTHER, None)
+    end = 0
+    n = len(s)
+    while end < n and not s[end].isspace() and s[end] != ";":
+        end += 1
+    head = s[:end].upper()
+    if head in _TX_START_KEYWORDS:
+        return (_EVENT_TX_START, None)
+    if head == "ROLLBACK":
+        return (_EVENT_TX_ROLLBACK, None)
+    if head == "COMMIT" or head == "END":
+        return (_EVENT_TX_COMMIT, None)
+    return (_EVENT_OTHER, None)
+
+
+def prepare_pending(sql):
+    """Parse `sql` into a `_PendingBatch` of events to be applied or
+    discarded once the dispatch's success/failure is known.
+
+    Single-statement bodies skip the splitter allocation entirely — the
+    wrapper's hot path is `cur.execute("SELECT ...")`-style single
+    statements, and we don't want to charge those a list allocation per
+    call. Returns `_EMPTY_BATCH` when there's nothing state-relevant.
+    """
+    if not sql:
+        return _EMPTY_BATCH
+    trimmed = sql.rstrip()
+    if trimmed.endswith(";"):
+        trimmed_no_semi = trimmed[:-1]
+    else:
+        trimmed_no_semi = trimmed
+    if ";" not in trimmed_no_semi:
+        ev = _classify_segment(sql)
+        if ev[0] == _EVENT_OTHER:
+            return _EMPTY_BATCH
+        return _PendingBatch((ev,))
+    events = []
+    for seg in split_statements(sql):
+        events.append(_classify_segment(seg))
+    if not events or all(e[0] == _EVENT_OTHER for e in events):
+        return _EMPTY_BATCH
+    return _PendingBatch(tuple(events))
+
+
+def apply_pending(state, batch, success):
+    """Commit or discard a `_PendingBatch` against `state`.
+
+    On success: walk events in order; SETs inside a sub-tx that ends with
+    ROLLBACK are dropped (server-side rolled them back); SETs inside a
+    sub-tx that ends with COMMIT, or outside any sub-tx, are applied.
+
+    On error: under the simple-Q multi-statement model, the server has
+    already executed earlier segments and a later segment errored. We
+    apply the SET segments that precede the FIRST non-SET, non-tx-marker
+    segment — those are assumed to have landed before the trailing
+    statement raised. A body that's pure SETs and errors means one of
+    the SETs themselves failed; we discard the entire batch (we can't
+    tell which SET failed, and applying any of them risks divergence).
+
+    Returns True if `state` mutated; False otherwise.
+    """
+    if batch.is_empty:
+        return False
+
+    before_hash = state.hash
+
+    if not success:
+        # Locate the first non-SET segment. Tx markers count as non-SET
+        # for this purpose — `BEGIN; SET; SELECT bad` would hit the
+        # tx_start as the first non-SET, and we'd apply nothing (which
+        # is correct: BEGIN opened a tx, and the failing SELECT aborted
+        # it, rolling back the SET).
+        idx_first_non_set = None
+        for i, ev in enumerate(batch.events):
+            if ev[0] != _EVENT_SET:
+                idx_first_non_set = i
+                break
+        if idx_first_non_set is None:
+            # Pure SETs body — failure means a SET errored. Discard all.
+            return False
+        for ev in batch.events[:idx_first_non_set]:
+            state.apply(ev[1])
+        return state.hash != before_hash
+
+    # Success path: walk events with sub-tx awareness.
+    sub_tx_buffer = []
+    in_sub_tx = False
+    for ev in batch.events:
+        kind = ev[0]
+        if kind == _EVENT_SET:
+            if in_sub_tx:
+                sub_tx_buffer.append(ev[1])
+            else:
+                state.apply(ev[1])
+        elif kind == _EVENT_TX_START:
+            # Nested BEGIN is a server-side error in real life; defensive
+            # behaviour is to leave any prior buffer intact. We don't
+            # observe the segment that would carry the error, so just
+            # mark in-sub-tx and continue.
+            in_sub_tx = True
+        elif kind == _EVENT_TX_COMMIT:
+            for cmd in sub_tx_buffer:
+                state.apply(cmd)
+            sub_tx_buffer = []
+            in_sub_tx = False
+        elif kind == _EVENT_TX_ROLLBACK:
+            sub_tx_buffer = []
+            in_sub_tx = False
+        # _EVENT_OTHER — no state effect
+
+    # Body ended still inside a sub-tx (e.g. `BEGIN; SET app.x='1'`):
+    # the tx is open server-side. Apply now so the in-tx cache-bypass
+    # path keys correctly under the post-SET hash. Cross-call ROLLBACK
+    # handling is a future improvement (would require connection-level
+    # pending-buffer that survives between calls); the existing wrapper
+    # already had this gap and we leave it intact for now.
+    if sub_tx_buffer:
+        for cmd in sub_tx_buffer:
+            state.apply(cmd)
+
+    return state.hash != before_hash
+
+
 class ConnectionGucState:
     """Per-connection unsafe-GUC state tracker.
 
@@ -734,6 +944,12 @@ class ConnectionGucState:
         split on top-level `;` (string literals respected) so a single Q
         like `SET app.user_id = '42'; SELECT 1` still updates state.
         Returns True if the hash mutated.
+
+        Optimistic application — used by tests and any caller that
+        doesn't have a request/response boundary to defer against. The
+        wrap.py hot path uses `prepare_pending` + `apply_pending` instead
+        so a server-side error on the SET doesn't leave wrapper state
+        diverged from server reality (Wave 2 SET-actually-applied fix).
         """
         before = self._hash
         # Fast path for the common single-statement case — avoid

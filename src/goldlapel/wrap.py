@@ -6,7 +6,9 @@ from goldlapel.cache import (
     ConnectionGucState,
     _detect_writes_multi,
     _DDL_SENTINEL,
+    apply_pending,
     is_top_level_function_call,
+    prepare_pending,
     update_tx_state,
 )
 
@@ -236,13 +238,23 @@ class CachedCursor:
         if self._conn is not None:
             _maybe_verify_sync_pre_call(self._conn)
 
-        # Observe SET / RESET commands BEFORE any cache decision so a
-        # multi-statement Q like `SET app.user_id='42'; SELECT ...`
-        # updates state and then keys the SELECT under the new hash.
-        # observe_sql is fast-pathed for non-SET statements (no allocation
-        # when there's no `;` and no "SET"/"RESET" prefix to match).
-        if self._conn is not None:
-            self._conn._guc_state.observe_sql(sql)
+        # Parse SET / RESET / DISCARD / set_config segments into a pending
+        # batch — the actual state mutation is deferred until AFTER the
+        # dispatch returns, so a server-side SET error doesn't leave the
+        # wrapper believing it applied (Wave 2 SET-actually-applied fix).
+        # Single-statement non-SET bodies short-circuit to _EMPTY_BATCH
+        # with no allocation.
+        pending_batch = (
+            prepare_pending(sql) if self._conn is not None else None
+        )
+        # State hash for the cache lookup uses the PRE-APPLY value. For
+        # single-statement SELECTs (no embedded SET), pending_batch is
+        # empty so pre-apply == post-apply — hash is stable. For
+        # multi-statement bodies that bundle a SET, the literal SQL
+        # already disambiguates per-SET-value (the SET value is in the
+        # SQL string), so a state_hash mismatch with the eventual
+        # cache.put hash is harmless at the cache-key level. The post-
+        # apply hash is read after the dispatch and used for cache.put.
         state_hash = self._conn._guc_state.hash if self._conn is not None else 0
 
         # Top-level `SELECT <user_func>(...)` mark-dirty: the function body
@@ -282,34 +294,66 @@ class CachedCursor:
                 object.__setattr__(self._conn, "_in_transaction", new_tx)
         else:
             had_tx_marker = False
-        # Bodies that contain tx-boundary segments (BEGIN/COMMIT/etc.) are
-        # never cached — the response is a status string, and pretending to
-        # serve it from cache would skip a real server round-trip the
-        # caller intends. Same shape as a write-found short-circuit.
-        if had_tx_marker:
-            return self._real.execute(sql, params)
 
-        if write_found:
-            return self._real.execute(sql, params)
+        def _commit_pending(success):
+            """Apply or discard `pending_batch` against the connection's
+            GucState now that the dispatch's success/failure is known.
+            No-op when there's no pending batch (no _conn or empty body)."""
+            if self._conn is not None and pending_batch is not None:
+                apply_pending(
+                    self._conn._guc_state, pending_batch, success
+                )
 
-        # Inside transaction: bypass cache for reads
-        if self._conn is not None and self._conn._in_transaction:
-            return self._real.execute(sql, params)
+        # Bypass-cache decisions:
+        # - had_tx_marker: BEGIN/COMMIT/etc. — response is a status string,
+        #   not rows worth caching.
+        # - write_found: write must hit the wire (we already invalidated
+        #   the cache above).
+        # - in_transaction: in-tx reads bypass the cache for read-your-own-
+        #   writes consistency (we don't track per-tx mutations precisely).
+        # - named cursor: server-side cursors stream results in chunks and
+        #   don't fit the in-memory cache shape.
+        bypass_cache = (
+            had_tx_marker
+            or write_found
+            or (self._conn is not None and self._conn._in_transaction)
+            or bool(getattr(self._real, "name", None))
+        )
 
-        # Bypass cache for server-side/named cursors
-        if getattr(self._real, "name", None):
-            return self._real.execute(sql, params)
+        if not bypass_cache:
+            # Read path: check native cache (state_hash-keyed). On a hit,
+            # the SAME body+state previously ran successfully — the SET
+            # in the body (if any) was already applied to per-connection
+            # state by the prior run's apply_pending, and the current
+            # state_hash matches the put-time hash exactly (that's how we
+            # got the hit). No dispatch, no re-apply — the connection is
+            # already where it needs to be.
+            entry = self._cache.get(sql, params, state_hash)
+            if entry is not None:
+                object.__setattr__(self, "_cached_rows", entry.rows)
+                object.__setattr__(self, "_cached_description", entry.description)
+                object.__setattr__(self, "_fetch_index", 0)
+                return None
 
-        # Read path: check native cache (state_hash-keyed)
-        entry = self._cache.get(sql, params, state_hash)
-        if entry is not None:
-            object.__setattr__(self, "_cached_rows", entry.rows)
-            object.__setattr__(self, "_cached_description", entry.description)
-            object.__setattr__(self, "_fetch_index", 0)
-            return None
+        # Cache miss (or bypass): execute for real. Defer-apply the pending
+        # batch AFTER the dispatch resolves so a server-side SET error
+        # doesn't mutate wrapper state (Wave 2 SET-actually-applied fix).
+        try:
+            result = self._real.execute(sql, params)
+        except BaseException:
+            _commit_pending(False)
+            raise
+        _commit_pending(True)
 
-        # Cache miss: execute for real
-        result = self._real.execute(sql, params)
+        if bypass_cache:
+            return result
+
+        # Read post-apply hash for the put — multi-statement bodies that
+        # bundle a SET commit their mutation here, so subsequent identical
+        # bodies on this connection key under the post-SET hash and hit.
+        put_state_hash = (
+            self._conn._guc_state.hash if self._conn is not None else 0
+        )
 
         # Cache the result if the query returns rows
         if self._real.description is not None:
@@ -320,7 +364,7 @@ class CachedCursor:
                 return result  # fetchall failed, cursor state is gone, nothing we can do
             # Cache the result (best effort)
             try:
-                self._cache.put(sql, params, rows, desc, state_hash)
+                self._cache.put(sql, params, rows, desc, put_state_hash)
             except Exception:
                 pass
             # Always serve from our copy since we consumed the cursor
@@ -371,9 +415,12 @@ class CachedCursor:
     def executemany(self, sql, params_list):
         # Observe in case the caller `executemany`s a `SET ...` (unusual
         # but cheap to track and avoids stale cache slots if they do).
+        # Pending mutations are deferred until after the dispatch resolves
+        # so a server-side SET error doesn't leave wrapper state diverged.
+        pending_batch = None
         if self._conn is not None:
             _maybe_verify_sync_pre_call(self._conn)
-            self._conn._guc_state.observe_sql(sql)
+            pending_batch = prepare_pending(sql)
             # Top-level function calls in executemany — also mark dirty
             # so the next call's pre-call verify reconciles state. The
             # function body might mutate state on every row.
@@ -390,7 +437,15 @@ class CachedCursor:
             )
             if new_tx != self._conn._in_transaction:
                 object.__setattr__(self._conn, "_in_transaction", new_tx)
-        return self._real.executemany(sql, params_list)
+        try:
+            result = self._real.executemany(sql, params_list)
+        except BaseException:
+            if self._conn is not None and pending_batch is not None:
+                apply_pending(self._conn._guc_state, pending_batch, False)
+            raise
+        if self._conn is not None and pending_batch is not None:
+            apply_pending(self._conn._guc_state, pending_batch, True)
+        return result
 
     def callproc(self, procname, params=None):
         self._cache.invalidate_all()
@@ -523,32 +578,42 @@ class AsyncCachedConnection:
     async def fetch(self, sql, *args):
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
-            self._guc_state.observe_sql(sql)
+            # Defer state mutation until after the dispatch resolves —
+            # see prepare_pending / apply_pending in goldlapel.cache for
+            # the Wave 2 SET-actually-applied rationale.
+            pending_batch = prepare_pending(sql)
             state_hash = self._guc_state.hash
             write_found = _apply_write_invalidation(
                 self._cache, _detect_writes_multi(sql)
             )
             had_tx_marker = self._observe_tx(sql)
-            if had_tx_marker or write_found:
-                result = await self._real.fetch(sql, *args)
-                self._schedule_post_call_verify(sql)
-                return result
-
-            if self._in_transaction:
-                result = await self._real.fetch(sql, *args)
-                self._schedule_post_call_verify(sql)
-                return result
-
+            bypass_cache = (
+                had_tx_marker or write_found or self._in_transaction
+            )
             params = args if args else None
-            entry = self._cache.get(sql, params, state_hash)
-            if entry is not None:
-                # Cache hit — no real call landed on the wire, so no
-                # post-call verify is needed (and triggering one would
-                # race the user's next call without any new state-
-                # mutation risk).
-                return entry.rows
 
-            rows = await self._real.fetch(sql, *args)
+            if not bypass_cache:
+                entry = self._cache.get(sql, params, state_hash)
+                if entry is not None:
+                    # Cache hit — no real call landed on the wire, so no
+                    # post-call verify is needed (and triggering one would
+                    # race the user's next call without any new state-
+                    # mutation risk). State already matches the put-time
+                    # hash exactly (that's how we got the hit), so
+                    # apply_pending would be a no-op for an unchanged-
+                    # value SET — skip.
+                    return entry.rows
+
+            try:
+                rows = await self._real.fetch(sql, *args)
+            except BaseException:
+                apply_pending(self._guc_state, pending_batch, False)
+                raise
+            apply_pending(self._guc_state, pending_batch, True)
+            self._schedule_post_call_verify(sql)
+            if bypass_cache:
+                return rows
+
             # Skip caching empty result sets — most often these are
             # session-state commands like `SET` / `RESET` / `LISTEN`
             # routed through `fetch()`, which return `[]` and would
@@ -557,70 +622,76 @@ class AsyncCachedConnection:
             # is not None`; asyncpg has no equivalent — `fetch` always
             # returns a list — so we gate on emptiness instead.)
             if rows:
-                self._cache.put(sql, params, list(rows), None, state_hash)
-            self._schedule_post_call_verify(sql)
+                self._cache.put(
+                    sql, params, list(rows), None, self._guc_state.hash
+                )
             return rows
 
     async def fetchrow(self, sql, *args):
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
-            self._guc_state.observe_sql(sql)
+            pending_batch = prepare_pending(sql)
             state_hash = self._guc_state.hash
             write_found = _apply_write_invalidation(
                 self._cache, _detect_writes_multi(sql)
             )
             had_tx_marker = self._observe_tx(sql)
-            if had_tx_marker or write_found:
-                result = await self._real.fetchrow(sql, *args)
-                self._schedule_post_call_verify(sql)
-                return result
-
-            if self._in_transaction:
-                result = await self._real.fetchrow(sql, *args)
-                self._schedule_post_call_verify(sql)
-                return result
-
+            bypass_cache = (
+                had_tx_marker or write_found or self._in_transaction
+            )
             params = args if args else None
-            entry = self._cache.get(sql, params, state_hash)
-            if entry is not None:
-                return entry.rows[0] if entry.rows else None
 
-            row = await self._real.fetchrow(sql, *args)
-            if row is not None:
-                self._cache.put(sql, params, [row], None, state_hash)
+            if not bypass_cache:
+                entry = self._cache.get(sql, params, state_hash)
+                if entry is not None:
+                    return entry.rows[0] if entry.rows else None
+
+            try:
+                row = await self._real.fetchrow(sql, *args)
+            except BaseException:
+                apply_pending(self._guc_state, pending_batch, False)
+                raise
+            apply_pending(self._guc_state, pending_batch, True)
             self._schedule_post_call_verify(sql)
+            if bypass_cache:
+                return row
+
+            if row is not None:
+                self._cache.put(
+                    sql, params, [row], None, self._guc_state.hash
+                )
             return row
 
     async def fetchval(self, sql, *args, column=0):
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
-            self._guc_state.observe_sql(sql)
+            pending_batch = prepare_pending(sql)
             state_hash = self._guc_state.hash
             write_found = _apply_write_invalidation(
                 self._cache, _detect_writes_multi(sql)
             )
             had_tx_marker = self._observe_tx(sql)
-            if had_tx_marker or write_found:
-                result = await self._real.fetchval(sql, *args, column=column)
-                self._schedule_post_call_verify(sql)
-                return result
-
-            if self._in_transaction:
-                result = await self._real.fetchval(sql, *args, column=column)
-                self._schedule_post_call_verify(sql)
-                return result
-
+            bypass_cache = (
+                had_tx_marker or write_found or self._in_transaction
+            )
             params = args if args else None
-            entry = self._cache.get(sql, params, state_hash)
-            if entry is not None:
-                if entry.rows:
-                    row = entry.rows[0]
-                    if hasattr(row, "__getitem__"):
-                        return row[column]
-                    return row
-                return None
 
-            val = await self._real.fetchval(sql, *args, column=column)
+            if not bypass_cache:
+                entry = self._cache.get(sql, params, state_hash)
+                if entry is not None:
+                    if entry.rows:
+                        row = entry.rows[0]
+                        if hasattr(row, "__getitem__"):
+                            return row[column]
+                        return row
+                    return None
+
+            try:
+                val = await self._real.fetchval(sql, *args, column=column)
+            except BaseException:
+                apply_pending(self._guc_state, pending_batch, False)
+                raise
+            apply_pending(self._guc_state, pending_batch, True)
             self._schedule_post_call_verify(sql)
             return val
 
@@ -631,13 +702,20 @@ class AsyncCachedConnection:
         # segments for tx markers so a body like
         # `BEGIN; INSERT INTO t VALUES (1); COMMIT` converges
         # `_in_transaction` to the server's actual end-state instead of
-        # tracking only the first token.
+        # tracking only the first token. SET state is committed only on
+        # dispatch success — server errors on the SET don't leave wrapper
+        # state diverged.
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
-            self._guc_state.observe_sql(sql)
+            pending_batch = prepare_pending(sql)
             _apply_write_invalidation(self._cache, _detect_writes_multi(sql))
             self._observe_tx(sql)
-            result = await self._real.execute(sql, *args)
+            try:
+                result = await self._real.execute(sql, *args)
+            except BaseException:
+                apply_pending(self._guc_state, pending_batch, False)
+                raise
+            apply_pending(self._guc_state, pending_batch, True)
             self._schedule_post_call_verify(sql)
             return result
 
