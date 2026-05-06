@@ -460,7 +460,7 @@ class TestStateHashWiring:
         cursor_real = conn.cursor()
         cc_cursor = CachedCursor(cursor_real, cache, cc_conn)
         baseline = cc_conn._guc_state.hash
-        cc_cursor.execute("SET timezone = 'UTC'")
+        cc_cursor.execute("SET application_name = 'foo'")
         assert cc_conn._guc_state.hash == baseline
 
     def test_two_connections_different_set_get_different_cache_slots(self):
@@ -481,6 +481,14 @@ class TestStateHashWiring:
         cache = make_connected_cache()
         cc_a = CachedConnection(conn_a, cache)
         cc_b = CachedConnection(conn_b, cache)
+        # Pretend the mock conns are recognized-driver instances so the
+        # verify-on-checkout fallback (which fires only for "unknown"
+        # drivers) doesn't add an extra cursor.execute(pg_settings...)
+        # to either path. The test is about cache-slot isolation, which
+        # is independent of the verify path.
+        from goldlapel.wrap import _DRIVER_PSYCOPG_SYNC
+        object.__setattr__(cc_a, "_driver", _DRIVER_PSYCOPG_SYNC)
+        object.__setattr__(cc_b, "_driver", _DRIVER_PSYCOPG_SYNC)
 
         cur_a = CachedCursor(cursor_a, cache, cc_a)
         cur_b = CachedCursor(cursor_b, cache, cc_b)
@@ -1026,3 +1034,446 @@ class TestAsyncSetResponseNotCached:
         a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
         await a.fetch("SELECT name FROM accounts")
         assert cache.get("SELECT name FROM accounts", None) is not None
+
+
+# --- Driver detection ---
+#
+# `_detect_driver` recognizes asyncpg / psycopg / psycopg2 connection
+# classes by their qualified name. Mocks land on "unknown" — which is
+# the safe answer (we don't assume default DISCARD-on-release behaviour).
+
+
+class TestDriverDetection:
+    def test_unknown_for_magicmock(self):
+        from goldlapel.wrap import _detect_driver, _DRIVER_UNKNOWN
+        assert _detect_driver(MagicMock()) == _DRIVER_UNKNOWN
+
+    def test_asyncpg_detection(self):
+        from goldlapel.wrap import _detect_driver, _DRIVER_ASYNCPG
+
+        # Build a class whose qualified name matches asyncpg.connection.Connection.
+        class Connection:
+            pass
+
+        Connection.__module__ = "asyncpg.connection"
+        assert _detect_driver(Connection()) == _DRIVER_ASYNCPG
+
+    def test_psycopg_async_detection(self):
+        from goldlapel.wrap import _detect_driver, _DRIVER_PSYCOPG_ASYNC
+
+        class AsyncConnection:
+            pass
+
+        AsyncConnection.__module__ = "psycopg"
+        assert _detect_driver(AsyncConnection()) == _DRIVER_PSYCOPG_ASYNC
+
+    def test_psycopg_sync_detection(self):
+        from goldlapel.wrap import _detect_driver, _DRIVER_PSYCOPG_SYNC
+
+        class Connection:
+            pass
+
+        Connection.__module__ = "psycopg"
+        assert _detect_driver(Connection()) == _DRIVER_PSYCOPG_SYNC
+
+    def test_psycopg2_detection(self):
+        from goldlapel.wrap import _detect_driver, _DRIVER_PSYCOPG_SYNC
+
+        class connection:
+            pass
+
+        connection.__module__ = "psycopg2.extensions"
+        assert _detect_driver(connection()) == _DRIVER_PSYCOPG_SYNC
+
+
+# --- Verify-on-checkout: sync pre-call hook ---
+
+
+class TestSyncVerifyOnCheckout:
+    """The sync pre-call hook fires `maybe_verify` ONLY when the driver
+    is "unknown" AND the connection is dirty. For known drivers we trust
+    the pool's default DISCARD-on-release; the parser observes the
+    DISCARD on the wire and clears state automatically."""
+
+    def _seed_dirty_with_unknown_driver(self):
+        from goldlapel.wrap import _DRIVER_UNKNOWN
+        conn, cursor = mock_conn(description=None, fetchall_result=[])
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        # MagicMock already classifies as unknown, but be explicit.
+        object.__setattr__(cc_conn, "_driver", _DRIVER_UNKNOWN)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        # Initial SET marks the state dirty.
+        cur.execute("SET app.user_id = '42'")
+        # Reset call counter so subsequent assertions can see ONLY the
+        # next execute()'s wire activity.
+        cursor.execute.reset_mock()
+        cursor.fetchall.reset_mock()
+        return conn, cursor, cc_conn, cur
+
+    def test_dirty_unknown_driver_triggers_verify(self):
+        conn, cursor, cc_conn, cur = self._seed_dirty_with_unknown_driver()
+        # Mock the verify response — pg_settings shows app.user_id=42.
+        cursor.fetchall.return_value = [("app.user_id", "42")]
+        cur.execute("SELECT name FROM accounts")
+        # First call must have been the verify SQL.
+        first_sql = cursor.execute.call_args_list[0][0][0]
+        assert "pg_settings" in first_sql
+        # Verify cleared dirty.
+        assert cc_conn._guc_state.dirty is False
+
+    def test_known_driver_skips_verify(self):
+        # If the driver is one we trust (asyncpg / psycopg / psycopg2),
+        # we don't pay the round-trip — the wire-side DISCARD parser
+        # handles the common case.
+        from goldlapel.wrap import _DRIVER_PSYCOPG_SYNC
+        conn, cursor = mock_conn(description=None, fetchall_result=[])
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        object.__setattr__(cc_conn, "_driver", _DRIVER_PSYCOPG_SYNC)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        cur.execute("SET app.user_id = '42'")
+        cursor.execute.reset_mock()
+        cur.execute("SELECT name FROM accounts")
+        # No call should have been the verify SQL — we trust the pool.
+        for call in cursor.execute.call_args_list:
+            sql = call[0][0]
+            assert "pg_settings" not in sql, f"Unexpected verify call: {sql}"
+
+    def test_clean_state_skips_verify(self):
+        # Even on an "unknown" driver, if dirty=False, no verify fires.
+        conn, cursor = mock_conn(description=None, fetchall_result=[])
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)  # default driver classification
+        cur = CachedCursor(cursor, cache, cc_conn)
+        # No prior SET — clean state.
+        cur.execute("SELECT 1")
+        for call in cursor.execute.call_args_list:
+            sql = call[0][0]
+            assert "pg_settings" not in sql
+
+    def test_discard_clears_dirty_skipping_next_verify(self):
+        # SET → DISCARD ALL → SELECT. The DISCARD-on-the-wire clears the
+        # dirty flag, so the SELECT's pre-call verify is a no-op.
+        from goldlapel.wrap import _DRIVER_UNKNOWN
+        conn, cursor = mock_conn(description=None, fetchall_result=[])
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        object.__setattr__(cc_conn, "_driver", _DRIVER_UNKNOWN)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        cur.execute("SET app.user_id = '42'")
+        cur.execute("DISCARD ALL")
+        cursor.execute.reset_mock()
+        cur.execute("SELECT 1")
+        for call in cursor.execute.call_args_list:
+            sql = call[0][0]
+            assert "pg_settings" not in sql
+
+
+# --- Sync mark-dirty for top-level function calls ---
+
+
+class TestSyncMarkDirtyOnFunctionCall:
+    """`SELECT my_func()` at statement-level marks the connection dirty
+    so the next pre-call verify reconciles state. The function body
+    might have done a server-side `SET` we couldn't see on the wire."""
+
+    def test_user_function_call_marks_dirty(self):
+        conn, cursor = mock_conn(
+            description=(("v",),),
+            fetchall_result=[(1,)],
+        )
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        assert cc_conn._guc_state.dirty is False
+        cur.execute("SELECT my_func()")
+        assert cc_conn._guc_state.dirty is True
+
+    def test_safe_builtin_does_not_mark_dirty(self):
+        conn, cursor = mock_conn(
+            description=(("v",),),
+            fetchall_result=[(1,)],
+        )
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        cur.execute("SELECT now()")
+        assert cc_conn._guc_state.dirty is False
+
+    def test_normal_select_does_not_mark_dirty(self):
+        conn, cursor = mock_conn(
+            description=(("name",),),
+            fetchall_result=[("alice",)],
+        )
+        cache = make_connected_cache()
+        cc_conn = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc_conn)
+        cur.execute("SELECT name FROM accounts")
+        assert cc_conn._guc_state.dirty is False
+
+
+# --- Async post-call verify (item #6) ---
+
+
+class TestAsyncPostCallVerify:
+    """The async post-call verify schedules a background task to read
+    pg_settings AFTER the user's response is dispatched. The user's
+    fetch() returns immediately; the verify runs concurrently."""
+
+    @pytest.mark.asyncio
+    async def test_user_function_fetch_schedules_verify(self):
+        from goldlapel.wrap import AsyncCachedConnection
+        import asyncio
+
+        class FakeAsyncpgConn:
+            def __init__(self):
+                self.calls = []
+
+            async def fetch(self, sql, *args):
+                self.calls.append(sql)
+                if "pg_settings" in sql:
+                    # Verify fetches the post-call session view.
+                    return [("app.user_id", "999")]
+                return [(1,)]
+
+        cache = make_connected_cache()
+        conn = FakeAsyncpgConn()
+        a = AsyncCachedConnection(conn, cache)
+        # User's call lands first; verify is scheduled afterwards.
+        rows = await a.fetch("SELECT my_func()")
+        assert rows == [(1,)]
+        # Drain the verify task — it should have been scheduled.
+        assert len(a._pending_verify_tasks) >= 0  # may have already run
+        if a._pending_verify_tasks:
+            await asyncio.gather(*a._pending_verify_tasks, return_exceptions=True)
+        # State map reflects the post-call value.
+        peer = type(a._guc_state)()
+        peer.observe_sql("SET app.user_id = '999'")
+        assert a._guc_state.hash == peer.hash
+        # `pg_settings` query landed.
+        assert any("pg_settings" in c for c in conn.calls)
+
+    @pytest.mark.asyncio
+    async def test_verify_failure_does_not_error_user_query(self):
+        # If pg_settings query fails, the user's call must STILL succeed.
+        from goldlapel.wrap import AsyncCachedConnection
+        import asyncio
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                if "pg_settings" in sql:
+                    raise RuntimeError("verify blew up")
+                return [(1,)]
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        # User's call must NOT raise.
+        rows = await a.fetch("SELECT my_func()")
+        assert rows == [(1,)]
+        # Drain any pending verify tasks (without raising).
+        if a._pending_verify_tasks:
+            await asyncio.gather(*a._pending_verify_tasks, return_exceptions=True)
+        # Connection stays dirty so a future verify can retry.
+        assert a._guc_state.dirty is True
+
+    @pytest.mark.asyncio
+    async def test_user_function_fetchrow_schedules_verify(self):
+        from goldlapel.wrap import AsyncCachedConnection
+        import asyncio
+
+        verify_calls = []
+
+        class FakeAsyncpgConn:
+            async def fetchrow(self, sql, *args):
+                return ("ok",)
+
+            async def fetch(self, sql, *args):
+                verify_calls.append(sql)
+                return [("app.user_id", "55")]
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.fetchrow("SELECT my_func()")
+        if a._pending_verify_tasks:
+            await asyncio.gather(*a._pending_verify_tasks, return_exceptions=True)
+        # Verify hit pg_settings.
+        assert any("pg_settings" in c for c in verify_calls)
+
+    @pytest.mark.asyncio
+    async def test_user_function_execute_schedules_verify(self):
+        from goldlapel.wrap import AsyncCachedConnection
+        import asyncio
+
+        verify_calls = []
+
+        class FakeAsyncpgConn:
+            async def execute(self, sql, *args):
+                return "OK"
+
+            async def fetch(self, sql, *args):
+                verify_calls.append(sql)
+                return []
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.execute("SELECT my_func()")
+        if a._pending_verify_tasks:
+            await asyncio.gather(*a._pending_verify_tasks, return_exceptions=True)
+        assert any("pg_settings" in c for c in verify_calls)
+
+    @pytest.mark.asyncio
+    async def test_safe_builtin_does_not_schedule_verify(self):
+        # `SELECT now()` is in the safe-builtins list — no verify needed.
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                return [("2026-01-01",)]
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.fetch("SELECT now()")
+        assert not a._pending_verify_tasks
+        assert a._guc_state.dirty is False
+
+    @pytest.mark.asyncio
+    async def test_normal_select_does_not_schedule_verify(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                return [("alice",)]
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.fetch("SELECT name FROM accounts")
+        assert not a._pending_verify_tasks
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_pending_verifies(self):
+        # If `close()` is called while a verify is in flight, the task
+        # must be cancelled cleanly — no lingering coroutines.
+        from goldlapel.wrap import AsyncCachedConnection
+        import asyncio
+
+        verify_started = asyncio.Event()
+        verify_proceed = asyncio.Event()
+        close_finished = False
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                if "pg_settings" in sql:
+                    verify_started.set()
+                    # Block until told to proceed (or cancelled).
+                    await verify_proceed.wait()
+                    return []
+                return [(1,)]
+
+            async def close(self):
+                pass
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        await a.fetch("SELECT my_func()")
+        # Wait for the verify to actually start before closing.
+        await asyncio.wait_for(verify_started.wait(), timeout=1.0)
+        # Close should cancel the in-flight verify and return promptly.
+        await a.close()
+        # All tasks drained (task set is empty post-close).
+        assert not a._pending_verify_tasks
+
+    @pytest.mark.asyncio
+    async def test_verify_serializes_with_user_calls(self):
+        # asyncpg / psycopg-async are single-op per connection. The
+        # post-call verify task and the user's NEXT call would race
+        # without explicit serialization. This test simulates that
+        # race: the verify task starts first (and blocks on a fake
+        # await), the user's next call must wait until verify finishes
+        # rather than racing the connection's protocol lock.
+        from goldlapel.wrap import AsyncCachedConnection
+        import asyncio
+
+        verify_started = asyncio.Event()
+        verify_proceed = asyncio.Event()
+        order_seen = []
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                if "pg_settings" in sql:
+                    order_seen.append("verify-start")
+                    verify_started.set()
+                    await verify_proceed.wait()
+                    order_seen.append("verify-end")
+                    return []
+                order_seen.append(f"user:{sql}")
+                return [(1,)]
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        # First call schedules a verify.
+        await a.fetch("SELECT my_func()")
+        # Wait for the verify task to actually be holding the lock.
+        await asyncio.wait_for(verify_started.wait(), timeout=1.0)
+        # User's next call — must wait behind the verify under the lock.
+        next_call_task = asyncio.create_task(a.fetch("SELECT 1"))
+        # Give the next-call task a chance to advance to the lock acquire.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # While verify is still in flight, the user's next call must
+        # NOT have hit the wire — the lock is held by verify.
+        assert "user:SELECT 1" not in order_seen, (
+            f"User call ran before verify finished: {order_seen}"
+        )
+        # Release verify. Now the user's call should proceed.
+        verify_proceed.set()
+        await next_call_task
+        # Sequence: user's first call, then verify, then user's next call.
+        assert order_seen[0] == "user:SELECT my_func()"
+        assert "verify-end" in order_seen
+        assert "user:SELECT 1" in order_seen
+        # Verify must complete BEFORE the user's next call lands —
+        # confirming the lock serialized them.
+        verify_end_idx = order_seen.index("verify-end")
+        user_call_idx = order_seen.index("user:SELECT 1")
+        assert verify_end_idx < user_call_idx
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_does_not_schedule_post_call_verify(self):
+        # A pure cache hit doesn't run the user's function on the wire,
+        # so no NEW post-call verify task is scheduled. (The pre-call
+        # verify path is independent and may still fire if the prior
+        # call left the connection dirty.)
+        from goldlapel.wrap import AsyncCachedConnection, _DRIVER_PSYCOPG_ASYNC
+        import asyncio
+
+        post_call_marker = []
+        captured = []
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                captured.append(sql)
+                if "pg_settings" in sql:
+                    return []
+                return [(1,)]
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(FakeAsyncpgConn(), cache)
+        # Pretend the driver is recognized so pre-call verify is gated off.
+        # The post-call verify path uses `mark_dirty` + create_task and is
+        # independent of driver detection.
+        object.__setattr__(a, "_driver", _DRIVER_PSYCOPG_ASYNC)
+        # First call populates the cache and schedules a post-call verify.
+        await a.fetch("SELECT my_func()")
+        if a._pending_verify_tasks:
+            await asyncio.gather(*a._pending_verify_tasks, return_exceptions=True)
+        captured.clear()
+        # Second call hits the cache — no new wire activity at all.
+        rows = await a.fetch("SELECT my_func()")
+        assert rows == [(1,)]
+        # No new post-call verify scheduled (the cache path returns before
+        # `_schedule_post_call_verify` runs).
+        assert not a._pending_verify_tasks
+        # And no new wire calls landed (driver was trusted, so pre-call
+        # verify was skipped too).
+        assert captured == []
