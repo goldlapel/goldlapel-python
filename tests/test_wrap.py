@@ -9,11 +9,53 @@ from goldlapel.wrap import wrap, CachedConnection, CachedCursor
 @pytest.fixture(autouse=True)
 def reset_cache():
     NativeCache._reset()
-    import goldlapel.wrap
-    goldlapel.wrap._cache = None
+    # `goldlapel.wrap` is shadowed at module import time by `from
+    # goldlapel.wrap import wrap` — so `goldlapel.wrap` resolves to the
+    # function, not the module. Use the sys.modules lookup instead.
+    import sys as _sys
+    _wrap_mod = _sys.modules["goldlapel.wrap"]
+    _wrap_mod._cache = None
+    # Reset the trigger-detection cache so each test sees a fresh start.
+    from goldlapel.cache import _trigger_detection_reset
+    _trigger_detection_reset()
     yield
     NativeCache._reset()
-    goldlapel.wrap._cache = None
+    _wrap_mod._cache = None
+    _trigger_detection_reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_aggressive_verify_by_default(monkeypatch):
+    """Most unit tests in this module construct `CachedConnection` /
+    `AsyncCachedConnection` directly with MagicMock-backed conns. The
+    smart aggressive-verify auto-detection runs a `pg_trigger`
+    `cursor.execute(...)` round-trip on the first wire op — which lands
+    on the same MagicMock cursor the test is asserting against,
+    polluting `cursor.execute.call_args_list` and breaking assertions
+    that pre-date the feature.
+
+    Production callers go through `goldlapel.start(...)`, which always
+    wires `aggressive_verify="auto"`; this fixture only flips the
+    *default* on direct `CachedConnection(conn, cache)` calls so legacy
+    tests stay clean. Tests that exercise the detection feature
+    explicitly pass `aggressive_verify=` (or seed the module-level
+    detection cache) to override.
+    """
+    import sys as _sys
+    _wrap_mod = _sys.modules["goldlapel.wrap"]
+    original_sync = _wrap_mod.CachedConnection.__init__
+    original_async = _wrap_mod.AsyncCachedConnection.__init__
+
+    def patched_sync(self, real_conn, cache, **kwargs):
+        kwargs.setdefault("aggressive_verify", _wrap_mod.AGGRESSIVE_VERIFY_OFF)
+        return original_sync(self, real_conn, cache, **kwargs)
+
+    def patched_async(self, real_conn, cache, **kwargs):
+        kwargs.setdefault("aggressive_verify", _wrap_mod.AGGRESSIVE_VERIFY_OFF)
+        return original_async(self, real_conn, cache, **kwargs)
+
+    monkeypatch.setattr(_wrap_mod.CachedConnection, "__init__", patched_sync)
+    monkeypatch.setattr(_wrap_mod.AsyncCachedConnection, "__init__", patched_async)
 
 
 def make_connected_cache():
@@ -283,6 +325,13 @@ class TestWrites:
 
 class MockCachedConn:
     _in_transaction = False
+    # Smart aggressive-verify defaults: "off" mode, pre-resolved as
+    # inactive. Mirrors the autouse `_no_aggressive_verify_by_default`
+    # fixture's intent — tests using `MockCachedConn` directly don't
+    # exercise the detection round-trip, so resolution is a no-op.
+    _aggressive_verify_mode = "off"
+    _aggressive_verify_active = False
+    _db_key = None
 
     def __init__(self):
         # Per-connection unsafe-GUC state — required by CachedCursor.execute

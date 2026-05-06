@@ -7,10 +7,59 @@ from goldlapel.cache import (
     _detect_writes_multi,
     _DDL_SENTINEL,
     apply_pending,
+    detect_trigger_internal_set,
+    detect_trigger_internal_set_async,
     is_top_level_function_call,
     prepare_pending,
     update_tx_state,
+    _trigger_detection_lookup,
+    _trigger_detection_store,
 )
+
+
+# --- Aggressive-verify modes (smart auto-enable for trigger-internal SETs) ---
+#
+# Triggers can SET / RESET / DISCARD / set_config() server-side, never
+# surfacing the command on the client wire. The wrapper's parser-based
+# state tracking misses these. Smart auto-enable detects the pattern at
+# first wire interaction and, when present, schedules a post-DML verify
+# so wrapper state stays in sync with what triggers do invisibly.
+#
+# Modes:
+#   "auto"  — detect once per database, follow the detection result
+#             (the customer-friendly default — zero tax on clean schemas)
+#   "on"    — force aggressive-verify on (skip detection)
+#   "off"   — force off (escape hatch; accept the correctness gap)
+#
+# Resolution lazily on the connection's first wire op so detection only
+# costs one round-trip per database and only when the user has at least
+# one thing to do.
+AGGRESSIVE_VERIFY_AUTO = "auto"
+AGGRESSIVE_VERIFY_ON = "on"
+AGGRESSIVE_VERIFY_OFF = "off"
+_VALID_AGGRESSIVE_VERIFY = (
+    AGGRESSIVE_VERIFY_AUTO,
+    AGGRESSIVE_VERIFY_ON,
+    AGGRESSIVE_VERIFY_OFF,
+)
+
+
+def _normalize_aggressive_verify(value):
+    """Validate and normalise the `aggressive_verify` mode string.
+
+    Accepts the three documented values plus None (treated as "auto" — the
+    default for callers that don't pass the kwarg). Raises ValueError on
+    anything else; this is a public-API surface and a typo here would
+    silently fall through to "off" without an exception, hiding the bug.
+    """
+    if value is None:
+        return AGGRESSIVE_VERIFY_AUTO
+    if value in _VALID_AGGRESSIVE_VERIFY:
+        return value
+    raise ValueError(
+        f"aggressive_verify must be one of {_VALID_AGGRESSIVE_VERIFY!r}, "
+        f"got {value!r}"
+    )
 
 
 # --- Driver detection ---
@@ -79,6 +128,74 @@ async def _maybe_verify_async_pre_call(cached_conn):
     await state.maybe_verify_async(cached_conn._real)
 
 
+def _resolve_aggressive_verify_sync(cached_conn):
+    """Return True iff aggressive-verify mode is active for `cached_conn`.
+
+    First call resolves the mode:
+    - "off"  → False, never run detection
+    - "on"   → True, never run detection
+    - "auto" → check the module-level db-keyed cache; if missing, run
+               the detection query NOW against `_real`. Cache the result
+               under `db_key` (or per-connection if no key was passed).
+
+    Subsequent calls hit the cached `_aggressive_verify_active` and skip
+    the cache lookup. Errors during detection resolve to False (safe
+    default — a clean schema doesn't need post-DML verify).
+    """
+    cached = cached_conn._aggressive_verify_active
+    if cached is not None:
+        return cached
+    mode = cached_conn._aggressive_verify_mode
+    if mode == AGGRESSIVE_VERIFY_OFF:
+        object.__setattr__(cached_conn, "_aggressive_verify_active", False)
+        return False
+    if mode == AGGRESSIVE_VERIFY_ON:
+        object.__setattr__(cached_conn, "_aggressive_verify_active", True)
+        return True
+    # "auto": consult the per-database cache, then (if missing) detect.
+    db_key = cached_conn._db_key
+    cached_db = _trigger_detection_lookup(db_key)
+    if cached_db is not None:
+        object.__setattr__(
+            cached_conn, "_aggressive_verify_active", cached_db
+        )
+        return cached_db
+    detected = detect_trigger_internal_set(cached_conn._real)
+    _trigger_detection_store(db_key, detected)
+    object.__setattr__(cached_conn, "_aggressive_verify_active", detected)
+    return detected
+
+
+async def _resolve_aggressive_verify_async(cached_conn):
+    """Async sibling of `_resolve_aggressive_verify_sync`.
+
+    Same resolution rules, but uses `detect_trigger_internal_set_async`
+    so it runs on asyncpg / psycopg-async connections without bouncing
+    through a thread pool.
+    """
+    cached = cached_conn._aggressive_verify_active
+    if cached is not None:
+        return cached
+    mode = cached_conn._aggressive_verify_mode
+    if mode == AGGRESSIVE_VERIFY_OFF:
+        object.__setattr__(cached_conn, "_aggressive_verify_active", False)
+        return False
+    if mode == AGGRESSIVE_VERIFY_ON:
+        object.__setattr__(cached_conn, "_aggressive_verify_active", True)
+        return True
+    db_key = cached_conn._db_key
+    cached_db = _trigger_detection_lookup(db_key)
+    if cached_db is not None:
+        object.__setattr__(
+            cached_conn, "_aggressive_verify_active", cached_db
+        )
+        return cached_db
+    detected = await detect_trigger_internal_set_async(cached_conn._real)
+    _trigger_detection_store(db_key, detected)
+    object.__setattr__(cached_conn, "_aggressive_verify_active", detected)
+    return detected
+
+
 def _detect_driver(real_conn):
     """Return a string identifier for the underlying driver. Detection is
     by-class (no module imports forced): we check the conn's qualified
@@ -145,7 +262,28 @@ def _detect_invalidation_port():
         return 7934
 
 
-def wrap(conn, invalidation_port=None, disable_native_cache=False):
+def wrap(
+    conn,
+    invalidation_port=None,
+    disable_native_cache=False,
+    aggressive_verify=AGGRESSIVE_VERIFY_AUTO,
+    db_key=None,
+):
+    """Wrap `conn` with cache + state-tracking layer. See module docstring.
+
+    Args:
+        conn: a real Postgres connection (asyncpg, psycopg, psycopg2).
+        invalidation_port: port for the wrapper's invalidation socket.
+            Defaults to proxy_port + 2 when None.
+        disable_native_cache: turn off the native cache (still tracks
+            invalidations for the dashboard).
+        aggressive_verify: smart auto-enable post-DML verify mode. One
+            of "auto" (default), "on", "off". See module-level docs.
+        db_key: opaque key for the trigger-detection cache (typically
+            the upstream URL). When None, detection runs once per
+            connection rather than once per database — still correct,
+            just less efficient.
+    """
     global _cache, _atexit_registered
     # Pass `disable_native_cache` through on every wrap() call. NativeCache
     # is a singleton; on first construction it stores the flag, and on every
@@ -161,14 +299,27 @@ def wrap(conn, invalidation_port=None, disable_native_cache=False):
         atexit.register(_shutdown_cache)
         _atexit_registered = True
 
-    if hasattr(conn, "fetch") and hasattr(conn, "fetchrow"):
-        return AsyncCachedConnection(conn, _cache)
+    mode = _normalize_aggressive_verify(aggressive_verify)
 
-    return CachedConnection(conn, _cache)
+    if hasattr(conn, "fetch") and hasattr(conn, "fetchrow"):
+        return AsyncCachedConnection(
+            conn, _cache, aggressive_verify=mode, db_key=db_key
+        )
+
+    return CachedConnection(
+        conn, _cache, aggressive_verify=mode, db_key=db_key
+    )
 
 
 class CachedConnection:
-    def __init__(self, real_conn, cache):
+    def __init__(
+        self,
+        real_conn,
+        cache,
+        *,
+        aggressive_verify=AGGRESSIVE_VERIFY_AUTO,
+        db_key=None,
+    ):
         object.__setattr__(self, "_real", real_conn)
         object.__setattr__(self, "_cache", cache)
         object.__setattr__(self, "_in_transaction", False)
@@ -182,6 +333,14 @@ class CachedConnection:
         # DISCARD-on-release default can be trusted. Detected once at
         # wrap time; the underlying conn class doesn't change after that.
         object.__setattr__(self, "_driver", _detect_driver(real_conn))
+        # Smart aggressive-verify: requested mode (auto/on/off) and the
+        # resolved active flag. The active flag is None until the first
+        # wire op runs detection (auto mode) or short-circuits to True/
+        # False (on/off modes). See `_resolve_aggressive_verify_sync`
+        # below for the resolution rules.
+        object.__setattr__(self, "_aggressive_verify_mode", aggressive_verify)
+        object.__setattr__(self, "_aggressive_verify_active", None)
+        object.__setattr__(self, "_db_key", db_key)
 
     def cursor(self, *args, **kwargs):
         real_cursor = self._real.cursor(*args, **kwargs)
@@ -237,6 +396,16 @@ class CachedCursor:
         # reasonable state hash even if verify fails.
         if self._conn is not None:
             _maybe_verify_sync_pre_call(self._conn)
+
+        # Smart aggressive-verify: resolve activation lazily on the first
+        # wire op. Cached (per-connection AND per-database) — runs the
+        # trigger-detection round-trip at most once per database, and
+        # zero times when the mode is "on" / "off". Errors during
+        # detection resolve to False (safe default). Resolved once;
+        # subsequent calls on this cursor / connection hit the cached
+        # `_aggressive_verify_active` attribute.
+        if self._conn is not None:
+            _resolve_aggressive_verify_sync(self._conn)
 
         # Parse SET / RESET / DISCARD / set_config segments into a pending
         # batch — the actual state mutation is deferred until AFTER the
@@ -345,6 +514,21 @@ class CachedCursor:
             raise
         _commit_pending(True)
 
+        # Smart aggressive-verify post-DML mark-dirty: when active AND
+        # the body included a write, mark the GUC state dirty so the
+        # next pre-call verify reconciles via pg_settings. Closes the
+        # trigger-internal-SET correctness gap (a row trigger could
+        # have done `SET app.user_id = ...` server-side, never visible
+        # on the wire). The sync path uses mark-dirty rather than fire-
+        # and-forget threads — the next checkout's pre-call verify is
+        # the natural reconciliation point.
+        if (
+            self._conn is not None
+            and write_found
+            and self._conn._aggressive_verify_active
+        ):
+            self._conn._guc_state.mark_dirty()
+
         if bypass_cache:
             return result
 
@@ -420,13 +604,25 @@ class CachedCursor:
         pending_batch = None
         if self._conn is not None:
             _maybe_verify_sync_pre_call(self._conn)
+            _resolve_aggressive_verify_sync(self._conn)
             pending_batch = prepare_pending(sql)
             # Top-level function calls in executemany — also mark dirty
             # so the next call's pre-call verify reconciles state. The
             # function body might mutate state on every row.
             if is_top_level_function_call(sql):
                 self._conn._guc_state.mark_dirty()
-        _apply_write_invalidation(self._cache, _detect_writes_multi(sql))
+        write_result = _detect_writes_multi(sql)
+        _apply_write_invalidation(self._cache, write_result)
+        # Smart aggressive-verify: `executemany("INSERT ...", rows)` may
+        # have triggered row-level triggers on every row that did SETs.
+        # Mark dirty so the next pre-call verify reconciles. (Mirrors the
+        # post-DML mark-dirty in `execute()`.)
+        if (
+            self._conn is not None
+            and write_result is not None
+            and self._conn._aggressive_verify_active
+        ):
+            self._conn._guc_state.mark_dirty()
         # Track tx markers for parity with `execute`. Multi-statement bodies
         # containing BEGIN/COMMIT in `executemany` are unusual but the cost
         # is negligible (single-statement fast path) and keeps the wrapper's
@@ -479,7 +675,14 @@ class CachedCursor:
 
 
 class AsyncCachedConnection:
-    def __init__(self, real_conn, cache):
+    def __init__(
+        self,
+        real_conn,
+        cache,
+        *,
+        aggressive_verify=AGGRESSIVE_VERIFY_AUTO,
+        db_key=None,
+    ):
         object.__setattr__(self, "_real", real_conn)
         object.__setattr__(self, "_cache", cache)
         object.__setattr__(self, "_in_transaction", False)
@@ -498,6 +701,11 @@ class AsyncCachedConnection:
         # cancel them — never block the user's hot path, never leak a
         # dangling coroutine on connection teardown.
         object.__setattr__(self, "_pending_verify_tasks", set())
+        # Smart aggressive-verify state — see CachedConnection for the
+        # mode/active-flag contract.
+        object.__setattr__(self, "_aggressive_verify_mode", aggressive_verify)
+        object.__setattr__(self, "_aggressive_verify_active", None)
+        object.__setattr__(self, "_db_key", db_key)
         # asyncpg / psycopg-async connections are single-op: at most one
         # `await fetch(...)` in flight at a time. The post-call verify
         # task and the user's NEXT call would race for the connection's
@@ -530,10 +738,12 @@ class AsyncCachedConnection:
             object.__setattr__(self, "_in_transaction", new_tx)
         return had_tx_marker
 
-    def _schedule_post_call_verify(self, sql):
+    def _schedule_post_call_verify(self, sql, force=False):
         """If `sql` is a top-level `SELECT <ident>(...)` whose function body
-        could plausibly mutate session state, schedule an async verify
-        task to read pg_settings AFTER the user's response is dispatched.
+        could plausibly mutate session state — OR `force=True` (used by
+        the smart aggressive-verify post-DML hook) — schedule an async
+        verify task to read pg_settings AFTER the user's response is
+        dispatched.
 
         The task uses `asyncio.create_task` so it runs concurrently with
         whatever the user does next. The op-lock serializes the verify
@@ -547,7 +757,7 @@ class AsyncCachedConnection:
         Cancellation (e.g. `close()` while verify is in flight) is
         absorbed without surfacing to the user.
         """
-        if not is_top_level_function_call(sql):
+        if not (force or is_top_level_function_call(sql)):
             return
         # Mark dirty BEFORE scheduling — even if create_task isn't
         # possible (we're not in an event loop, somehow), the dirty
@@ -578,14 +788,14 @@ class AsyncCachedConnection:
     async def fetch(self, sql, *args):
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
+            await _resolve_aggressive_verify_async(self)
             # Defer state mutation until after the dispatch resolves —
             # see prepare_pending / apply_pending in goldlapel.cache for
             # the Wave 2 SET-actually-applied rationale.
             pending_batch = prepare_pending(sql)
             state_hash = self._guc_state.hash
-            write_found = _apply_write_invalidation(
-                self._cache, _detect_writes_multi(sql)
-            )
+            write_result = _detect_writes_multi(sql)
+            write_found = _apply_write_invalidation(self._cache, write_result)
             had_tx_marker = self._observe_tx(sql)
             bypass_cache = (
                 had_tx_marker or write_found or self._in_transaction
@@ -610,7 +820,15 @@ class AsyncCachedConnection:
                 apply_pending(self._guc_state, pending_batch, False)
                 raise
             apply_pending(self._guc_state, pending_batch, True)
-            self._schedule_post_call_verify(sql)
+            # Smart aggressive-verify: force a post-DML verify when the
+            # body included a write AND aggressive-verify is active.
+            # Closes the trigger-internal-SET correctness gap. Layered
+            # over the existing top-level-function-call verify trigger.
+            force_verify = bool(
+                write_result is not None
+                and self._aggressive_verify_active
+            )
+            self._schedule_post_call_verify(sql, force=force_verify)
             if bypass_cache:
                 return rows
 
@@ -630,11 +848,11 @@ class AsyncCachedConnection:
     async def fetchrow(self, sql, *args):
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
+            await _resolve_aggressive_verify_async(self)
             pending_batch = prepare_pending(sql)
             state_hash = self._guc_state.hash
-            write_found = _apply_write_invalidation(
-                self._cache, _detect_writes_multi(sql)
-            )
+            write_result = _detect_writes_multi(sql)
+            write_found = _apply_write_invalidation(self._cache, write_result)
             had_tx_marker = self._observe_tx(sql)
             bypass_cache = (
                 had_tx_marker or write_found or self._in_transaction
@@ -652,7 +870,11 @@ class AsyncCachedConnection:
                 apply_pending(self._guc_state, pending_batch, False)
                 raise
             apply_pending(self._guc_state, pending_batch, True)
-            self._schedule_post_call_verify(sql)
+            force_verify = bool(
+                write_result is not None
+                and self._aggressive_verify_active
+            )
+            self._schedule_post_call_verify(sql, force=force_verify)
             if bypass_cache:
                 return row
 
@@ -665,11 +887,11 @@ class AsyncCachedConnection:
     async def fetchval(self, sql, *args, column=0):
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
+            await _resolve_aggressive_verify_async(self)
             pending_batch = prepare_pending(sql)
             state_hash = self._guc_state.hash
-            write_found = _apply_write_invalidation(
-                self._cache, _detect_writes_multi(sql)
-            )
+            write_result = _detect_writes_multi(sql)
+            write_found = _apply_write_invalidation(self._cache, write_result)
             had_tx_marker = self._observe_tx(sql)
             bypass_cache = (
                 had_tx_marker or write_found or self._in_transaction
@@ -692,7 +914,11 @@ class AsyncCachedConnection:
                 apply_pending(self._guc_state, pending_batch, False)
                 raise
             apply_pending(self._guc_state, pending_batch, True)
-            self._schedule_post_call_verify(sql)
+            force_verify = bool(
+                write_result is not None
+                and self._aggressive_verify_active
+            )
+            self._schedule_post_call_verify(sql, force=force_verify)
             return val
 
     async def execute(self, sql, *args):
@@ -707,8 +933,10 @@ class AsyncCachedConnection:
         # state diverged.
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
+            await _resolve_aggressive_verify_async(self)
             pending_batch = prepare_pending(sql)
-            _apply_write_invalidation(self._cache, _detect_writes_multi(sql))
+            write_result = _detect_writes_multi(sql)
+            _apply_write_invalidation(self._cache, write_result)
             self._observe_tx(sql)
             try:
                 result = await self._real.execute(sql, *args)
@@ -716,7 +944,11 @@ class AsyncCachedConnection:
                 apply_pending(self._guc_state, pending_batch, False)
                 raise
             apply_pending(self._guc_state, pending_batch, True)
-            self._schedule_post_call_verify(sql)
+            force_verify = bool(
+                write_result is not None
+                and self._aggressive_verify_active
+            )
+            self._schedule_post_call_verify(sql, force=force_verify)
             return result
 
     def transaction(self, **kwargs):
