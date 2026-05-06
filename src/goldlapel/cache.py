@@ -1072,6 +1072,134 @@ _VERIFY_SQL = (
 )
 
 
+# ---- Smart aggressive-verify: trigger-internal-SET detection ----
+#
+# Triggers fire on DML and can SET / RESET / DISCARD / set_config()
+# server-side without ever surfacing those commands on the client wire.
+# The wrapper's normal observe-on-the-wire parser misses them, leaving
+# the per-connection ConnectionGucState diverged from server reality.
+#
+# To close that gap WITHOUT charging every customer the cost of a
+# post-DML verify, we detect once per database whether any user trigger
+# could plausibly do this. If yes, the wrapper enables an "aggressive
+# verify" mode that schedules a post-DML verify (mark-dirty in the sync
+# path, async create_task in the async path) on every observed
+# INSERT/UPDATE/DELETE/MERGE/TRUNCATE. False positives cost ~1ms per
+# write; false negatives are the bad case (silent correctness drift) —
+# the regex is intentionally permissive to bias toward false positives.
+#
+# Detection is cached module-level keyed by the database key (caller
+# passes the upstream URL). One detection round-trip per database, not
+# per-connection, not per-call.
+_TRIGGER_DETECTION_SQL = (
+    "SELECT EXISTS ("
+    "    SELECT 1"
+    "    FROM pg_trigger t"
+    "    JOIN pg_proc p ON t.tgfoid = p.oid"
+    "    WHERE NOT t.tgisinternal"
+    "    AND ("
+    "        p.prosrc ~* '\\mset\\M'"
+    "        OR p.prosrc ~* 'set_config'"
+    "        OR p.prosrc ~* '\\mreset\\M'"
+    "        OR p.prosrc ~* '\\mdiscard\\M'"
+    "    )"
+    ")"
+)
+
+
+# Module-level detection cache. Keyed by an opaque "database key" (the
+# caller's upstream URL is fine — what matters is that two conns to the
+# same db share a key). Values are bool. A `threading.Lock` guards the
+# dict; reads/writes are infrequent (once per db, then steady-state hits)
+# so the lock is uncontended.
+import threading as _threading
+_trigger_detection_cache = {}
+_trigger_detection_lock = _threading.Lock()
+
+
+def _trigger_detection_lookup(db_key):
+    """Return cached detection bool for `db_key`, or None if uncached."""
+    if db_key is None:
+        return None
+    with _trigger_detection_lock:
+        return _trigger_detection_cache.get(db_key)
+
+
+def _trigger_detection_store(db_key, value):
+    """Store detection result. Idempotent — last-writer-wins on the rare
+    race where two connections detect concurrently (both should see the
+    same answer; if they don't, the database changed under us, which is
+    out of scope for v1)."""
+    if db_key is None:
+        return
+    with _trigger_detection_lock:
+        _trigger_detection_cache[db_key] = bool(value)
+
+
+def _trigger_detection_reset():
+    """Test helper — clear the module-level cache so each test sees a
+    fresh detection round-trip."""
+    with _trigger_detection_lock:
+        _trigger_detection_cache.clear()
+
+
+def detect_trigger_internal_set(real_conn):
+    """Run the trigger-pattern detection query on `real_conn` (sync DBAPI
+    cursor protocol). Returns True if any non-internal trigger's body
+    references SET / RESET / DISCARD / set_config. False on a clean
+    schema OR on any error — detection is best-effort, NEVER fails the
+    user's call. False on error is the safe default: smart auto-enable
+    declines to opt-in when it can't read pg_trigger.
+
+    Caller is responsible for caching — this function does the wire op
+    every time it's called.
+    """
+    try:
+        cursor = real_conn.cursor()
+        try:
+            cursor.execute(_TRIGGER_DETECTION_SQL)
+            row = cursor.fetchone()
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if not row:
+            return False
+        # `EXISTS(...)` returns a single-column row of bool. Tolerate
+        # tuple / Row / Mapping-like shapes.
+        try:
+            value = row[0]
+        except (KeyError, IndexError, TypeError):
+            return False
+        return bool(value)
+    except Exception:
+        return False
+
+
+async def detect_trigger_internal_set_async(real_conn):
+    """Async sibling of `detect_trigger_internal_set` — uses asyncpg's
+    `fetchval` / `fetch` API. Same contract: returns True iff the
+    detection query says yes. False on any error.
+    """
+    try:
+        # Prefer fetchval (returns the scalar directly). asyncpg /
+        # psycopg.AsyncConnection both expose it on Connection.
+        if hasattr(real_conn, "fetchval"):
+            value = await real_conn.fetchval(_TRIGGER_DETECTION_SQL)
+            return bool(value)
+        # Fallback: fetch + first-row first-col.
+        rows = await real_conn.fetch(_TRIGGER_DETECTION_SQL)
+        if not rows:
+            return False
+        try:
+            return bool(rows[0][0])
+        except (KeyError, IndexError, TypeError):
+            return False
+    except Exception:
+        return False
+
+
 def _make_key(sql, params, state_hash=0):
     if params is None:
         params_part = None
