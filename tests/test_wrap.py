@@ -2360,14 +2360,16 @@ class TestWrapKwargsPlumbing:
             wrap(conn, invalidation_port=9999, aggressive_verify="bogus")
 
     def test_wrap_default_is_auto(self):
-        conn = MagicMock()
-        delattr(conn, "fetch")
-        delattr(conn, "fetchrow")
-        result = wrap(conn, invalidation_port=9999)
-        # Note: the autouse `_no_aggressive_verify_by_default` fixture
-        # patches CachedConnection.__init__ to default to "off" for
-        # legacy-test stability. Bypass it by inspecting `wrap`'s
-        # default-arg propagation directly.
-        from goldlapel.wrap import _normalize_aggressive_verify
-        # The default kwarg on wrap() is "auto" — verify the constant.
-        assert _normalize_aggressive_verify(None) == "auto"
+        # The `_no_aggressive_verify_by_default` fixture patches
+        # CachedConnection.__init__ to default to "off" for legacy-test
+        # stability. Bypass it by inspecting `wrap`'s default-arg
+        # propagation through the function signature directly.
+        import inspect
+        sig = inspect.signature(wrap)
+        assert sig.parameters["aggressive_verify"].default == "auto"
+
+    def test_wrap_passes_db_key_default_none(self):
+        # Default db_key is None — caller goes per-connection cache.
+        import inspect
+        sig = inspect.signature(wrap)
+        assert sig.parameters["db_key"].default is None
