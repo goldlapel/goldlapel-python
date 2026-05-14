@@ -15,31 +15,33 @@ def reset_cache():
     import sys as _sys
     _wrap_mod = _sys.modules["goldlapel.wrap"]
     _wrap_mod._cache = None
-    # Reset the trigger-detection cache so each test sees a fresh start.
-    from goldlapel.cache import _trigger_detection_reset
-    _trigger_detection_reset()
+    # Reset the off-warning one-shot set so tests that exercise the
+    # warning path start from a clean slate.
+    _wrap_mod._aggressive_verify_off_warned.clear()
     yield
     NativeCache._reset()
     _wrap_mod._cache = None
-    _trigger_detection_reset()
+    _wrap_mod._aggressive_verify_off_warned.clear()
 
 
 @pytest.fixture(autouse=True)
 def _no_aggressive_verify_by_default(monkeypatch):
     """Most unit tests in this module construct `CachedConnection` /
-    `AsyncCachedConnection` directly with MagicMock-backed conns. The
-    smart aggressive-verify auto-detection runs a `pg_trigger`
-    `cursor.execute(...)` round-trip on the first wire op — which lands
-    on the same MagicMock cursor the test is asserting against,
-    polluting `cursor.execute.call_args_list` and breaking assertions
-    that pre-date the feature.
+    `AsyncCachedConnection` directly with MagicMock-backed conns and
+    assert against the mock cursor's `execute.call_args_list`. The
+    always-on dml_seq bump (the new default) doesn't pollute that
+    cursor — there's no detection round-trip and no post-DML verify
+    query — but it DOES change the per-connection state hash on every
+    write. Some legacy tests put a row into the cache, then INSERT,
+    then assert subsequent reads still hit / miss in specific ways
+    keyed off a stable hash. Pinning the default to "off" for direct
+    constructor calls keeps that legacy behaviour for the existing
+    tests; the bump tests below pass mode= explicitly.
 
     Production callers go through `goldlapel.start(...)`, which always
-    wires `aggressive_verify="auto"`; this fixture only flips the
-    *default* on direct `CachedConnection(conn, cache)` calls so legacy
-    tests stay clean. Tests that exercise the detection feature
-    explicitly pass `aggressive_verify=` (or seed the module-level
-    detection cache) to override.
+    wires `aggressive_verify="auto"`. The fixture does NOT affect the
+    public `wrap()` factory; only direct `CachedConnection(...)` /
+    `AsyncCachedConnection(...)` constructions.
     """
     import sys as _sys
     _wrap_mod = _sys.modules["goldlapel.wrap"]
@@ -325,12 +327,12 @@ class TestWrites:
 
 class MockCachedConn:
     _in_transaction = False
-    # Smart aggressive-verify defaults: "off" mode, pre-resolved as
-    # inactive. Mirrors the autouse `_no_aggressive_verify_by_default`
-    # fixture's intent — tests using `MockCachedConn` directly don't
-    # exercise the detection round-trip, so resolution is a no-op.
+    # Aggressive-verify defaults: "off" mode skips the dml_seq bump
+    # entirely, so tests using `MockCachedConn` directly see stable
+    # state hashes across writes — matches the autouse
+    # `_no_aggressive_verify_by_default` fixture's intent for the
+    # legacy direct-construction tests.
     _aggressive_verify_mode = "off"
-    _aggressive_verify_active = False
     _db_key = None
 
     def __init__(self):
@@ -1839,330 +1841,211 @@ class TestAggressiveVerifyModeNormalisation:
             _normalize_aggressive_verify(True)
 
 
-class TestTriggerDetection:
-    """Tests for `detect_trigger_internal_set` / `_async`. These hit
-    the underlying conn directly with a single round-trip to
-    `pg_trigger`. False on errors (network, permission, mocked) is the
-    safe default."""
+class TestSyncDmlSeqBump:
+    """Always-on DML cache-busting (sync). Every observed write bumps
+    the per-connection `dml_seq` counter — which is folded into the
+    state hash, so subsequent reads on the same connection key under a
+    fresh L1 slot and bypass any pre-write cached row. No detection,
+    no post-DML verify round-trip.
 
-    def test_sync_detection_true(self):
-        from goldlapel.cache import detect_trigger_internal_set
-        cursor = MagicMock()
-        cursor.fetchone.return_value = (True,)
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
-        assert detect_trigger_internal_set(conn) is True
-        # The detection SQL is the EXISTS(...) pg_trigger query.
-        sql = cursor.execute.call_args[0][0]
-        assert "pg_trigger" in sql
-        assert "tgisinternal" in sql
-        assert "set_config" in sql
-
-    def test_sync_detection_false(self):
-        from goldlapel.cache import detect_trigger_internal_set
-        cursor = MagicMock()
-        cursor.fetchone.return_value = (False,)
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
-        assert detect_trigger_internal_set(conn) is False
-
-    def test_sync_detection_swallows_errors(self):
-        from goldlapel.cache import detect_trigger_internal_set
-        conn = MagicMock()
-        conn.cursor.side_effect = RuntimeError("network down")
-        # No exception escapes — false (safe default) is returned.
-        assert detect_trigger_internal_set(conn) is False
-
-    def test_sync_detection_handles_empty_row(self):
-        from goldlapel.cache import detect_trigger_internal_set
-        cursor = MagicMock()
-        cursor.fetchone.return_value = None
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
-        assert detect_trigger_internal_set(conn) is False
-
-    @pytest.mark.asyncio
-    async def test_async_detection_true_via_fetchval(self):
-        from goldlapel.cache import detect_trigger_internal_set_async
-
-        class FakeAsyncpgConn:
-            async def fetchval(self, sql):
-                self.last_sql = sql
-                return True
-
-        conn = FakeAsyncpgConn()
-        assert await detect_trigger_internal_set_async(conn) is True
-        assert "pg_trigger" in conn.last_sql
-
-    @pytest.mark.asyncio
-    async def test_async_detection_false_via_fetchval(self):
-        from goldlapel.cache import detect_trigger_internal_set_async
-
-        class FakeAsyncpgConn:
-            async def fetchval(self, sql):
-                return False
-
-        assert await detect_trigger_internal_set_async(FakeAsyncpgConn()) is False
-
-    @pytest.mark.asyncio
-    async def test_async_detection_falls_back_to_fetch(self):
-        # Conns without `fetchval` — defensive path that uses fetch().
-        from goldlapel.cache import detect_trigger_internal_set_async
-
-        class FetchOnlyConn:
-            async def fetch(self, sql):
-                return [(True,)]
-
-        assert await detect_trigger_internal_set_async(FetchOnlyConn()) is True
-
-    @pytest.mark.asyncio
-    async def test_async_detection_swallows_errors(self):
-        from goldlapel.cache import detect_trigger_internal_set_async
-
-        class BrokenConn:
-            async def fetchval(self, sql):
-                raise RuntimeError("boom")
-
-        assert await detect_trigger_internal_set_async(BrokenConn()) is False
-
-
-class TestModuleLevelDetectionCache:
-    """The detection result is cached module-level keyed by an opaque
-    db-key (callers pass the upstream URL). One detection round-trip
-    per database — every connection to the same db reuses the result."""
-
-    def test_lookup_miss_returns_none(self):
-        from goldlapel.cache import (
-            _trigger_detection_lookup, _trigger_detection_reset,
-        )
-        _trigger_detection_reset()
-        assert _trigger_detection_lookup("postgresql://x/y") is None
-
-    def test_store_then_lookup_returns_value(self):
-        from goldlapel.cache import (
-            _trigger_detection_lookup,
-            _trigger_detection_store,
-            _trigger_detection_reset,
-        )
-        _trigger_detection_reset()
-        _trigger_detection_store("postgresql://a/b", True)
-        assert _trigger_detection_lookup("postgresql://a/b") is True
-
-    def test_store_none_key_is_noop(self):
-        # No db_key means caller goes per-connection — module cache is bypassed.
-        from goldlapel.cache import (
-            _trigger_detection_lookup, _trigger_detection_store,
-        )
-        _trigger_detection_store(None, True)
-        assert _trigger_detection_lookup(None) is None
-
-
-class TestSyncAggressiveVerifyResolution:
-    """The sync resolver runs detection lazily on the first wire op,
-    caches the result on the connection, and never re-runs."""
-
-    def test_off_mode_skips_detection_entirely(self):
-        # "off" mode: detection never runs, _aggressive_verify_active
-        # resolves to False without a wire op.
-        from goldlapel.wrap import (
-            _resolve_aggressive_verify_sync, AGGRESSIVE_VERIFY_OFF,
-        )
-        cache = make_connected_cache()
-        conn, _cursor = mock_conn()
-        cc = CachedConnection(
-            conn, cache, aggressive_verify=AGGRESSIVE_VERIFY_OFF,
-        )
-        assert _resolve_aggressive_verify_sync(cc) is False
-        assert cc._aggressive_verify_active is False
-        # Detection cursor was never invoked.
-        conn.cursor.assert_not_called()
-
-    def test_on_mode_skips_detection_entirely(self):
-        from goldlapel.wrap import (
-            _resolve_aggressive_verify_sync, AGGRESSIVE_VERIFY_ON,
-        )
-        cache = make_connected_cache()
-        conn, _cursor = mock_conn()
-        cc = CachedConnection(
-            conn, cache, aggressive_verify=AGGRESSIVE_VERIFY_ON,
-        )
-        assert _resolve_aggressive_verify_sync(cc) is True
-        assert cc._aggressive_verify_active is True
-        conn.cursor.assert_not_called()
-
-    def test_auto_runs_detection_then_caches(self):
-        from goldlapel.wrap import (
-            _resolve_aggressive_verify_sync, AGGRESSIVE_VERIFY_AUTO,
-        )
-        from goldlapel.cache import _trigger_detection_reset
-        _trigger_detection_reset()
-
-        cache = make_connected_cache()
-        cursor = MagicMock()
-        cursor.fetchone.return_value = (True,)
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
-        cc = CachedConnection(
-            conn, cache,
-            aggressive_verify=AGGRESSIVE_VERIFY_AUTO,
-            db_key="postgresql://test/db",
-        )
-        assert _resolve_aggressive_verify_sync(cc) is True
-        # Second call doesn't re-run detection — uses _aggressive_verify_active.
-        cursor.execute.reset_mock()
-        assert _resolve_aggressive_verify_sync(cc) is True
-        cursor.execute.assert_not_called()
-
-    def test_auto_db_cache_shared_across_connections(self):
-        # Two connections with the same db_key share the same detection
-        # result — second connection doesn't re-run detection.
-        from goldlapel.wrap import (
-            _resolve_aggressive_verify_sync, AGGRESSIVE_VERIFY_AUTO,
-        )
-        from goldlapel.cache import _trigger_detection_reset
-        _trigger_detection_reset()
-
-        cache = make_connected_cache()
-        cursor1 = MagicMock()
-        cursor1.fetchone.return_value = (True,)
-        conn1 = MagicMock()
-        conn1.cursor.return_value = cursor1
-        cc1 = CachedConnection(
-            conn1, cache,
-            aggressive_verify=AGGRESSIVE_VERIFY_AUTO,
-            db_key="postgresql://shared/db",
-        )
-        assert _resolve_aggressive_verify_sync(cc1) is True
-
-        # Second conn — different conn, same db_key. Should NOT issue
-        # detection on its own conn.
-        conn2 = MagicMock()
-        cc2 = CachedConnection(
-            conn2, cache,
-            aggressive_verify=AGGRESSIVE_VERIFY_AUTO,
-            db_key="postgresql://shared/db",
-        )
-        assert _resolve_aggressive_verify_sync(cc2) is True
-        conn2.cursor.assert_not_called()
-
-    def test_auto_no_triggers_disables(self):
-        from goldlapel.wrap import (
-            _resolve_aggressive_verify_sync, AGGRESSIVE_VERIFY_AUTO,
-        )
-        from goldlapel.cache import _trigger_detection_reset
-        _trigger_detection_reset()
-
-        cache = make_connected_cache()
-        cursor = MagicMock()
-        cursor.fetchone.return_value = (False,)
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
-        cc = CachedConnection(
-            conn, cache,
-            aggressive_verify=AGGRESSIVE_VERIFY_AUTO,
-            db_key="postgresql://clean/db",
-        )
-        assert _resolve_aggressive_verify_sync(cc) is False
-
-
-class TestSyncPostDmlVerify:
-    """In aggressive-verify mode, every observed DML marks the GUC state
-    dirty so the next pre-call verify reconciles via pg_settings.
-    Triggers fire on DML and may have done a server-side SET we never
-    saw on the wire."""
+    `aggressive_verify="off"` is the customer opt-out and skips the
+    bump entirely (the warning is emitted at `wrap()` time, not at the
+    connection-constructor level — these tests construct directly so
+    no warning fires)."""
 
     def _make(self, mode="on", description=None, fetchall_result=None):
-        from goldlapel.wrap import _DRIVER_UNKNOWN
         conn, cursor = mock_conn(
             description=description, fetchall_result=fetchall_result or [],
         )
         cache = make_connected_cache()
         cc = CachedConnection(conn, cache, aggressive_verify=mode)
-        # Force unknown driver so the dirty flag would actually trigger
-        # a verify on the next pre-call hook (matches Wave 1 contract).
-        object.__setattr__(cc, "_driver", _DRIVER_UNKNOWN)
         return conn, cursor, cc, CachedCursor(cursor, cache, cc)
 
-    def test_insert_marks_dirty_when_on(self):
+    def test_insert_bumps_dml_seq_when_on(self):
         _conn, _cursor, cc, cur = self._make(mode="on")
-        assert cc._guc_state.dirty is False
+        assert cc._guc_state.dml_seq == 0
         cur.execute("INSERT INTO orders (id) VALUES (1)")
-        assert cc._guc_state.dirty is True
+        assert cc._guc_state.dml_seq == 1
 
-    def test_update_marks_dirty_when_on(self):
+    def test_update_bumps_dml_seq_when_on(self):
         _conn, _cursor, cc, cur = self._make(mode="on")
         cur.execute("UPDATE orders SET total = 0 WHERE id = 1")
-        assert cc._guc_state.dirty is True
+        assert cc._guc_state.dml_seq == 1
 
-    def test_delete_marks_dirty_when_on(self):
+    def test_delete_bumps_dml_seq_when_on(self):
         _conn, _cursor, cc, cur = self._make(mode="on")
         cur.execute("DELETE FROM orders WHERE id = 1")
-        assert cc._guc_state.dirty is True
+        assert cc._guc_state.dml_seq == 1
 
-    def test_truncate_marks_dirty_when_on(self):
+    def test_truncate_bumps_dml_seq_when_on(self):
         _conn, _cursor, cc, cur = self._make(mode="on")
         cur.execute("TRUNCATE TABLE orders")
-        assert cc._guc_state.dirty is True
+        assert cc._guc_state.dml_seq == 1
 
-    def test_merge_marks_dirty_when_on(self):
+    def test_merge_bumps_dml_seq_when_on(self):
         # MERGE INTO is DML — `_detect_writes_multi` recognises it.
         _conn, _cursor, cc, cur = self._make(mode="on")
         cur.execute(
             "MERGE INTO orders USING staged ON orders.id=staged.id "
             "WHEN MATCHED THEN UPDATE SET total=staged.total"
         )
-        assert cc._guc_state.dirty is True
+        assert cc._guc_state.dml_seq == 1
 
-    def test_select_does_not_mark_dirty_when_on(self):
+    def test_auto_mode_bumps_dml_seq(self):
+        # "auto" is the default and identical to "on" — both bump on
+        # every DML (no detection, no per-database gating).
+        _conn, _cursor, cc, cur = self._make(mode="auto")
+        cur.execute("INSERT INTO orders (id) VALUES (1)")
+        assert cc._guc_state.dml_seq == 1
+
+    def test_repeated_dml_bumps_each_time(self):
+        # The counter is monotonic — each write nudges the hash to a
+        # fresh slot. Cache-busting on writes is the point.
+        _conn, _cursor, cc, cur = self._make(mode="on")
+        cur.execute("INSERT INTO orders VALUES (1)")
+        cur.execute("INSERT INTO orders VALUES (2)")
+        cur.execute("INSERT INTO orders VALUES (3)")
+        assert cc._guc_state.dml_seq == 3
+
+    def test_select_does_not_bump(self):
         _conn, _cursor, cc, cur = self._make(
             mode="on",
             description=(("v",),),
             fetchall_result=[(1,)],
         )
         cur.execute("SELECT 1")
-        assert cc._guc_state.dirty is False
+        assert cc._guc_state.dml_seq == 0
 
-    def test_insert_does_not_mark_dirty_when_off(self):
+    def test_insert_does_not_bump_when_off(self):
         _conn, _cursor, cc, cur = self._make(mode="off")
         cur.execute("INSERT INTO orders (id) VALUES (1)")
-        # Mode is off — no aggressive verify. Dirty flag stays False.
-        assert cc._guc_state.dirty is False
+        assert cc._guc_state.dml_seq == 0
 
-    def test_executemany_insert_marks_dirty_when_on(self):
+    def test_executemany_insert_bumps_when_on(self):
         _conn, _cursor, cc, cur = self._make(mode="on")
         cur.executemany(
             "INSERT INTO orders (id) VALUES (%s)", [(1,), (2,)],
         )
-        assert cc._guc_state.dirty is True
+        # One bump per executemany call (matches the sync execute
+        # contract — we don't see per-row triggers, only the body).
+        assert cc._guc_state.dml_seq == 1
 
-    def test_executemany_insert_does_not_mark_dirty_when_off(self):
+    def test_executemany_insert_does_not_bump_when_off(self):
         _conn, _cursor, cc, cur = self._make(mode="off")
         cur.executemany(
             "INSERT INTO orders (id) VALUES (%s)", [(1,)],
         )
-        assert cc._guc_state.dirty is False
+        assert cc._guc_state.dml_seq == 0
 
 
-class TestAsyncPostDmlVerify:
+class TestSyncCacheMissAfterDml:
+    """The dml_seq bump changes the state hash → subsequent identical-
+    SQL reads on the same connection key under a fresh L1 slot and go
+    to PG. Closes the trigger-internal-SET correctness gap without a
+    detection probe or a post-DML verify round-trip."""
+
+    def test_read_after_write_misses_cache(self):
+        # Populate the cache under hash=0 (clean connection).
+        cache = make_connected_cache()
+        cache.put("SELECT * FROM orders", None, [(1, "old")], (("id",),))
+        conn, cursor = mock_conn(
+            description=(("id",), ("v",)),
+            fetchall_result=[(2, "new")],
+        )
+        # Use aggressive_verify="on" so the bump fires.
+        cc = CachedConnection(conn, cache, aggressive_verify="on")
+        cur = CachedCursor(cursor, cache, cc)
+
+        # First: read — hits the pre-existing cache slot.
+        cur.execute("SELECT * FROM orders")
+        assert cur.fetchone() == (1, "old")
+
+        # Write — bumps dml_seq, also invalidates the `orders` slot
+        # (via `_apply_write_invalidation`). Either signal alone would
+        # be enough, but together they're the belt+braces.
+        cur.execute("INSERT INTO orders VALUES (2, 'new')")
+        assert cc._guc_state.dml_seq == 1
+
+        # Read again — even if the cache slot SOMEHOW survived, the
+        # state hash is different now, so the lookup keys to a fresh
+        # slot and goes through to the real cursor.
+        cursor.execute.reset_mock()
+        cur.execute("SELECT * FROM orders")
+        cursor.execute.assert_called_once_with("SELECT * FROM orders", None)
+
+    def test_read_after_write_off_can_share_old_slot(self):
+        # With aggressive_verify="off", the bump is skipped — but the
+        # write still invalidates the table via `_apply_write_invalidation`.
+        # So the "off" mode is still correct for the simple
+        # write-then-read pattern; it only loses the trigger-internal-
+        # SET coverage where the trigger SETs a GUC without us seeing it.
+        cache = make_connected_cache()
+        conn, cursor = mock_conn()
+        cc = CachedConnection(conn, cache, aggressive_verify="off")
+        cur = CachedCursor(cursor, cache, cc)
+        cur.execute("INSERT INTO orders VALUES (1, 'a')")
+        assert cc._guc_state.dml_seq == 0
+
+
+class TestSyncDirtyBypass:
+    """When the connection's GUC state is dirty (an unsafe SET / function
+    call observed, verify-on-checkout either skipped because the driver
+    is trusted, or failed silently), the cache lookup MUST bypass and
+    the query goes to the proxy."""
+
+    def test_dirty_bypasses_cache_lookup(self):
+        cache = make_connected_cache()
+        cache.put("SELECT 1", None, [(1,)], None)
+        conn, cursor = mock_conn(
+            description=(("v",),),
+            fetchall_result=[(2,)],
+        )
+        cc = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc)
+        # Force the state dirty WITHOUT changing the hash — mark_dirty
+        # is the only operation that does this. The pre-call verify
+        # path won't clear it because the driver is "unknown" by
+        # default for MagicMock and verify would fail silently.
+        cc._guc_state.mark_dirty()
+        # Pretend the driver is trusted so the pre-call verify is
+        # skipped (otherwise verify would run and clear dirty).
+        from goldlapel.wrap import _DRIVER_PSYCOPG_SYNC
+        object.__setattr__(cc, "_driver", _DRIVER_PSYCOPG_SYNC)
+        # Now execute — dirty=True, so cache lookup is bypassed and the
+        # query goes to the real cursor.
+        cur.execute("SELECT 1")
+        # The real cursor was called — bypass landed it on the wire.
+        cursor.execute.assert_called_once_with("SELECT 1", None)
+        # And the cached (1,) was NOT served from L1.
+        assert cur.fetchone() == (2,)
+
+    def test_clean_state_does_not_bypass(self):
+        # Sanity check: same setup but dirty=False → cache hit.
+        cache = make_connected_cache()
+        cache.put("SELECT 1", None, [(1,)], None)
+        conn, cursor = mock_conn()
+        cc = CachedConnection(conn, cache)
+        cur = CachedCursor(cursor, cache, cc)
+        from goldlapel.wrap import _DRIVER_PSYCOPG_SYNC
+        object.__setattr__(cc, "_driver", _DRIVER_PSYCOPG_SYNC)
+        # No mark_dirty, no SET.
+        cur.execute("SELECT 1")
+        # Cache hit — real cursor not called.
+        cursor.execute.assert_not_called()
+        assert cur.fetchone() == (1,)
+
+
+class TestAsyncDmlSeqBump:
     """Async path mirrors the sync contract — DML in aggressive-verify
-    mode schedules an async verify task using Wave 1's existing
-    `_schedule_post_call_verify` machinery via a new `force=True` flag.
-    Reuses the op-lock for serialisation; reuses the
-    `_pending_verify_tasks` set for cancellation."""
+    mode bumps dml_seq. The bump goes through the async hot paths
+    (`fetch`, `fetchrow`, `fetchval`, `execute`) and uses the same
+    `_bump_dml_if_active` helper."""
 
     @pytest.mark.asyncio
-    async def test_async_insert_schedules_verify_when_on(self):
+    async def test_async_execute_insert_bumps_when_on(self):
         from goldlapel.wrap import AsyncCachedConnection
 
-        verify_seen = []
-
         class FakeAsyncpgConn:
-            async def fetch(self, sql, *args):
-                if "pg_settings" in sql:
-                    verify_seen.append(sql)
-                    return []
-                return []
-
             async def execute(self, sql, *args):
                 return "INSERT 0 1"
 
@@ -2171,27 +2054,13 @@ class TestAsyncPostDmlVerify:
             FakeAsyncpgConn(), cache, aggressive_verify="on",
         )
         await a.execute("INSERT INTO orders (id) VALUES (1)")
-        # Drain pending tasks so the verify actually runs.
-        import asyncio
-        for task in list(a._pending_verify_tasks):
-            await task
-        assert len(verify_seen) == 1, (
-            f"Expected exactly one verify call, got: {verify_seen}"
-        )
+        assert a._guc_state.dml_seq == 1
 
     @pytest.mark.asyncio
-    async def test_async_insert_does_not_schedule_when_off(self):
+    async def test_async_execute_insert_does_not_bump_when_off(self):
         from goldlapel.wrap import AsyncCachedConnection
 
-        verify_seen = []
-
         class FakeAsyncpgConn:
-            async def fetch(self, sql, *args):
-                if "pg_settings" in sql:
-                    verify_seen.append(sql)
-                    return []
-                return []
-
             async def execute(self, sql, *args):
                 return "INSERT 0 1"
 
@@ -2200,23 +2069,15 @@ class TestAsyncPostDmlVerify:
             FakeAsyncpgConn(), cache, aggressive_verify="off",
         )
         await a.execute("INSERT INTO orders (id) VALUES (1)")
-        # No tasks should be pending.
-        assert not a._pending_verify_tasks
-        assert verify_seen == []
+        assert a._guc_state.dml_seq == 0
 
     @pytest.mark.asyncio
-    async def test_async_select_does_not_schedule_when_on(self):
-        # Pure SELECTs don't trigger the post-DML hook even when the
-        # mode is on — only DML does.
+    async def test_async_select_does_not_bump_when_on(self):
+        # Pure SELECTs don't bump — only DML does.
         from goldlapel.wrap import AsyncCachedConnection
-
-        verify_seen = []
 
         class FakeAsyncpgConn:
             async def fetch(self, sql, *args):
-                if "pg_settings" in sql:
-                    verify_seen.append(sql)
-                    return []
                 return [(1,)]
 
         cache = make_connected_cache()
@@ -2224,23 +2085,16 @@ class TestAsyncPostDmlVerify:
             FakeAsyncpgConn(), cache, aggressive_verify="on",
         )
         await a.fetch("SELECT * FROM orders WHERE id = 1")
-        for task in list(a._pending_verify_tasks):
-            await task
-        assert verify_seen == []
+        assert a._guc_state.dml_seq == 0
 
     @pytest.mark.asyncio
-    async def test_async_fetch_with_dml_schedules_verify(self):
+    async def test_async_fetch_with_dml_bumps(self):
         # `await conn.fetch("INSERT INTO ... RETURNING ...")` is a write
-        # via fetch() — must also schedule the verify.
+        # via fetch() — must also bump.
         from goldlapel.wrap import AsyncCachedConnection
-
-        verify_seen = []
 
         class FakeAsyncpgConn:
             async def fetch(self, sql, *args):
-                if "pg_settings" in sql:
-                    verify_seen.append(sql)
-                    return []
                 return [(1,)]
 
         cache = make_connected_cache()
@@ -2248,66 +2102,15 @@ class TestAsyncPostDmlVerify:
             FakeAsyncpgConn(), cache, aggressive_verify="on",
         )
         await a.fetch("INSERT INTO orders (id) VALUES (1) RETURNING id")
-        for task in list(a._pending_verify_tasks):
-            await task
-        assert len(verify_seen) == 1
+        assert a._guc_state.dml_seq == 1
 
     @pytest.mark.asyncio
-    async def test_async_auto_no_triggers_disables_verify(self):
-        # mode=auto, fetchval reports no triggers — DML should NOT
-        # schedule a verify because aggressive_verify_active is False.
+    async def test_async_auto_bumps_on_dml(self):
+        # mode="auto" is the default and identical to "on" — every DML
+        # bumps. (No detection probe; no per-database gating.)
         from goldlapel.wrap import AsyncCachedConnection
-        from goldlapel.cache import _trigger_detection_reset
-        _trigger_detection_reset()
-
-        verify_seen = []
 
         class FakeAsyncpgConn:
-            async def fetchval(self, sql):
-                # The detection query — return False (no triggers).
-                return False
-
-            async def fetch(self, sql, *args):
-                if "pg_settings" in sql:
-                    verify_seen.append(sql)
-                    return []
-                return []
-
-            async def execute(self, sql, *args):
-                return "INSERT 0 1"
-
-        cache = make_connected_cache()
-        a = AsyncCachedConnection(
-            FakeAsyncpgConn(), cache,
-            aggressive_verify="auto",
-            db_key="postgresql://clean/db",
-        )
-        await a.execute("INSERT INTO orders (id) VALUES (1)")
-        for task in list(a._pending_verify_tasks):
-            await task
-        assert verify_seen == [], (
-            "Detection said no triggers — verify must NOT have fired."
-        )
-
-    @pytest.mark.asyncio
-    async def test_async_auto_with_triggers_enables_verify(self):
-        from goldlapel.wrap import AsyncCachedConnection
-        from goldlapel.cache import _trigger_detection_reset
-        _trigger_detection_reset()
-
-        verify_seen = []
-
-        class FakeAsyncpgConn:
-            async def fetchval(self, sql):
-                # Detection — return True (triggers exist).
-                return True
-
-            async def fetch(self, sql, *args):
-                if "pg_settings" in sql:
-                    verify_seen.append(sql)
-                    return []
-                return []
-
             async def execute(self, sql, *args):
                 return "INSERT 0 1"
 
@@ -2318,9 +2121,155 @@ class TestAsyncPostDmlVerify:
             db_key="postgresql://hot/db",
         )
         await a.execute("INSERT INTO orders (id) VALUES (1)")
-        for task in list(a._pending_verify_tasks):
-            await task
-        assert len(verify_seen) == 1
+        assert a._guc_state.dml_seq == 1
+
+
+class TestAsyncCacheMissAfterDml:
+    """Async cache-busting via dml_seq: after a write, subsequent
+    identical-SQL reads land in a fresh L1 slot and bypass any pre-write
+    cached row."""
+
+    @pytest.mark.asyncio
+    async def test_async_read_after_write_misses_cache(self):
+        from goldlapel.wrap import AsyncCachedConnection
+
+        seen_sql = []
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                seen_sql.append(sql)
+                if sql.startswith("INSERT"):
+                    return [(2,)]
+                return [(1,)]
+
+        cache = make_connected_cache()
+        a = AsyncCachedConnection(
+            FakeAsyncpgConn(), cache, aggressive_verify="on",
+        )
+        # Read — populates the cache at hash=0.
+        rows = await a.fetch("SELECT * FROM orders")
+        assert rows == [(1,)]
+        # Write — bumps dml_seq AND invalidates orders.
+        await a.fetch("INSERT INTO orders VALUES (1) RETURNING id")
+        assert a._guc_state.dml_seq == 1
+        # Read again — fresh slot key, real fetch lands.
+        seen_sql.clear()
+        await a.fetch("SELECT * FROM orders")
+        assert seen_sql == ["SELECT * FROM orders"]
+
+
+class TestAsyncDirtyBypass:
+    """When the async connection's GUC state is dirty, cache lookup
+    bypasses. Same contract as the sync path."""
+
+    @pytest.mark.asyncio
+    async def test_async_dirty_bypasses_cache_lookup(self):
+        from goldlapel.wrap import AsyncCachedConnection, _DRIVER_ASYNCPG
+
+        captured = []
+
+        class FakeAsyncpgConn:
+            async def fetch(self, sql, *args):
+                captured.append(sql)
+                return [(2,)]
+
+        cache = make_connected_cache()
+        cache.put("SELECT 1", None, [(1,)], None)
+        a = AsyncCachedConnection(
+            FakeAsyncpgConn(), cache, aggressive_verify="on",
+        )
+        # Pretend we're on a trusted driver so the pre-call verify is
+        # a no-op (it would otherwise clear dirty).
+        object.__setattr__(a, "_driver", _DRIVER_ASYNCPG)
+        a._guc_state.mark_dirty()
+        rows = await a.fetch("SELECT 1")
+        # Dirty bypass → went to wire, returned (2,) not the cached (1,).
+        assert rows == [(2,)]
+        assert captured == ["SELECT 1"]
+
+
+class TestAggressiveVerifyOffWarning:
+    """`aggressive_verify="off"` emits a one-shot WARNING per db_key
+    when passed through `wrap()`. The warning calls out the security
+    implications (re-introduces the trigger-internal-SET correctness
+    gap on that connection). Constructor-direct paths skip the
+    warning — only the public `wrap()` factory triggers it."""
+
+    def test_off_warns_once_per_db_key(self, caplog):
+        import logging as _logging
+        import sys as _sys
+        _wrap_mod = _sys.modules["goldlapel.wrap"]
+        _wrap_mod._aggressive_verify_off_warned.clear()
+        caplog.set_level(_logging.WARNING)
+        conn = MagicMock()
+        delattr(conn, "fetch")
+        delattr(conn, "fetchrow")
+        wrap(
+            conn, invalidation_port=9999,
+            aggressive_verify="off",
+            db_key="postgresql://test/db",
+        )
+        # Second wrap on the same db_key — no new warning emitted.
+        warns_after_first = len(caplog.records)
+        conn2 = MagicMock()
+        delattr(conn2, "fetch")
+        delattr(conn2, "fetchrow")
+        wrap(
+            conn2, invalidation_port=9999,
+            aggressive_verify="off",
+            db_key="postgresql://test/db",
+        )
+        assert len(caplog.records) == warns_after_first
+        # The single warning mentions the security implications.
+        msgs = [r.message for r in caplog.records]
+        joined = " ".join(msgs)
+        assert "aggressive_verify" in joined
+        assert "off" in joined
+
+    def test_off_warns_again_for_new_db_key(self, caplog):
+        import logging as _logging
+        import sys as _sys
+        _wrap_mod = _sys.modules["goldlapel.wrap"]
+        _wrap_mod._aggressive_verify_off_warned.clear()
+        caplog.set_level(_logging.WARNING)
+        conn = MagicMock()
+        delattr(conn, "fetch")
+        delattr(conn, "fetchrow")
+        wrap(
+            conn, invalidation_port=9999,
+            aggressive_verify="off",
+            db_key="postgresql://one/db",
+        )
+        count_after_one = len(caplog.records)
+        conn2 = MagicMock()
+        delattr(conn2, "fetch")
+        delattr(conn2, "fetchrow")
+        wrap(
+            conn2, invalidation_port=9999,
+            aggressive_verify="off",
+            db_key="postgresql://two/db",
+        )
+        assert len(caplog.records) == count_after_one + 1
+
+    def test_auto_does_not_warn(self, caplog):
+        import logging as _logging
+        import sys as _sys
+        _wrap_mod = _sys.modules["goldlapel.wrap"]
+        _wrap_mod._aggressive_verify_off_warned.clear()
+        caplog.set_level(_logging.WARNING)
+        conn = MagicMock()
+        delattr(conn, "fetch")
+        delattr(conn, "fetchrow")
+        wrap(
+            conn, invalidation_port=9999,
+            aggressive_verify="auto",
+            db_key="postgresql://test/db",
+        )
+        # No off-warning lines in the log.
+        msgs = [r.message for r in caplog.records]
+        assert not any(
+            "aggressive_verify" in m and "off" in m for m in msgs
+        )
 
 
 class TestWrapKwargsPlumbing:

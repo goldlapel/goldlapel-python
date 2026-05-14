@@ -2012,6 +2012,95 @@ class TestMarkDirty:
         assert s.dirty is False
 
 
+class TestIsDirtyMethod:
+    """`is_dirty()` is the method form of the `dirty` property, used by
+    wrap.py's hot path to gate L1 cache lookups. Both forms must return
+    the same bool."""
+
+    def test_is_dirty_matches_property(self):
+        s = ConnectionGucState()
+        assert s.is_dirty() == s.dirty == False
+        s.mark_dirty()
+        assert s.is_dirty() == s.dirty == True
+        s.observe_sql("DISCARD ALL")
+        assert s.is_dirty() == s.dirty == False
+
+
+# --- dml_seq cache-busting (always-on aggressive-verify) ---
+
+
+class TestDmlSeqBump:
+    """`bump_dml_seq` is called by the wrap.py hot path on every observed
+    write while `aggressive_verify` is on. The counter folds into the
+    state hash so post-write reads on the same connection key under a
+    fresh L1 slot."""
+
+    def test_initial_seq_is_zero(self):
+        s = ConnectionGucState()
+        assert s.dml_seq == 0
+
+    def test_bump_increments(self):
+        s = ConnectionGucState()
+        s.bump_dml_seq()
+        assert s.dml_seq == 1
+        s.bump_dml_seq()
+        assert s.dml_seq == 2
+
+    def test_bump_changes_hash(self):
+        s = ConnectionGucState()
+        h0 = s.hash
+        s.bump_dml_seq()
+        h1 = s.hash
+        s.bump_dml_seq()
+        h2 = s.hash
+        # Each bump moves the hash to a distinct slot — the L1 cache
+        # key changes on every write.
+        assert h0 != h1
+        assert h1 != h2
+        assert h0 != h2
+
+    def test_empty_state_hash_remains_zero_with_no_bumps(self):
+        # Sanity: a fresh, never-bumped state still hashes to 0 so peer
+        # connections without DML can share a cache slot — the empty
+        # state is the universally-safe "default context" slot.
+        s = ConnectionGucState()
+        assert s.hash == 0
+
+    def test_bump_then_discard_resets(self):
+        # DISCARD ALL fully resets the connection — clearing the dml_seq
+        # along with the values map. After a DISCARD, the connection is
+        # safe to share slots with a fresh peer again.
+        s = ConnectionGucState()
+        s.bump_dml_seq()
+        s.bump_dml_seq()
+        assert s.dml_seq == 2
+        s.observe_sql("DISCARD ALL")
+        assert s.dml_seq == 0
+        assert s.hash == 0
+
+    def test_bump_combines_with_unsafe_set_in_hash(self):
+        # The state hash folds both `_values` AND `_dml_seq` — two
+        # connections with the same SET but different DML history must
+        # NOT share a cache slot, and vice versa.
+        a = ConnectionGucState()
+        a.observe_sql("SET app.user_id = '42'")
+        b = ConnectionGucState()
+        b.observe_sql("SET app.user_id = '42'")
+        # Same SETs, same hash.
+        assert a.hash == b.hash
+        # Bump A — diverges.
+        a.bump_dml_seq()
+        assert a.hash != b.hash
+
+    def test_bump_does_not_set_dirty(self):
+        # The bump is a cache-key signal, not a verify trigger. Tests
+        # that gate behaviour off `dirty` must not also fire when
+        # `bump_dml_seq` is called.
+        s = ConnectionGucState()
+        s.bump_dml_seq()
+        assert s.is_dirty() is False
+
+
 # --- Pending-mutation API (Wave 2 SET-actually-applied) ---
 
 

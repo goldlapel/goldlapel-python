@@ -624,7 +624,9 @@ class TestAsyncAggressiveVerifyKwarg:
                 )
             assert wrap_calls, "wrap() was not called"
             assert wrap_calls[0].get("aggressive_verify") == "on"
-            # Upstream URL → db_key for the trigger-detection cache.
+            # Upstream URL → db_key (used today for the one-shot
+            # `aggressive_verify="off"` warning; reserved for future
+            # per-database telemetry).
             assert wrap_calls[0].get("db_key") == "postgresql://host:5432/mydb"
         finally:
             _reset_proxy_state()
