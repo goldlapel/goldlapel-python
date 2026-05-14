@@ -428,12 +428,13 @@ class GoldLapel:
         self._disable_matviews = bool(disable_matviews)
         self._disable_sqloptimize = bool(disable_sqloptimize)
         self._disable_auto_indexes = bool(disable_auto_indexes)
-        # Smart aggressive-verify mode (closes the trigger-internal-SET
-        # correctness gap). "auto" detects per-database whether any user
-        # trigger could SET / RESET / DISCARD / set_config server-side
-        # and enables post-DML verify when it does. "on" forces-on, "off"
-        # is the escape hatch. Validated eagerly so a typo surfaces at
-        # construction, not at first wire op.
+        # Aggressive-verify mode (closes the trigger-internal-SET
+        # correctness gap by bumping a per-connection `dml_seq` counter
+        # on every observed write — the bump folds into the L1 cache
+        # key, so post-write reads naturally key under a fresh slot).
+        # "auto" / "on" enable the bump (default); "off" is the
+        # opt-out, warned about at wrap() time. Validated eagerly so a
+        # typo surfaces at construction, not at first wire op.
         from goldlapel.wrap import _normalize_aggressive_verify
         self._aggressive_verify = _normalize_aggressive_verify(aggressive_verify)
 
@@ -623,10 +624,11 @@ class GoldLapel:
                 from goldlapel.wrap import wrap
                 # invalidation_port is resolved at construction: either the
                 # explicit kwarg or proxy_port + 2.
-                # `db_key=upstream` keys the trigger-detection cache by
-                # the upstream URL — every connection to the same db
-                # shares the cached detection result, so we pay one
-                # round-trip per database, not per-connection.
+                # `db_key=upstream` is opaque per-database context for
+                # the wrapper — used today to namespace the one-shot
+                # `aggressive_verify="off"` warning so multi-database
+                # apps only see it once per upstream, not once per
+                # connection.
                 self._conn = wrap(
                     raw_conn,
                     invalidation_port=self._invalidation_port,
@@ -978,16 +980,17 @@ def start(
         Default False.
     - disable_auto_indexes: skip automatic index creation (--disable-auto-indexes).
         Default False.
-    - aggressive_verify: smart auto-enable post-DML verify mode for the
+    - aggressive_verify: always-on DML cache-busting mode for the
         trigger-internal-SET correctness gap. Triggers can `SET` /
-        `RESET` / `DISCARD` / `set_config()` server-side without surfacing
-        on the client wire, leaving the wrapper's per-connection state
-        diverged from server reality. One of:
-          * "auto" (default) — detect once per database via a `pg_trigger`
-            scan; enable verify when any user trigger references those
-            commands. Zero tax on clean schemas.
-          * "on" — force-on (skip detection).
-          * "off" — escape hatch; accept the correctness gap.
+        `RESET` / `DISCARD` / `set_config()` server-side without
+        surfacing on the client wire — the wrapper closes that gap by
+        bumping a per-connection `dml_seq` counter on every observed
+        write (the counter folds into the L1 cache key, so post-write
+        reads naturally key under a fresh slot). One of:
+          * "auto" (default) — bump on every DML.
+          * "on" — alias of "auto".
+          * "off" — opt out of the bump. Warns at startup; only safe
+            on schemas with no GUC-mutating triggers.
 
     Promoted top-level concepts are rejected inside the `config` dict.
 

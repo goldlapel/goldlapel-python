@@ -1,5 +1,6 @@
 import atexit
 import asyncio
+import logging
 
 from goldlapel.cache import (
     NativeCache,
@@ -7,33 +8,34 @@ from goldlapel.cache import (
     _detect_writes_multi,
     _DDL_SENTINEL,
     apply_pending,
-    detect_trigger_internal_set,
-    detect_trigger_internal_set_async,
     is_top_level_function_call,
     prepare_pending,
     update_tx_state,
-    _trigger_detection_lookup,
-    _trigger_detection_store,
 )
 
 
-# --- Aggressive-verify modes (smart auto-enable for trigger-internal SETs) ---
+# --- Aggressive-verify modes (always-on DML cache-busting) ---
 #
 # Triggers can SET / RESET / DISCARD / set_config() server-side, never
 # surfacing the command on the client wire. The wrapper's parser-based
-# state tracking misses these. Smart auto-enable detects the pattern at
-# first wire interaction and, when present, schedules a post-DML verify
-# so wrapper state stays in sync with what triggers do invisibly.
+# state tracking misses those mutations. Rather than detect-then-verify
+# (the older approach, which required a per-database probe of pg_trigger
+# AND a per-write pg_settings round-trip), the wrapper now bumps a
+# per-connection `dml_seq` counter on every observed DML. The counter is
+# folded into the connection's GUC state hash, so the L1 cache key
+# changes naturally after any write — subsequent reads bypass any
+# pre-write slot and round-trip to the proxy, which makes its own
+# decision. No detection, no verify query.
 #
 # Modes:
-#   "auto"  — detect once per database, follow the detection result
-#             (the customer-friendly default — zero tax on clean schemas)
-#   "on"    — force aggressive-verify on (skip detection)
-#   "off"   — force off (escape hatch; accept the correctness gap)
-#
-# Resolution lazily on the connection's first wire op so detection only
-# costs one round-trip per database and only when the user has at least
-# one thing to do.
+#   "auto"  — bump on every DML (the customer-friendly default — zero
+#             extra round-trips, but every write busts the L1 view on
+#             that connection)
+#   "on"    — alias of "auto"
+#   "off"   — opt out of the bump (escape hatch). Warns at wrap() time
+#             — disabling the bump re-introduces the correctness gap
+#             for trigger-internal SETs and is only ever the right
+#             answer for schemas the customer can prove are clean.
 AGGRESSIVE_VERIFY_AUTO = "auto"
 AGGRESSIVE_VERIFY_ON = "on"
 AGGRESSIVE_VERIFY_OFF = "off"
@@ -59,6 +61,38 @@ def _normalize_aggressive_verify(value):
     raise ValueError(
         f"aggressive_verify must be one of {_VALID_AGGRESSIVE_VERIFY!r}, "
         f"got {value!r}"
+    )
+
+
+# Process-wide set of db_keys (or None for "no key passed") we've
+# already warned about when `aggressive_verify="off"` was passed. Keeps
+# the warning to once-per-wrap()-target rather than once-per-call.
+_aggressive_verify_off_warned = set()
+_aggressive_verify_off_warn_lock = None
+
+
+def _warn_aggressive_verify_off(db_key):
+    """Emit a one-shot WARNING when the customer opted out of the DML
+    bump. The bump is cheap (one int + one hash) and closes the
+    trigger-internal-SET correctness gap; opting out is only safe when
+    the schema demonstrably has no DML triggers that mutate GUCs.
+    """
+    global _aggressive_verify_off_warn_lock
+    if _aggressive_verify_off_warn_lock is None:
+        import threading
+        _aggressive_verify_off_warn_lock = threading.Lock()
+    with _aggressive_verify_off_warn_lock:
+        if db_key in _aggressive_verify_off_warned:
+            return
+        _aggressive_verify_off_warned.add(db_key)
+    logging.getLogger(__name__).warning(
+        "Gold Lapel: aggressive_verify=\"off\" disables the per-DML "
+        "cache-key bump. Triggers that SET / RESET / set_config() "
+        "server-side will not invalidate this connection's L1 cache "
+        "slot — stale rows can be served until the next DISCARD. Only "
+        "use this opt-out on schemas you can prove have no GUC-"
+        "mutating triggers. db_key=%r",
+        db_key,
     )
 
 
@@ -126,74 +160,6 @@ async def _maybe_verify_async_pre_call(cached_conn):
     if cached_conn._driver != _DRIVER_UNKNOWN:
         return
     await state.maybe_verify_async(cached_conn._real)
-
-
-def _resolve_aggressive_verify_sync(cached_conn):
-    """Return True iff aggressive-verify mode is active for `cached_conn`.
-
-    First call resolves the mode:
-    - "off"  → False, never run detection
-    - "on"   → True, never run detection
-    - "auto" → check the module-level db-keyed cache; if missing, run
-               the detection query NOW against `_real`. Cache the result
-               under `db_key` (or per-connection if no key was passed).
-
-    Subsequent calls hit the cached `_aggressive_verify_active` and skip
-    the cache lookup. Errors during detection resolve to False (safe
-    default — a clean schema doesn't need post-DML verify).
-    """
-    cached = cached_conn._aggressive_verify_active
-    if cached is not None:
-        return cached
-    mode = cached_conn._aggressive_verify_mode
-    if mode == AGGRESSIVE_VERIFY_OFF:
-        object.__setattr__(cached_conn, "_aggressive_verify_active", False)
-        return False
-    if mode == AGGRESSIVE_VERIFY_ON:
-        object.__setattr__(cached_conn, "_aggressive_verify_active", True)
-        return True
-    # "auto": consult the per-database cache, then (if missing) detect.
-    db_key = cached_conn._db_key
-    cached_db = _trigger_detection_lookup(db_key)
-    if cached_db is not None:
-        object.__setattr__(
-            cached_conn, "_aggressive_verify_active", cached_db
-        )
-        return cached_db
-    detected = detect_trigger_internal_set(cached_conn._real)
-    _trigger_detection_store(db_key, detected)
-    object.__setattr__(cached_conn, "_aggressive_verify_active", detected)
-    return detected
-
-
-async def _resolve_aggressive_verify_async(cached_conn):
-    """Async sibling of `_resolve_aggressive_verify_sync`.
-
-    Same resolution rules, but uses `detect_trigger_internal_set_async`
-    so it runs on asyncpg / psycopg-async connections without bouncing
-    through a thread pool.
-    """
-    cached = cached_conn._aggressive_verify_active
-    if cached is not None:
-        return cached
-    mode = cached_conn._aggressive_verify_mode
-    if mode == AGGRESSIVE_VERIFY_OFF:
-        object.__setattr__(cached_conn, "_aggressive_verify_active", False)
-        return False
-    if mode == AGGRESSIVE_VERIFY_ON:
-        object.__setattr__(cached_conn, "_aggressive_verify_active", True)
-        return True
-    db_key = cached_conn._db_key
-    cached_db = _trigger_detection_lookup(db_key)
-    if cached_db is not None:
-        object.__setattr__(
-            cached_conn, "_aggressive_verify_active", cached_db
-        )
-        return cached_db
-    detected = await detect_trigger_internal_set_async(cached_conn._real)
-    _trigger_detection_store(db_key, detected)
-    object.__setattr__(cached_conn, "_aggressive_verify_active", detected)
-    return detected
 
 
 def _detect_driver(real_conn):
@@ -277,12 +243,12 @@ def wrap(
             Defaults to proxy_port + 2 when None.
         disable_native_cache: turn off the native cache (still tracks
             invalidations for the dashboard).
-        aggressive_verify: smart auto-enable post-DML verify mode. One
-            of "auto" (default), "on", "off". See module-level docs.
-        db_key: opaque key for the trigger-detection cache (typically
-            the upstream URL). When None, detection runs once per
-            connection rather than once per database — still correct,
-            just less efficient.
+        aggressive_verify: always-on DML cache-busting mode. One of
+            "auto" (default — bump dml_seq on every observed write),
+            "on" (alias of "auto"), or "off" (opt out; warns at
+            wrap-time). See module-level docs.
+        db_key: opaque key for telemetry / one-shot logging (typically
+            the upstream URL). Kept on the wrapper for context.
     """
     global _cache, _atexit_registered
     # Pass `disable_native_cache` through on every wrap() call. NativeCache
@@ -300,6 +266,10 @@ def wrap(
         _atexit_registered = True
 
     mode = _normalize_aggressive_verify(aggressive_verify)
+    if mode == AGGRESSIVE_VERIFY_OFF:
+        # One-shot WARNING per db_key — opting out of the DML bump
+        # re-introduces the trigger-internal-SET correctness gap.
+        _warn_aggressive_verify_off(db_key)
 
     if hasattr(conn, "fetch") and hasattr(conn, "fetchrow"):
         return AsyncCachedConnection(
@@ -333,13 +303,11 @@ class CachedConnection:
         # DISCARD-on-release default can be trusted. Detected once at
         # wrap time; the underlying conn class doesn't change after that.
         object.__setattr__(self, "_driver", _detect_driver(real_conn))
-        # Smart aggressive-verify: requested mode (auto/on/off) and the
-        # resolved active flag. The active flag is None until the first
-        # wire op runs detection (auto mode) or short-circuits to True/
-        # False (on/off modes). See `_resolve_aggressive_verify_sync`
-        # below for the resolution rules.
+        # Aggressive-verify mode (auto / on / off). Drives the per-DML
+        # `bump_dml_seq` call in the hot path: auto/on bump on every
+        # write; off skips the bump entirely (the customer-opt-out
+        # escape hatch, warned about in `wrap()`).
         object.__setattr__(self, "_aggressive_verify_mode", aggressive_verify)
-        object.__setattr__(self, "_aggressive_verify_active", None)
         object.__setattr__(self, "_db_key", db_key)
 
     def cursor(self, *args, **kwargs):
@@ -396,16 +364,6 @@ class CachedCursor:
         # reasonable state hash even if verify fails.
         if self._conn is not None:
             _maybe_verify_sync_pre_call(self._conn)
-
-        # Smart aggressive-verify: resolve activation lazily on the first
-        # wire op. Cached (per-connection AND per-database) — runs the
-        # trigger-detection round-trip at most once per database, and
-        # zero times when the mode is "on" / "off". Errors during
-        # detection resolve to False (safe default). Resolved once;
-        # subsequent calls on this cursor / connection hit the cached
-        # `_aggressive_verify_active` attribute.
-        if self._conn is not None:
-            _resolve_aggressive_verify_sync(self._conn)
 
         # Parse SET / RESET / DISCARD / set_config segments into a pending
         # batch — the actual state mutation is deferred until AFTER the
@@ -473,23 +431,34 @@ class CachedCursor:
                     self._conn._guc_state, pending_batch, success
                 )
 
-        # Bypass-cache decisions:
-        # - had_tx_marker: BEGIN/COMMIT/etc. — response is a status string,
-        #   not rows worth caching.
-        # - write_found: write must hit the wire (we already invalidated
-        #   the cache above).
-        # - in_transaction: in-tx reads bypass the cache for read-your-own-
-        #   writes consistency (we don't track per-tx mutations precisely).
-        # - named cursor: server-side cursors stream results in chunks and
-        #   don't fit the in-memory cache shape.
+        # Bodies that bypass the cache end-to-end (skip both L1 lookup
+        # AND the post-call put):
+        # - had_tx_marker: BEGIN/COMMIT/etc. return status strings, not
+        #   rows worth caching.
+        # - write_found: writes already invalidated the table; serving
+        #   from a stale slot would be wrong.
+        # - in_transaction: in-tx reads bypass for read-your-own-writes
+        #   consistency (we don't track per-tx mutations precisely).
+        # - named cursor: server-side cursors stream results in chunks
+        #   and don't fit the in-memory cache shape.
         bypass_cache = (
             had_tx_marker
             or write_found
             or (self._conn is not None and self._conn._in_transaction)
             or bool(getattr(self._real, "name", None))
         )
+        # Dirty bypass affects ONLY the L1 lookup, not the put. A prior
+        # unsafe SET / function call left the GUC state un-reconciled
+        # (the pre-call verify either skipped — trusted driver — or
+        # errored silently), so we can't trust ANY cached row keyed
+        # under the current hash to be safe to serve. Route this query
+        # to the wire; afterwards, putting the wire's result under the
+        # observed hash is fine (post-apply state is fresh).
+        dirty_lookup_bypass = (
+            self._conn is not None and self._conn._guc_state.is_dirty()
+        )
 
-        if not bypass_cache:
+        if not (bypass_cache or dirty_lookup_bypass):
             # Read path: check native cache (state_hash-keyed). On a hit,
             # the SAME body+state previously ran successfully — the SET
             # in the body (if any) was already applied to per-connection
@@ -514,20 +483,20 @@ class CachedCursor:
             raise
         _commit_pending(True)
 
-        # Smart aggressive-verify post-DML mark-dirty: when active AND
-        # the body included a write, mark the GUC state dirty so the
-        # next pre-call verify reconciles via pg_settings. Closes the
-        # trigger-internal-SET correctness gap (a row trigger could
-        # have done `SET app.user_id = ...` server-side, never visible
-        # on the wire). The sync path uses mark-dirty rather than fire-
-        # and-forget threads — the next checkout's pre-call verify is
-        # the natural reconciliation point.
+        # Always-on DML cache-busting: bump the per-connection dml_seq
+        # whenever the body included a write. Replaces the older
+        # "detect triggers, then run a pg_settings verify" pattern.
+        # The bump changes the connection's state hash → subsequent
+        # reads on this connection key under a fresh slot and bypass
+        # any pre-write cached row — the proxy makes its own decision
+        # on the round-trip. `aggressive_verify="off"` is the customer
+        # opt-out (warned about at wrap() time) and skips the bump.
         if (
             self._conn is not None
             and write_found
-            and self._conn._aggressive_verify_active
+            and self._conn._aggressive_verify_mode != AGGRESSIVE_VERIFY_OFF
         ):
-            self._conn._guc_state.mark_dirty()
+            self._conn._guc_state.bump_dml_seq()
 
         if bypass_cache:
             return result
@@ -604,25 +573,24 @@ class CachedCursor:
         pending_batch = None
         if self._conn is not None:
             _maybe_verify_sync_pre_call(self._conn)
-            _resolve_aggressive_verify_sync(self._conn)
             pending_batch = prepare_pending(sql)
-            # Top-level function calls in executemany — also mark dirty
-            # so the next call's pre-call verify reconciles state. The
-            # function body might mutate state on every row.
+            # Top-level function calls in executemany — mark dirty so the
+            # next call's pre-call verify reconciles state. The function
+            # body might mutate state on every row.
             if is_top_level_function_call(sql):
                 self._conn._guc_state.mark_dirty()
         write_result = _detect_writes_multi(sql)
         _apply_write_invalidation(self._cache, write_result)
-        # Smart aggressive-verify: `executemany("INSERT ...", rows)` may
-        # have triggered row-level triggers on every row that did SETs.
-        # Mark dirty so the next pre-call verify reconciles. (Mirrors the
-        # post-DML mark-dirty in `execute()`.)
+        # Always-on DML cache-busting: `executemany("INSERT ...", rows)`
+        # may have triggered row-level triggers on every row that did
+        # SETs. Bump dml_seq so the next read on this connection keys
+        # under a fresh slot and bypasses the pre-write L1 view.
         if (
             self._conn is not None
             and write_result is not None
-            and self._conn._aggressive_verify_active
+            and self._conn._aggressive_verify_mode != AGGRESSIVE_VERIFY_OFF
         ):
-            self._conn._guc_state.mark_dirty()
+            self._conn._guc_state.bump_dml_seq()
         # Track tx markers for parity with `execute`. Multi-statement bodies
         # containing BEGIN/COMMIT in `executemany` are unusual but the cost
         # is negligible (single-statement fast path) and keeps the wrapper's
@@ -701,10 +669,9 @@ class AsyncCachedConnection:
         # cancel them — never block the user's hot path, never leak a
         # dangling coroutine on connection teardown.
         object.__setattr__(self, "_pending_verify_tasks", set())
-        # Smart aggressive-verify state — see CachedConnection for the
-        # mode/active-flag contract.
+        # Aggressive-verify mode (auto / on / off). Drives the per-DML
+        # `bump_dml_seq` call in the hot path; off skips the bump.
         object.__setattr__(self, "_aggressive_verify_mode", aggressive_verify)
-        object.__setattr__(self, "_aggressive_verify_active", None)
         object.__setattr__(self, "_db_key", db_key)
         # asyncpg / psycopg-async connections are single-op: at most one
         # `await fetch(...)` in flight at a time. The post-call verify
@@ -738,10 +705,9 @@ class AsyncCachedConnection:
             object.__setattr__(self, "_in_transaction", new_tx)
         return had_tx_marker
 
-    def _schedule_post_call_verify(self, sql, force=False):
-        """If `sql` is a top-level `SELECT <ident>(...)` whose function body
-        could plausibly mutate session state — OR `force=True` (used by
-        the smart aggressive-verify post-DML hook) — schedule an async
+    def _schedule_post_call_verify(self, sql):
+        """If `sql` is a top-level `SELECT <ident>(...)` whose function
+        body could plausibly mutate session state, schedule an async
         verify task to read pg_settings AFTER the user's response is
         dispatched.
 
@@ -756,8 +722,13 @@ class AsyncCachedConnection:
         connection stays dirty and the next pre-call verify retries.
         Cancellation (e.g. `close()` while verify is in flight) is
         absorbed without surfacing to the user.
+
+        DML cache-busting goes through `bump_dml_seq` (in the caller),
+        not through this verify path — the bump alone changes the
+        connection's cache key, which is sufficient. No need to round-
+        trip pg_settings on every write.
         """
-        if not (force or is_top_level_function_call(sql)):
+        if not is_top_level_function_call(sql):
             return
         # Mark dirty BEFORE scheduling — even if create_task isn't
         # possible (we're not in an event loop, somehow), the dirty
@@ -785,10 +756,19 @@ class AsyncCachedConnection:
         async with self._get_op_lock():
             await self._guc_state.maybe_verify_async(self._real)
 
+    def _bump_dml_if_active(self, write_result):
+        """Per-write `bump_dml_seq` hook, skipped when the customer
+        opted out via `aggressive_verify="off"`. Centralises the
+        mode-check so the four async hot paths stay near-identical."""
+        if (
+            write_result is not None
+            and self._aggressive_verify_mode != AGGRESSIVE_VERIFY_OFF
+        ):
+            self._guc_state.bump_dml_seq()
+
     async def fetch(self, sql, *args):
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
-            await _resolve_aggressive_verify_async(self)
             # Defer state mutation until after the dispatch resolves —
             # see prepare_pending / apply_pending in goldlapel.cache for
             # the Wave 2 SET-actually-applied rationale.
@@ -800,9 +780,14 @@ class AsyncCachedConnection:
             bypass_cache = (
                 had_tx_marker or write_found or self._in_transaction
             )
+            # Dirty-lookup bypass: prior unsafe SET / function call left
+            # the GUC state un-reconciled. Skip L1 lookup, still go
+            # through the post-call put path (the wire's result under
+            # the observed hash is fine to cache forward).
+            dirty_lookup_bypass = self._guc_state.is_dirty()
             params = args if args else None
 
-            if not bypass_cache:
+            if not (bypass_cache or dirty_lookup_bypass):
                 entry = self._cache.get(sql, params, state_hash)
                 if entry is not None:
                     # Cache hit — no real call landed on the wire, so no
@@ -820,15 +805,15 @@ class AsyncCachedConnection:
                 apply_pending(self._guc_state, pending_batch, False)
                 raise
             apply_pending(self._guc_state, pending_batch, True)
-            # Smart aggressive-verify: force a post-DML verify when the
-            # body included a write AND aggressive-verify is active.
-            # Closes the trigger-internal-SET correctness gap. Layered
-            # over the existing top-level-function-call verify trigger.
-            force_verify = bool(
-                write_result is not None
-                and self._aggressive_verify_active
-            )
-            self._schedule_post_call_verify(sql, force=force_verify)
+            # Always-on DML cache-busting: bump dml_seq on every observed
+            # write (unless the customer opted out). The bump changes the
+            # cache key — no extra round-trip required.
+            self._bump_dml_if_active(write_result)
+            # Top-level function call verify is still scheduled — it
+            # reconciles GUC state on the off-chance the function did a
+            # server-side SET we never saw on the wire. Independent of
+            # the DML bump; both fire when applicable.
+            self._schedule_post_call_verify(sql)
             if bypass_cache:
                 return rows
 
@@ -848,7 +833,6 @@ class AsyncCachedConnection:
     async def fetchrow(self, sql, *args):
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
-            await _resolve_aggressive_verify_async(self)
             pending_batch = prepare_pending(sql)
             state_hash = self._guc_state.hash
             write_result = _detect_writes_multi(sql)
@@ -857,9 +841,10 @@ class AsyncCachedConnection:
             bypass_cache = (
                 had_tx_marker or write_found or self._in_transaction
             )
+            dirty_lookup_bypass = self._guc_state.is_dirty()
             params = args if args else None
 
-            if not bypass_cache:
+            if not (bypass_cache or dirty_lookup_bypass):
                 entry = self._cache.get(sql, params, state_hash)
                 if entry is not None:
                     return entry.rows[0] if entry.rows else None
@@ -870,11 +855,8 @@ class AsyncCachedConnection:
                 apply_pending(self._guc_state, pending_batch, False)
                 raise
             apply_pending(self._guc_state, pending_batch, True)
-            force_verify = bool(
-                write_result is not None
-                and self._aggressive_verify_active
-            )
-            self._schedule_post_call_verify(sql, force=force_verify)
+            self._bump_dml_if_active(write_result)
+            self._schedule_post_call_verify(sql)
             if bypass_cache:
                 return row
 
@@ -887,7 +869,6 @@ class AsyncCachedConnection:
     async def fetchval(self, sql, *args, column=0):
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
-            await _resolve_aggressive_verify_async(self)
             pending_batch = prepare_pending(sql)
             state_hash = self._guc_state.hash
             write_result = _detect_writes_multi(sql)
@@ -896,9 +877,10 @@ class AsyncCachedConnection:
             bypass_cache = (
                 had_tx_marker or write_found or self._in_transaction
             )
+            dirty_lookup_bypass = self._guc_state.is_dirty()
             params = args if args else None
 
-            if not bypass_cache:
+            if not (bypass_cache or dirty_lookup_bypass):
                 entry = self._cache.get(sql, params, state_hash)
                 if entry is not None:
                     if entry.rows:
@@ -914,11 +896,8 @@ class AsyncCachedConnection:
                 apply_pending(self._guc_state, pending_batch, False)
                 raise
             apply_pending(self._guc_state, pending_batch, True)
-            force_verify = bool(
-                write_result is not None
-                and self._aggressive_verify_active
-            )
-            self._schedule_post_call_verify(sql, force=force_verify)
+            self._bump_dml_if_active(write_result)
+            self._schedule_post_call_verify(sql)
             return val
 
     async def execute(self, sql, *args):
@@ -933,7 +912,6 @@ class AsyncCachedConnection:
         # state diverged.
         async with self._get_op_lock():
             await _maybe_verify_async_pre_call(self)
-            await _resolve_aggressive_verify_async(self)
             pending_batch = prepare_pending(sql)
             write_result = _detect_writes_multi(sql)
             _apply_write_invalidation(self._cache, write_result)
@@ -944,11 +922,8 @@ class AsyncCachedConnection:
                 apply_pending(self._guc_state, pending_batch, False)
                 raise
             apply_pending(self._guc_state, pending_batch, True)
-            force_verify = bool(
-                write_result is not None
-                and self._aggressive_verify_active
-            )
-            self._schedule_post_call_verify(sql, force=force_verify)
+            self._bump_dml_if_active(write_result)
+            self._schedule_post_call_verify(sql)
             return result
 
     def transaction(self, **kwargs):
