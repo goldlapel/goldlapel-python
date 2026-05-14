@@ -841,7 +841,7 @@ class ConnectionGucState:
     and verify only runs when explicitly invoked.
     """
 
-    __slots__ = ("_values", "_hash", "_dirty", "_discards_observed")
+    __slots__ = ("_values", "_hash", "_dirty", "_discards_observed", "_dml_seq")
 
     def __init__(self):
         self._values = {}  # lowercased GUC name → raw value string
@@ -858,6 +858,17 @@ class ConnectionGucState:
         # entry and skips work if it's nonzero (a DISCARD already
         # reconciled state for us).
         self._discards_observed = 0
+        # Per-connection DML sequence counter. Bumped via `bump_dml_seq`
+        # on every observed write while aggressive-verify is on. Folded
+        # into the state hash so the L1 cache key naturally changes
+        # post-write — the next read on this connection bypasses the
+        # stale slot and goes to the proxy, which makes its own decision
+        # about whether to serve the cached value. Replaces the older
+        # "detect triggers, then run a pg_settings verify after DML"
+        # approach: cheaper (no extra round-trip), simpler (no
+        # detection), and strictly safer (every DML invalidates the
+        # connection's L1 view, not just the ones we detected as risky).
+        self._dml_seq = 0
 
     @property
     def hash(self):
@@ -878,6 +889,36 @@ class ConnectionGucState:
         including DISCARD ALL). Read by `maybe_verify` to decide whether
         the dirty-flag suspicion is already reconciled."""
         return self._discards_observed
+
+    @property
+    def dml_seq(self):
+        """Per-connection DML sequence counter — bumped via
+        `bump_dml_seq` on every observed write. Folded into the state
+        hash so post-write reads naturally key under a fresh slot and
+        bypass any pre-write cached row on this connection."""
+        return self._dml_seq
+
+    def is_dirty(self):
+        """Method form of the `dirty` property. The wrap.py hot path
+        calls this to gate L1 cache lookups: when dirty, the cache is
+        bypassed entirely and the query goes to the proxy, which makes
+        its own decision about whether the cached value is still good.
+        Mirrors the property — both return the same bool."""
+        return self._dirty
+
+    def bump_dml_seq(self):
+        """Increment the per-connection DML sequence counter and
+        recompute the state hash. Called by the wrap.py hot path on
+        every observed write while aggressive-verify is on (default).
+        Cheap — one int bump + one tuple hash.
+
+        Replaces the older "mark_dirty + post-DML verify query" pattern:
+        a hash bump is enough — the cache key changes, the L1 slot is
+        no longer addressable from this connection, and the proxy
+        decides on the next round-trip whether the row is still valid.
+        No verify round-trip required."""
+        self._dml_seq += 1
+        self._recompute_hash()
 
     def mark_dirty(self):
         """Force-set the dirty flag. Used by the post-call verify path —
@@ -918,12 +959,18 @@ class ConnectionGucState:
             return False
         if kind == SET_KIND_RESET_ALL:
             # DISCARD ALL routes here too — clear EVERYTHING (state map +
-            # dirty flag). The connection has been fully reset by the
-            # pool / by the user; no remaining uncertainty.
+            # dirty flag + dml_seq). The connection has been fully reset
+            # by the pool / by the user; no remaining uncertainty.
             self._discards_observed += 1
             self._dirty = False
+            mutated = False
             if self._values:
                 self._values.clear()
+                mutated = True
+            if self._dml_seq != 0:
+                self._dml_seq = 0
+                mutated = True
+            if mutated:
                 self._recompute_hash()
                 return True
             return False
@@ -970,14 +1017,20 @@ class ConnectionGucState:
         return self._hash != before
 
     def _recompute_hash(self):
-        if not self._values:
+        # Fresh state (no SETs observed AND no DML observed) hashes to 0
+        # — that's the shared "default-context" cache slot two clean
+        # connections can correctly share. Once anything mutates state
+        # (a SET, or a DML bump), we fold both the values map and the
+        # DML counter into the hash so peer connections with different
+        # values OR different DML history never collide.
+        if not self._values and self._dml_seq == 0:
             self._hash = 0
             return
         # Sorted iteration → deterministic hash regardless of insertion
         # order. Python's `hash()` is process-randomised, but the state
         # hash never crosses process boundaries (it's only ever used as
         # part of a local L1 cache key), so that's fine.
-        self._hash = hash(tuple(sorted(self._values.items())))
+        self._hash = hash((tuple(sorted(self._values.items())), self._dml_seq))
 
     # ---- verify-on-checkout: rebuild state map from pg_settings ----
 
@@ -1070,134 +1123,6 @@ class ConnectionGucState:
 _VERIFY_SQL = (
     "SELECT name, setting FROM pg_settings WHERE source = 'session'"
 )
-
-
-# ---- Smart aggressive-verify: trigger-internal-SET detection ----
-#
-# Triggers fire on DML and can SET / RESET / DISCARD / set_config()
-# server-side without ever surfacing those commands on the client wire.
-# The wrapper's normal observe-on-the-wire parser misses them, leaving
-# the per-connection ConnectionGucState diverged from server reality.
-#
-# To close that gap WITHOUT charging every customer the cost of a
-# post-DML verify, we detect once per database whether any user trigger
-# could plausibly do this. If yes, the wrapper enables an "aggressive
-# verify" mode that schedules a post-DML verify (mark-dirty in the sync
-# path, async create_task in the async path) on every observed
-# INSERT/UPDATE/DELETE/MERGE/TRUNCATE. False positives cost ~1ms per
-# write; false negatives are the bad case (silent correctness drift) —
-# the regex is intentionally permissive to bias toward false positives.
-#
-# Detection is cached module-level keyed by the database key (caller
-# passes the upstream URL). One detection round-trip per database, not
-# per-connection, not per-call.
-_TRIGGER_DETECTION_SQL = (
-    "SELECT EXISTS ("
-    "    SELECT 1"
-    "    FROM pg_trigger t"
-    "    JOIN pg_proc p ON t.tgfoid = p.oid"
-    "    WHERE NOT t.tgisinternal"
-    "    AND ("
-    "        p.prosrc ~* '\\mset\\M'"
-    "        OR p.prosrc ~* 'set_config'"
-    "        OR p.prosrc ~* '\\mreset\\M'"
-    "        OR p.prosrc ~* '\\mdiscard\\M'"
-    "    )"
-    ")"
-)
-
-
-# Module-level detection cache. Keyed by an opaque "database key" (the
-# caller's upstream URL is fine — what matters is that two conns to the
-# same db share a key). Values are bool. A `threading.Lock` guards the
-# dict; reads/writes are infrequent (once per db, then steady-state hits)
-# so the lock is uncontended.
-import threading as _threading
-_trigger_detection_cache = {}
-_trigger_detection_lock = _threading.Lock()
-
-
-def _trigger_detection_lookup(db_key):
-    """Return cached detection bool for `db_key`, or None if uncached."""
-    if db_key is None:
-        return None
-    with _trigger_detection_lock:
-        return _trigger_detection_cache.get(db_key)
-
-
-def _trigger_detection_store(db_key, value):
-    """Store detection result. Idempotent — last-writer-wins on the rare
-    race where two connections detect concurrently (both should see the
-    same answer; if they don't, the database changed under us, which is
-    out of scope for v1)."""
-    if db_key is None:
-        return
-    with _trigger_detection_lock:
-        _trigger_detection_cache[db_key] = bool(value)
-
-
-def _trigger_detection_reset():
-    """Test helper — clear the module-level cache so each test sees a
-    fresh detection round-trip."""
-    with _trigger_detection_lock:
-        _trigger_detection_cache.clear()
-
-
-def detect_trigger_internal_set(real_conn):
-    """Run the trigger-pattern detection query on `real_conn` (sync DBAPI
-    cursor protocol). Returns True if any non-internal trigger's body
-    references SET / RESET / DISCARD / set_config. False on a clean
-    schema OR on any error — detection is best-effort, NEVER fails the
-    user's call. False on error is the safe default: smart auto-enable
-    declines to opt-in when it can't read pg_trigger.
-
-    Caller is responsible for caching — this function does the wire op
-    every time it's called.
-    """
-    try:
-        cursor = real_conn.cursor()
-        try:
-            cursor.execute(_TRIGGER_DETECTION_SQL)
-            row = cursor.fetchone()
-        finally:
-            try:
-                cursor.close()
-            except Exception:
-                pass
-        if not row:
-            return False
-        # `EXISTS(...)` returns a single-column row of bool. Tolerate
-        # tuple / Row / Mapping-like shapes.
-        try:
-            value = row[0]
-        except (KeyError, IndexError, TypeError):
-            return False
-        return bool(value)
-    except Exception:
-        return False
-
-
-async def detect_trigger_internal_set_async(real_conn):
-    """Async sibling of `detect_trigger_internal_set` — uses asyncpg's
-    `fetchval` / `fetch` API. Same contract: returns True iff the
-    detection query says yes. False on any error.
-    """
-    try:
-        # Prefer fetchval (returns the scalar directly). asyncpg /
-        # psycopg.AsyncConnection both expose it on Connection.
-        if hasattr(real_conn, "fetchval"):
-            value = await real_conn.fetchval(_TRIGGER_DETECTION_SQL)
-            return bool(value)
-        # Fallback: fetch + first-row first-col.
-        rows = await real_conn.fetch(_TRIGGER_DETECTION_SQL)
-        if not rows:
-            return False
-        try:
-            return bool(rows[0][0])
-        except (KeyError, IndexError, TypeError):
-            return False
-    except Exception:
-        return False
 
 
 def _make_key(sql, params, state_hash=0):
