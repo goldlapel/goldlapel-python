@@ -34,6 +34,7 @@ from goldlapel.proxy import (
     _log_level_to_verbose_flag,
     _make_proxy_url,
     _set_pdeathsig,
+    _unregister,
     _wait_for_port,
     _STARTUP_TIMEOUT,
     GoldLapel,
@@ -285,10 +286,13 @@ class AsyncGoldLapel:
 
         # Startup banner — matches the sync path's stderr banner.
         if not self._sync._silent:
-            banner = (
-                f"goldlapel → :{self._sync._proxy_port} (proxy) | "
-                f"http://127.0.0.1:{self._sync._dashboard_port} (dashboard)"
-            )
+            if self._sync._dashboard_port:
+                banner = (
+                    f"goldlapel → :{self._sync._proxy_port} (proxy) | "
+                    f"http://127.0.0.1:{self._sync._dashboard_port} (dashboard)"
+                )
+            else:
+                banner = f"goldlapel → :{self._sync._proxy_port} (proxy)"
             print(banner, file=sys.stderr)
 
         return self._sync._proxy_url
@@ -350,6 +354,7 @@ class AsyncGoldLapel:
         self._sync._process = None
         self._sync._proxy_url = None
         self._sync._dashboard_token = None
+        _unregister(self._sync)
 
     # -- Async context manager ---------------------------------------------
 
@@ -524,9 +529,7 @@ async def _actual_start(upstream, **kwargs):
             if existing:
                 del proxy_mod._instances[existing._upstream]
             if proxy_port is None:
-                proxy_port = proxy_mod._next_port
-            if proxy_port >= proxy_mod._next_port:
-                proxy_mod._next_port = proxy_port + 1
+                proxy_port = proxy_mod._pick_proxy_port(kwargs.get("dashboard_port"))
             inst = AsyncGoldLapel(upstream, **{**kwargs, "proxy_port": proxy_port})
             proxy_mod._instances[upstream] = inst._sync
             need_spawn = True

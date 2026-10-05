@@ -68,7 +68,6 @@ _LOG_LEVEL_TO_VERBOSE = {
 _instances = {}
 _cleanup_registered = False
 _lock = threading.Lock()
-_next_port = DEFAULT_PROXY_PORT
 _utils_mod = None
 
 
@@ -321,8 +320,11 @@ def _kill_orphan_on_port(port):
         return
     if shutil.which("lsof"):
         try:
+            # -a ANDs the selectors (lsof ORs them by default): only a
+            # goldlapel process listening on this port, never whatever else
+            # holds it or every goldlapel process on the machine.
             out = subprocess.check_output(
-                ["lsof", "-ti", f":{port}", "-c", "goldlapel"],
+                ["lsof", "-a", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-c", "goldlapel"],
                 stderr=subprocess.DEVNULL, text=True,
             )
             for pid_str in out.strip().split():
@@ -332,6 +334,38 @@ def _kill_orphan_on_port(port):
             time.sleep(0.5)
         except (subprocess.CalledProcessError, ValueError, OSError):
             pass
+
+
+def _claimed_ports():
+    """Ports held by the proxies this process has started (or is starting):
+    each one's proxy port plus its dashboard port (none when disabled with 0).
+    A proxy whose process has exited holds nothing. Caller holds `_lock`."""
+    claimed = set()
+    for inst in _instances.values():
+        if inst._process is not None and inst._process.poll() is not None:
+            continue
+        claimed.add(inst._proxy_port)
+        if inst._dashboard_port:
+            claimed.add(inst._dashboard_port)
+    return claimed
+
+
+def _pick_proxy_port(dashboard_port):
+    """Auto-assign a proxy port: the smallest P >= DEFAULT_PROXY_PORT such
+    that neither P nor its dashboard port (P + 1 unless `dashboard_port` is
+    given) is claimed by another proxy of this process. An explicit dashboard
+    port is the caller's choice, so only P is checked against the claims.
+    Caller holds `_lock`."""
+    claimed = _claimed_ports()
+    for port in range(DEFAULT_PROXY_PORT, 65535):
+        if port in claimed:
+            continue
+        if dashboard_port is None:
+            if port + 1 not in claimed:
+                return port
+        elif port != int(dashboard_port):
+            return port
+    raise RuntimeError("Gold Lapel could not find a free proxy port")
 
 
 def _set_pdeathsig():
@@ -641,13 +675,7 @@ class GoldLapel:
         self._process = None
         self._proxy_url = None
         self._dashboard_token = None
-        # Drop ourselves from the registry so the next start(same_url) gets a
-        # fresh allocation instead of silently drifting to a new port because
-        # _next_port has advanced. Option A from the v0.2 review findings —
-        # clean slate on next start. dict.pop is atomic under the GIL, so this
-        # is safe without _lock (and reacquiring _lock here would deadlock the
-        # bulk stop()/atexit paths that hold it while iterating _instances).
-        _instances.pop(self._upstream, None)
+        _unregister(self)
 
     @property
     def conn(self):
@@ -757,6 +785,17 @@ class GoldLapel:
         return _utils().explain_score(self._effective_conn(conn), *args, **kwargs)
 
 
+def _unregister(inst):
+    """Drop a stopped proxy from the registry so its ports are free for the
+    next auto-assignment and the next start(same_url) gets a fresh instance
+    (Option A from the v0.2 review findings). Only removes `inst` itself — a
+    directly-constructed GoldLapel for the same upstream must not evict the
+    factory's live one. Runs without `_lock`: the bulk stop()/atexit paths
+    hold it while iterating, and reacquiring it here would deadlock."""
+    if _instances.get(inst._upstream) is inst:
+        _instances.pop(inst._upstream, None)
+
+
 def _ensure_running(
     upstream,
     *,
@@ -777,7 +816,7 @@ def _ensure_running(
     disable_sqloptimize=False,
     disable_auto_indexes=False,
 ):
-    global _cleanup_registered, _next_port
+    global _cleanup_registered
     with _lock:
         if upstream in _instances:
             inst = _instances[upstream]
@@ -786,9 +825,7 @@ def _ensure_running(
             del _instances[upstream]
 
         if proxy_port is None:
-            proxy_port = _next_port
-        if proxy_port >= _next_port:
-            _next_port = proxy_port + 1
+            proxy_port = _pick_proxy_port(dashboard_port)
 
         inst = GoldLapel(
             upstream,
@@ -881,7 +918,9 @@ def start(
     Top-level kwargs match the canonical config surface shared across every
     Gold Lapel wrapper:
 
-    - proxy_port: proxy listen port (default 7932)
+    - proxy_port: proxy listen port. Default: 7932, or for further upstreams
+        the next port whose pair (proxy + dashboard) no other proxy started
+        by this process holds — 7934, 7936, ...
     - dashboard_port: dashboard port (derived as proxy_port + 1 when unset; 0 disables)
     - log_level: one of 'trace', 'debug', 'info', 'warn', 'error'
     - mode: proxy operating mode ('waiter', 'consideration', ...)

@@ -44,6 +44,8 @@ Point your Postgres driver at `gl.url`. Gold Lapel sits between your app and you
 
 The proxy listens on two ports: the proxy itself (`proxy_port`, default 7932) and the dashboard (`dashboard_port`, default `proxy_port + 1`; `0` disables it).
 
+Each `start()` for a different upstream spawns its own proxy. Without an explicit `proxy_port`, it takes the next pair no other proxy in the process holds: the first gets 7932 (dashboard 7933), the second 7934 (dashboard 7935), and so on. An explicit `proxy_port` is used as given; stopping a proxy frees its ports.
+
 Async usage (`goldlapel.asyncio.start`), context managers, transactional coordination via `gl.using(conn)`, and framework integrations are in the docs.
 
 ## Documents and streams

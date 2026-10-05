@@ -454,7 +454,6 @@ class TestModuleFunctions:
 
 def _reset_module_state():
     proxy_mod._instances.clear()
-    proxy_mod._next_port = DEFAULT_PROXY_PORT
 
 
 def _mock_popen():
@@ -491,10 +490,11 @@ class TestMultiInstance:
         start(url_a)
         start(url_b)
 
-        assert len(proxy_mod._instances) == 2
-        ports = [inst._proxy_port for inst in proxy_mod._instances.values()]
-        assert 7932 in ports
-        assert 7933 in ports
+        # Each proxy holds a pair (proxy port + dashboard port), so the
+        # second one steps over the first one's dashboard on 7933.
+        assert proxy_mod._instances[url_a]._proxy_port == 7932
+        assert proxy_mod._instances[url_b]._proxy_port == 7934
+        assert proxy_mod._instances[url_b]._dashboard_port == 7935
 
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
@@ -613,17 +613,112 @@ class TestMultiInstance:
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_explicit_port_advances_next_port(self, mock_find, mock_popen, mock_wait, mock_detect):
+    def test_explicit_port_is_used_as_given_and_claims_its_pair(
+        self, mock_find, mock_popen, mock_wait, mock_detect,
+    ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
         url_b = "postgresql://host-b:5432/db_b"
 
-        start(url_a, proxy_port=8000)
-        start(url_b)  # Should auto-assign 8001, not 7932
+        start(url_a, proxy_port=7933)
+        start(url_b)
 
-        inst_b = proxy_mod._instances[url_b]
-        assert inst_b._proxy_port == 8001
+        assert proxy_mod._instances[url_a]._proxy_port == 7933
+        # 7932's dashboard would be 7933, 7933/7934 are taken: next free pair.
+        assert proxy_mod._instances[url_b]._proxy_port == 7935
+
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_far_explicit_port_leaves_default_free(
+        self, mock_find, mock_popen, mock_wait, mock_detect,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host-a:5432/db_a", proxy_port=8000)
+        gl_b = start("postgresql://host-b:5432/db_b")
+
+        assert gl_b._proxy_port == DEFAULT_PROXY_PORT
+
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_explicit_dashboard_port_is_skipped(
+        self, mock_find, mock_popen, mock_wait, mock_detect,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host-a:5432/db_a", dashboard_port=7934)
+        gl_b = start("postgresql://host-b:5432/db_b")
+
+        # Claimed: 7932 (proxy) and 7934 (dashboard). 7933 is free but its
+        # dashboard would land on 7934, so the first free pair is 7935/7936.
+        assert gl_b._proxy_port == 7935
+        assert gl_b._dashboard_port == 7936
+
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_disabled_dashboard_claims_only_the_proxy_port(
+        self, mock_find, mock_popen, mock_wait, mock_detect,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host-a:5432/db_a", dashboard_port=0)
+        gl_b = start("postgresql://host-b:5432/db_b", dashboard_port=0)
+        gl_c = start("postgresql://host-c:5432/db_c")
+
+        assert gl_b._proxy_port == 7933
+        assert gl_c._proxy_port == 7934
+
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_new_explicit_dashboard_port_avoids_claimed_proxy_port(
+        self, mock_find, mock_popen, mock_wait, mock_detect,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        start("postgresql://host-a:5432/db_a")
+        gl_b = start("postgresql://host-b:5432/db_b", dashboard_port=9000)
+
+        # 7932/7933 are claimed by the first proxy; with an explicit
+        # dashboard the second only needs a free proxy port.
+        assert gl_b._proxy_port == 7934
+        assert gl_b._dashboard_port == 9000
+
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_stop_releases_ports(self, mock_find, mock_popen, mock_wait, mock_detect):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        url_a = "postgresql://host-a:5432/db_a"
+        start(url_a)
+        start("postgresql://host-b:5432/db_b")
+        stop(url_a)
+
+        gl_c = start("postgresql://host-c:5432/db_c")
+        assert gl_c._proxy_port == 7932
+
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_exited_proxy_releases_ports(self, mock_find, mock_popen, mock_wait, mock_detect):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+
+        gl_a = start("postgresql://host-a:5432/db_a")
+        gl_a._process.poll.return_value = 1  # proxy died
+
+        gl_b = start("postgresql://host-b:5432/db_b")
+        assert gl_b._proxy_port == 7932
 
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
@@ -716,8 +811,8 @@ class TestMultiInstance:
     ):
         # Regression for v0.2 review finding (MEDIUM, Option A): after
         # gl.stop(), the _instances entry must be dropped so the next
-        # start(same_url) doesn't get a stale entry (and silently land on a
-        # different port because _next_port has advanced).
+        # start(same_url) gets a fresh instance and its ports are free for
+        # other upstreams.
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url = "postgresql://host:5432/mydb"
@@ -728,15 +823,48 @@ class TestMultiInstance:
         assert url not in proxy_mod._instances, \
             "gl.stop() must remove itself from _instances"
 
-        # Start a second, different upstream so _next_port advances; then
-        # the re-start of `url` should get the freshly allocated port
-        # (7934), not the stale 7932. The key invariant is: the port is
-        # *newly* allocated — no silent reuse of the stale entry.
-        start("postgresql://other:5432/other_db")
+        # The stopped proxy's pair is free again, so another upstream takes
+        # 7932 and the restart of `url` gets the next free pair.
+        other = start("postgresql://other:5432/other_db")
         gl2 = start(url)
-        assert gl2._proxy_port != 7932, \
-            f"restart after stop silently reused stale port 7932: got {gl2._proxy_port}"
-        assert gl2._proxy_port == 7934  # two intermediate allocations advanced _next_port
+        assert other._proxy_port == 7932
+        assert gl2 is not gl
+        assert gl2._proxy_port == 7934
+
+    def test_stopping_unregistered_instance_keeps_registered_one(self):
+        # A directly-constructed GoldLapel for the same upstream must not
+        # drop the factory's registered instance (and free its ports).
+        url = "postgresql://host:5432/mydb"
+        registered = GoldLapel(url)
+        proxy_mod._instances[url] = registered
+
+        GoldLapel(url).stop()
+        assert proxy_mod._instances[url] is registered
+
+
+class TestKillOrphanOnPort:
+    def test_only_targets_goldlapel_listeners(self):
+        # lsof ORs its selectors unless -a is given: without it,
+        # `-i :PORT -c goldlapel` matches whatever owns the port *or* every
+        # goldlapel process on the machine.
+        with patch("goldlapel.proxy._port_in_use", return_value=True), \
+             patch("goldlapel.proxy.shutil.which", return_value="/usr/bin/lsof"), \
+             patch("goldlapel.proxy.subprocess.check_output", return_value="") as mock_lsof, \
+             patch("goldlapel.proxy.os.kill") as mock_kill:
+            proxy_mod._kill_orphan_on_port(7934)
+
+        cmd = mock_lsof.call_args[0][0]
+        assert "-a" in cmd
+        assert "-iTCP:7934" in cmd
+        assert "-sTCP:LISTEN" in cmd
+        assert cmd[cmd.index("-c") + 1] == "goldlapel"
+        mock_kill.assert_not_called()
+
+    def test_free_port_skips_lsof(self):
+        with patch("goldlapel.proxy._port_in_use", return_value=False), \
+             patch("goldlapel.proxy.subprocess.check_output") as mock_lsof:
+            proxy_mod._kill_orphan_on_port(7934)
+        mock_lsof.assert_not_called()
 
 
 class TestStartupBanner:

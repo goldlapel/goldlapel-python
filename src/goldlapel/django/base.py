@@ -40,14 +40,12 @@ class DatabaseWrapper(PgDatabaseWrapper):
         gl_opts = params.pop("goldlapel", {})
         # Django OPTIONS dict uses the canonical snake_case surface —
         # `proxy_port`, `dashboard_port`, `log_level`, `mode`, etc. —
-        # matching `goldlapel.start(**opts)`.
-        proxy_port = gl_opts.get("proxy_port", goldlapel.DEFAULT_PROXY_PORT)
-        start_kwargs = {
-            "proxy_port": proxy_port,
-            "client": "django",
-        }
+        # matching `goldlapel.start(**opts)`. Without a configured
+        # proxy_port the core picks one, so several DATABASES each get
+        # their own proxy + dashboard pair.
+        start_kwargs = {"client": "django"}
         for key in (
-            "dashboard_port", "log_level", "mode",
+            "proxy_port", "dashboard_port", "log_level", "mode",
             "license", "config_file", "config", "extra_args", "silent",
         ):
             if key in gl_opts:
@@ -56,9 +54,9 @@ class DatabaseWrapper(PgDatabaseWrapper):
         upstream = _build_upstream_url(self.settings_dict)
 
         try:
-            goldlapel.start(upstream, **start_kwargs)
+            gl = goldlapel.start(upstream, **start_kwargs)
             params["host"] = "127.0.0.1"
-            params["port"] = proxy_port
+            params["port"] = gl.proxy_port
         except Exception as exc:
             logger.warning(
                 "Gold Lapel proxy failed to start, falling back to direct connection: %s",

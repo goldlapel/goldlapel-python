@@ -417,9 +417,7 @@ class TestAllMethodsCount:
 
 def _reset_proxy_state():
     from goldlapel import proxy as proxy_mod
-    from goldlapel.proxy import DEFAULT_PROXY_PORT
     proxy_mod._instances.clear()
-    proxy_mod._next_port = DEFAULT_PROXY_PORT
 
 
 def _mock_popen_instance():
@@ -427,6 +425,92 @@ def _mock_popen_instance():
     proc.poll.return_value = None
     proc.stderr = MagicMock()
     return proc
+
+
+class TestAsyncPortAllocation:
+    """Async starts share the sync registry and port rule: each proxy claims
+    its proxy port and its dashboard port, so auto-assigned pairs never
+    overlap — across async, sync, or a mix of both."""
+
+    @staticmethod
+    def _fake_asyncpg():
+        fake_asyncpg = MagicMock()
+        fake_raw = MagicMock()
+        fake_raw.set_type_codec = AsyncMock()
+        fake_raw.close = AsyncMock()
+        fake_asyncpg.connect = AsyncMock(return_value=fake_raw)
+        return fake_asyncpg
+
+    def _patches(self):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        for target, kwargs in (
+            ("goldlapel.asyncio._proxy._detect_asyncpg", {"return_value": self._fake_asyncpg()}),
+            ("goldlapel.asyncio._proxy._find_binary", {"return_value": "/usr/bin/goldlapel"}),
+            ("goldlapel.asyncio._proxy._wait_for_port", {"return_value": True}),
+            ("goldlapel.asyncio._proxy._kill_orphan_on_port", {}),
+            ("subprocess.Popen", {"side_effect": lambda *a, **kw: _mock_popen_instance()}),
+        ):
+            stack.enter_context(patch(target, **kwargs))
+        return stack
+
+    @pytest.mark.asyncio
+    async def test_two_upstreams_get_non_overlapping_pairs(self):
+        _reset_proxy_state()
+        try:
+            with self._patches():
+                a = await gl_async.start("postgresql://host-a:5432/db_a", silent=True)
+                b = await gl_async.start("postgresql://host-b:5432/db_b", silent=True)
+            assert a._sync._proxy_port == 7932
+            assert b._sync._proxy_port == 7934
+            assert b._sync._dashboard_port == 7935
+        finally:
+            _reset_proxy_state()
+
+    @pytest.mark.asyncio
+    async def test_explicit_dashboard_port_is_skipped(self):
+        _reset_proxy_state()
+        try:
+            with self._patches():
+                await gl_async.start(
+                    "postgresql://host-a:5432/db_a", dashboard_port=7934, silent=True,
+                )
+                b = await gl_async.start("postgresql://host-b:5432/db_b", silent=True)
+            assert b._sync._proxy_port == 7935
+        finally:
+            _reset_proxy_state()
+
+    @pytest.mark.asyncio
+    async def test_sync_and_async_share_claims(self):
+        from goldlapel import proxy as proxy_mod
+        _reset_proxy_state()
+        try:
+            with self._patches(), \
+                 patch("goldlapel.proxy._detect_sync_driver",
+                       return_value=("psycopg3", MagicMock())), \
+                 patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+                 patch("goldlapel.proxy._wait_for_port", return_value=True), \
+                 patch("goldlapel.proxy._kill_orphan_on_port"):
+                sync_gl = proxy_mod.start("postgresql://host-a:5432/db_a", silent=True)
+                b = await gl_async.start("postgresql://host-b:5432/db_b", silent=True)
+            assert sync_gl._proxy_port == 7932
+            assert b._sync._proxy_port == 7934
+        finally:
+            _reset_proxy_state()
+
+    @pytest.mark.asyncio
+    async def test_stop_releases_ports(self):
+        from goldlapel import proxy as proxy_mod
+        _reset_proxy_state()
+        try:
+            with self._patches():
+                a = await gl_async.start("postgresql://host-a:5432/db_a", silent=True)
+                await a.stop()
+                assert "postgresql://host-a:5432/db_a" not in proxy_mod._instances
+                b = await gl_async.start("postgresql://host-b:5432/db_b", silent=True)
+            assert b._sync._proxy_port == 7932
+        finally:
+            _reset_proxy_state()
 
 
 class TestAsyncStartupBanner:
@@ -457,6 +541,23 @@ class TestAsyncStartupBanner:
                 captured = capsys.readouterr()
                 assert "goldlapel →" not in captured.out
                 assert "goldlapel →" in captured.err
+        finally:
+            _reset_proxy_state()
+
+    @pytest.mark.asyncio
+    async def test_async_banner_omits_disabled_dashboard(self, capsys):
+        _reset_proxy_state()
+        try:
+            fake_asyncpg = self._base_patches()
+            with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
+                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
+                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
+                 patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
+                await gl_async.start("postgresql://host:5432/mydb", dashboard_port=0)
+                captured = capsys.readouterr()
+                assert "goldlapel → :7932 (proxy)" in captured.err
+                assert "(dashboard)" not in captured.err
         finally:
             _reset_proxy_state()
 

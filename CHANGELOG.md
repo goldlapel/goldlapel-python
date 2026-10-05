@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Fixed — multiple upstreams no longer collide on ports
+
+Each proxy uses two ports, proxy (`P`) and dashboard (`P + 1`), but
+auto-assignment stepped by one, so a second upstream got 7933 — the first
+proxy's dashboard port. Auto-assigned ports now skip every port a live proxy
+in this process holds (its proxy port, plus its dashboard port unless that is
+disabled with `0`): two upstreams get 7932/7933 and 7934/7935. The first proxy
+still gets 7932, an explicit `proxy_port` is used as given, and stopping a
+proxy frees its ports for the next one. Sync and `goldlapel.asyncio` share the
+same allocation.
+
+- Django: the backend only passes `proxy_port` when `OPTIONS["goldlapel"]`
+  sets one, and points Django at the port the proxy actually got — two
+  `DATABASES` entries without a port previously both asked for 7932.
+- `goldlapel.asyncio`: `gl.stop()` now releases the proxy's registry entry
+  (and ports), as the sync `stop()` already did. The startup banner no
+  longer prints a dashboard URL when `dashboard_port=0`.
+- The stale-proxy cleanup before spawn only signals a `goldlapel` process
+  listening on the target port. It passed `lsof` selectors without `-a`,
+  which ORs them: it also matched a non-Gold-Lapel process holding that port
+  and every `goldlapel` process on the machine, including this process's
+  other proxies.
+
 ### Breaking changes — the in-process cache (L1) is gone
 
 **The wrapper no longer caches anything itself.** The proxy's result cache
