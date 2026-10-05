@@ -437,3 +437,48 @@ class TestMultipleEngines:
         first, second = (c[0][0] for c in mock_sa.call_args_list)
         assert first.startswith("postgresql+psycopg://u:p@localhost:7932/main")
         assert second.startswith("postgresql+psycopg://u:p@localhost:7934/analytics")
+
+
+class TestUnknownOptions:
+    @patch("goldlapel.sqlalchemy.goldlapel")
+    @patch("goldlapel.sqlalchemy._sa_create_engine")
+    def test_create_engine_rejects_removed_kwarg(self, mock_sa, mock_gl):
+        with pytest.raises(TypeError) as exc:
+            create_engine("postgresql://host/db", goldlapel_invalidation_port=7934)
+        assert "goldlapel_invalidation_port (removed with the in-process cache)" in str(exc.value)
+        mock_gl.start.assert_not_called()
+        mock_sa.assert_not_called()
+
+    @patch("goldlapel.sqlalchemy.goldlapel")
+    def test_create_async_engine_rejects_unknown_kwarg(self, mock_gl):
+        with pytest.raises(TypeError, match="goldlapel_native_cache"):
+            create_async_engine("postgresql+asyncpg://host/db", goldlapel_native_cache=False)
+        mock_gl.start.assert_not_called()
+
+    @patch("goldlapel.sqlalchemy.goldlapel")
+    def test_init_rejects_removed_option(self, mock_gl):
+        with pytest.raises(TypeError, match="aggressive_verify \\(removed with the in-process cache\\)"):
+            init("postgresql://host/db", aggressive_verify="always")
+        mock_gl.start.assert_not_called()
+
+
+class TestEngineUrlDropsUpstreamTls:
+    @patch("goldlapel.proxy._detect_sync_driver",
+           side_effect=lambda: ("psycopg3", MagicMock()))
+    @patch("goldlapel.proxy._kill_orphan_on_port")
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    @patch("goldlapel.sqlalchemy._sa_create_engine")
+    def test_sslmode_goes_upstream_not_to_the_engine(
+        self, mock_sa, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: MagicMock(**{"poll.return_value": None})
+        create_engine("postgresql+psycopg://u:p@h:5432/main?sslmode=require",
+                      goldlapel_silent=True)
+
+        engine_url = mock_sa.call_args[0][0]
+        assert engine_url.startswith("postgresql+psycopg://u:p@localhost:7932/main")
+        assert "sslmode" not in engine_url
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("--upstream") + 1] == "postgresql://u:p@h:5432/main?sslmode=require"

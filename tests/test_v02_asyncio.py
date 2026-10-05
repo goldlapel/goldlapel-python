@@ -44,10 +44,10 @@ class TestAsyncStart:
         mock_detect.return_value = fake_asyncpg
 
         # Mock subprocess spawn + port wait so no real binary is needed.
-        with patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-             patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-             patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-             patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"):
+        with patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+             patch("goldlapel.proxy._wait_for_port", return_value=True), \
+             patch("goldlapel.proxy._kill_orphan_on_port"), \
+             patch("goldlapel.proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"):
             import subprocess as sp_mod
             with patch("subprocess.Popen") as mock_popen:
                 proc = MagicMock()
@@ -446,9 +446,9 @@ class TestAsyncPortAllocation:
         stack = ExitStack()
         for target, kwargs in (
             ("goldlapel.asyncio._proxy._detect_asyncpg", {"return_value": self._fake_asyncpg()}),
-            ("goldlapel.asyncio._proxy._find_binary", {"return_value": "/usr/bin/goldlapel"}),
-            ("goldlapel.asyncio._proxy._wait_for_port", {"return_value": True}),
-            ("goldlapel.asyncio._proxy._kill_orphan_on_port", {}),
+            ("goldlapel.proxy._find_binary", {"return_value": "/usr/bin/goldlapel"}),
+            ("goldlapel.proxy._wait_for_port", {"return_value": True}),
+            ("goldlapel.proxy._kill_orphan_on_port", {}),
             ("subprocess.Popen", {"side_effect": lambda *a, **kw: _mock_popen_instance()}),
         ):
             stack.enter_context(patch(target, **kwargs))
@@ -532,10 +532,10 @@ class TestAsyncStartupBanner:
         try:
             fake_asyncpg = self._base_patches()
             with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
-                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
+                 patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+                 patch("goldlapel.proxy._wait_for_port", return_value=True), \
+                 patch("goldlapel.proxy._kill_orphan_on_port"), \
+                 patch("goldlapel.proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
                  patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
                 await gl_async.start("postgresql://host:5432/mydb")
                 captured = capsys.readouterr()
@@ -550,9 +550,9 @@ class TestAsyncStartupBanner:
         try:
             fake_asyncpg = self._base_patches()
             with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
-                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
+                 patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+                 patch("goldlapel.proxy._wait_for_port", return_value=True), \
+                 patch("goldlapel.proxy._kill_orphan_on_port"), \
                  patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
                 await gl_async.start("postgresql://host:5432/mydb", dashboard_port=0)
                 captured = capsys.readouterr()
@@ -567,10 +567,10 @@ class TestAsyncStartupBanner:
         try:
             fake_asyncpg = self._base_patches()
             with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
-                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
+                 patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+                 patch("goldlapel.proxy._wait_for_port", return_value=True), \
+                 patch("goldlapel.proxy._kill_orphan_on_port"), \
+                 patch("goldlapel.proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
                  patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
                 await gl_async.start("postgresql://host:5432/mydb", silent=True)
                 captured = capsys.readouterr()
@@ -643,10 +643,10 @@ class TestAsyncPromotedDisableKwargs:
                 return _mock_popen_instance()
 
             with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
-                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
+                 patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+                 patch("goldlapel.proxy._wait_for_port", return_value=True), \
+                 patch("goldlapel.proxy._kill_orphan_on_port"), \
+                 patch("goldlapel.proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
                  patch("subprocess.Popen", side_effect=capture_popen):
                 await gl_async.start(
                     "postgresql://host:5432/mydb",
@@ -678,10 +678,10 @@ class TestAsyncPromotedDisableKwargs:
                 return _mock_popen_instance()
 
             with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
-                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
+                 patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel"), \
+                 patch("goldlapel.proxy._wait_for_port", return_value=True), \
+                 patch("goldlapel.proxy._kill_orphan_on_port"), \
+                 patch("goldlapel.proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
                  patch("subprocess.Popen", side_effect=capture_popen):
                 await gl_async.start("postgresql://host:5432/mydb", silent=True)
             assert captured_cmd, "Popen was not called"
@@ -755,7 +755,7 @@ class TestAsyncExplicitPortCollision:
         try:
             with self._patches():
                 await gl_async.start("postgresql://u:secret@host-a:5432/db_a", silent=True)
-                with patch("goldlapel.asyncio._proxy._kill_orphan_on_port") as orphan:
+                with patch("goldlapel.proxy._kill_orphan_on_port") as orphan:
                     with pytest.raises(RuntimeError) as exc:
                         await gl_async.start(
                             "postgresql://host-b:5432/db_b", proxy_port=7933, silent=True,
@@ -792,3 +792,152 @@ class TestAsyncApiKey:
             assert "gl_test_async" not in captured["cmd"]
         finally:
             _reset_proxy_state()
+
+
+class TestAsyncSharedProxy:
+    """Async handles on a shared proxy each hold it: stopping one — or
+    leaving `async with start(url)` — stops the proxy only when no other
+    holder (sync or async) is left."""
+
+    @staticmethod
+    def _patches():
+        return TestAsyncPortAllocation()._patches()
+
+    @pytest.mark.asyncio
+    async def test_async_with_on_reused_proxy_leaves_it_running(self):
+        from goldlapel import proxy as proxy_mod
+        url = "postgresql://host-a:5432/db_a"
+        with self._patches():
+            a = await gl_async.start(url, silent=True)
+            process = a._sync._process
+            async with gl_async.start(url, silent=True) as b:
+                assert b._sync is a._sync
+            assert a.running
+            process.terminate.assert_not_called()
+
+            await a.stop()
+        process.terminate.assert_called_once()
+        assert url not in proxy_mod._instances
+        assert not proxy_mod._live
+
+    @pytest.mark.asyncio
+    async def test_async_stop_keeps_a_sync_holders_proxy(self):
+        from goldlapel import proxy as proxy_mod
+        url = "postgresql://host-a:5432/db_a"
+        with self._patches(), \
+             patch("goldlapel.proxy._detect_sync_driver",
+                   return_value=("psycopg3", MagicMock())):
+            sync_gl = proxy_mod.start(url, silent=True)
+            async with gl_async.start(url, silent=True):
+                pass
+            assert sync_gl.running
+            sync_gl._process.terminate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_double_stop_of_one_handle_releases_once(self):
+        url = "postgresql://host-a:5432/db_a"
+        with self._patches():
+            a = await gl_async.start(url, silent=True)
+            b = await gl_async.start(url, silent=True)
+            await b.stop()
+            await b.stop()
+            assert a.running
+
+    @pytest.mark.asyncio
+    async def test_sync_start_of_async_proxy_gets_a_connection(self):
+        from goldlapel import proxy as proxy_mod
+        url = "postgresql://host-a:5432/db_a"
+        sync_conn = MagicMock(name="sync_conn")
+        driver = MagicMock()
+        driver.connect.return_value = sync_conn
+        with self._patches(), \
+             patch("goldlapel.proxy._detect_sync_driver", return_value=("psycopg3", driver)):
+            await gl_async.start(url, silent=True)
+            gl = proxy_mod.start(url, silent=True)
+        assert gl.conn is sync_conn
+
+
+class TestAsyncCancellation:
+    """A start cancelled while connecting releases its hold, so the ports
+    are not left claimed by an entry with no process."""
+
+    @staticmethod
+    def _hanging_asyncpg():
+        fake_asyncpg = MagicMock()
+
+        async def connect(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        fake_asyncpg.connect = connect
+        return fake_asyncpg
+
+    @pytest.mark.asyncio
+    async def test_cancelled_fresh_start_releases_everything(self):
+        from goldlapel import proxy as proxy_mod
+        url = "postgresql://host-a:5432/db_a"
+        with TestAsyncPortAllocation()._patches(), \
+             patch("goldlapel.asyncio._proxy._detect_asyncpg",
+                   return_value=self._hanging_asyncpg()):
+            task = asyncio.ensure_future(gl_async.start(url, silent=True))
+            await asyncio.sleep(0.05)
+            sync = proxy_mod._instances[url]
+            process = sync._process
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        process.terminate.assert_called_once()
+        assert url not in proxy_mod._instances
+        assert not proxy_mod._live
+
+    @pytest.mark.asyncio
+    async def test_cancelled_reuse_gives_back_only_its_hold(self):
+        url = "postgresql://host-a:5432/db_a"
+        with TestAsyncPortAllocation()._patches():
+            a = await gl_async.start(url, silent=True)
+            with patch("goldlapel.asyncio._proxy._detect_asyncpg",
+                       return_value=self._hanging_asyncpg()):
+                task = asyncio.ensure_future(gl_async.start(url, silent=True))
+                await asyncio.sleep(0.05)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert a.running
+            assert a._sync._holders == 1
+
+
+class TestAsyncWaitsForStartInProgress:
+    @pytest.mark.asyncio
+    async def test_async_start_waits_for_a_sync_start_in_another_thread(self):
+        import threading
+        import time
+        from goldlapel import proxy as proxy_mod
+
+        def slow_wait(*args, **kwargs):
+            time.sleep(0.3)
+            return True
+
+        url = "postgresql://host-a:5432/db_a"
+        with TestAsyncPortAllocation()._patches(), \
+             patch("goldlapel.proxy._wait_for_port", side_effect=slow_wait), \
+             patch("goldlapel.proxy._detect_sync_driver",
+                   return_value=("psycopg3", MagicMock())), \
+             patch("subprocess.Popen",
+                   side_effect=lambda *a, **kw: _mock_popen_instance()) as popen:
+            box = {}
+            t = threading.Thread(target=lambda: box.setdefault(
+                "gl", proxy_mod.start(url, silent=True)))
+            t.start()
+            await asyncio.sleep(0.1)
+            b = await gl_async.start(url, silent=True)
+            t.join()
+        assert popen.call_count == 1
+        assert b._sync is box["gl"]
+        assert b.url is not None
+
+
+class TestAsyncUnknownOptions:
+    def test_removed_option_says_why(self):
+        with pytest.raises(TypeError, match="invalidation_port \\(removed with the in-process cache\\)"):
+            gl_async.start("postgresql://host:5432/db", invalidation_port=7934)
+        with pytest.raises(TypeError, match="Unknown Gold Lapel options: bogus"):
+            AsyncGoldLapel("postgresql://host:5432/db", bogus=1)

@@ -2,6 +2,7 @@ import os
 import re
 
 import goldlapel
+from goldlapel.proxy import _unknown_options_message
 from sqlalchemy import create_engine as _sa_create_engine
 
 _DIALECT_RE = re.compile(r'^(postgres(?:ql)?)\+(\w+)(://)')
@@ -40,12 +41,21 @@ _START_OPTIONS = (
 def _proxy_url_for(url, options):
     # Start (or reuse) the proxy for `url` and return the URL of that
     # proxy — not goldlapel.proxy_url(), which can't tell several apart.
+    unknown = set(options) - set(_START_OPTIONS)
+    if unknown:
+        raise TypeError(_unknown_options_message(unknown))
     clean_url, dialect = _strip_dialect(_url_to_str(url))
     inst = goldlapel.start(clean_url, **{"client": "sqlalchemy", **options})
     return _restore_dialect(inst.url, dialect)
 
 
 def _start_proxy(url, kwargs):
+    unknown = [
+        key for key in kwargs
+        if key.startswith("goldlapel_") and key[len("goldlapel_"):] not in _START_OPTIONS
+    ]
+    if unknown:
+        raise TypeError(_unknown_options_message(unknown, prefix="goldlapel_"))
     options = {}
     for name in _START_OPTIONS:
         key = "goldlapel_" + name

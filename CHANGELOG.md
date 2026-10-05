@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+### Fixed — proxies that start, share and stop cleanly
+
+- **Busy ports.** Auto-assigned ports now skip any pair that something else
+  on the machine is listening on, not just the pairs this process's own
+  proxies hold. When an explicit `proxy_port` / `dashboard_port` is
+  already in use, the proxy refuses to start, and the `RuntimeError`
+  includes its message. Previously the readiness check connected to whatever was listening there and reported success,
+  so the app's queries could go to another app's proxy and its upstream.
+- **Readiness.** A start only succeeds if the proxy answers *and* is still
+  running. If it exits during startup, the error gives its exit status and
+  the end of its stderr.
+- **TLS URLs.** `gl.url` (and the SQLAlchemy engine URL) no longer passes
+  the upstream's TLS/GSS parameters through (`sslmode`, `sslcert`, `sslkey`,
+  `sslrootcert`, `sslcrl`, `sslcrldir`, `sslpassword`, `sslsni`,
+  `sslnegotiation`, `ssl_min_protocol_version`, `ssl_max_protocol_version`,
+  `requiressl`, `channel_binding`, `gssencmode`, `krbsrvname`, `gsslib`).
+  The proxy turns down client TLS unless it has `tls_cert` / `tls_key`, so
+  every `?sslmode=require` URL (Neon, Supabase, RDS) failed to connect. The
+  proxy still uses those parameters upstream. When you configure client
+  TLS, they're kept. In Django, TLS settings in `OPTIONS` now go to the
+  proxy's upstream URL and are dropped from Django's own connection to the
+  proxy.
+- **Sharing a proxy.** Starting an upstream that's already running shares
+  its proxy, and the proxy stops when the last caller stops it, for sync
+  and `goldlapel.asyncio` alike. Previously `async with start(url)` on a
+  reused proxy stopped it for everyone. `goldlapel.stop(url)` still stops
+  it outright.
+- **Threads.** When two threads started the same upstream at once, the
+  second could spawn a second proxy on the same ports, or get an instance
+  whose `url` and `conn` weren't set yet. Now it waits for the first start
+  to finish (or fail) and uses its result.
+- **Directly constructed `GoldLapel(url)`** now claims its ports on
+  `start()` like the factories do. Without `proxy_port` it gets a free
+  pair too.
+- **Interrupted starts.** Ctrl-C during a sync start, or cancelling an
+  async start, no longer leaves ports claimed by a registry entry with no
+  process.
+- **Proxies started from short-lived threads** (a Django `runserver`
+  request thread, for example) were killed when that thread ended: Linux's
+  parent-death signal follows the spawning *thread*, not the process. The
+  proxy is now spawned from one long-lived thread.
+- **Stale-proxy cleanup** only stops a true leftover: a Gold Lapel proxy
+  for this same upstream and port whose parent process has gone. It no
+  longer touches another running app's proxy. This works on Linux only.
+  Elsewhere nothing is killed, and the proxy's busy-port error says what
+  to do.
+- **Unknown options are rejected** with a `TypeError` that names them.
+  Removed options say why, for example
+  `invalidation_port (removed with the in-process cache)`. This covers
+  `goldlapel.start`, `goldlapel.asyncio.start`, `GoldLapel(...)`,
+  SQLAlchemy's `goldlapel_*` engine kwargs and `init()`, and Django's
+  `OPTIONS["goldlapel"]` (`ImproperlyConfigured`). Django and SQLAlchemy
+  used to ignore unknown keys without a word.
+- Django: `OPTIONS["goldlapel"]: None` is treated as no options instead of
+  raising `TypeError`.
+
 ### Fixed — multiple upstreams no longer collide on ports
 
 Each proxy uses two ports, proxy (`P`) and dashboard (`P + 1`), but
@@ -19,11 +75,6 @@ same allocation.
 - `goldlapel.asyncio`: `gl.stop()` now releases the proxy's registry entry
   (and ports), as the sync `stop()` already did. The startup banner no
   longer prints a dashboard URL when `dashboard_port=0`.
-- The stale-proxy cleanup before spawn only signals a `goldlapel` process
-  listening on the target port. It passed `lsof` selectors without `-a`,
-  which ORs them: it also matched a non-Gold-Lapel process holding that port
-  and every `goldlapel` process on the machine, including this process's
-  other proxies.
 
 ### Fixed — several databases from frameworks, async reuse, explicit ports
 

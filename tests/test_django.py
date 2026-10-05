@@ -328,3 +328,86 @@ class TestOptionForwarding:
         mock_gl.start.assert_called_once_with(
             _build_upstream_url(wrapper.settings_dict), **self.ALL_OPTIONS,
         )
+
+
+class TestOptionsEdgeCases:
+    @patch("goldlapel.django.base.goldlapel")
+    @patch("goldlapel.django.base.PgDatabaseWrapper.get_connection_params")
+    def test_goldlapel_none_means_defaults(self, mock_super, mock_gl):
+        mock_gl.start.return_value.proxy_port = 7932
+        mock_super.return_value = {"host": "h", "port": 5432, "goldlapel": None}
+        wrapper = _make_wrapper({"HOST": "h", "PORT": "5432", "NAME": "db"})
+
+        params = DatabaseWrapper.get_connection_params(wrapper)
+
+        mock_gl.start.assert_called_once_with("postgresql://h:5432/db", client="django")
+        assert params["port"] == 7932
+
+    @pytest.mark.parametrize("key, why", [
+        ("invalidation_port", "removed with the in-process cache"),
+        ("aggressive_verify", "removed with the in-process cache"),
+        ("prot", None),
+    ])
+    @patch("goldlapel.django.base.goldlapel")
+    @patch("goldlapel.django.base.PgDatabaseWrapper.get_connection_params")
+    def test_unknown_key_is_rejected(self, mock_super, mock_gl, key, why):
+        from django.core.exceptions import ImproperlyConfigured
+        mock_super.return_value = {"host": "h", "port": 5432, "goldlapel": {key: 1}}
+        wrapper = _make_wrapper({"HOST": "h", "PORT": "5432", "NAME": "db"})
+
+        with pytest.raises(ImproperlyConfigured) as exc:
+            DatabaseWrapper.get_connection_params(wrapper)
+
+        assert key in str(exc.value)
+        if why:
+            assert why in str(exc.value)
+        mock_gl.start.assert_not_called()
+
+
+class TestTlsOptions:
+    """sslmode & co. in OPTIONS are for the database: they go upstream on
+    the proxy's URL, and Django's own connection to the proxy drops them."""
+
+    SETTINGS = {"HOST": "db.example.com", "PORT": "5432", "NAME": "db",
+                "USER": "u", "PASSWORD": "p",
+                "OPTIONS": {"sslmode": "require", "sslrootcert": "/etc/ca.pem"}}
+
+    def test_upstream_url_carries_tls_options(self):
+        assert _build_upstream_url(self.SETTINGS) == (
+            "postgresql://u:p@db.example.com:5432/db"
+            "?sslmode=require&sslrootcert=%2Fetc%2Fca.pem"
+        )
+
+    @patch("goldlapel.django.base.goldlapel")
+    @patch("goldlapel.django.base.PgDatabaseWrapper.get_connection_params")
+    def test_connection_to_proxy_drops_tls_options(self, mock_super, mock_gl):
+        mock_gl.start.return_value.proxy_port = 7932
+        mock_super.return_value = {"host": "db.example.com", "port": 5432,
+                                   "sslmode": "require", "sslrootcert": "/etc/ca.pem",
+                                   "connect_timeout": 5}
+        params = DatabaseWrapper.get_connection_params(_make_wrapper(self.SETTINGS))
+
+        assert "sslmode" not in params and "sslrootcert" not in params
+        assert params["connect_timeout"] == 5
+        upstream = mock_gl.start.call_args[0][0]
+        assert "sslmode=require" in upstream
+
+    @patch("goldlapel.django.base.goldlapel")
+    @patch("goldlapel.django.base.PgDatabaseWrapper.get_connection_params")
+    def test_fallback_keeps_tls_options(self, mock_super, mock_gl):
+        mock_gl.start.side_effect = RuntimeError("no binary")
+        mock_super.return_value = {"host": "db.example.com", "port": 5432,
+                                   "sslmode": "require"}
+        params = DatabaseWrapper.get_connection_params(_make_wrapper(self.SETTINGS))
+        assert params["sslmode"] == "require"
+
+    @patch("goldlapel.django.base.goldlapel")
+    @patch("goldlapel.django.base.PgDatabaseWrapper.get_connection_params")
+    def test_client_tls_keeps_tls_options(self, mock_super, mock_gl):
+        mock_gl.start.return_value.proxy_port = 7932
+        mock_super.return_value = {
+            "host": "db.example.com", "port": 5432, "sslmode": "require",
+            "goldlapel": {"config": {"tls_cert": "/c.pem", "tls_key": "/k.pem"}},
+        }
+        params = DatabaseWrapper.get_connection_params(_make_wrapper(self.SETTINGS))
+        assert params["sslmode"] == "require"

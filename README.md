@@ -44,7 +44,11 @@ Point your Postgres driver at `gl.url`. Gold Lapel sits between your app and you
 
 The proxy listens on two ports: the proxy itself (`proxy_port`, default 7932) and the dashboard (`dashboard_port`, default `proxy_port + 1`; `0` disables it).
 
-Each `start()` for a different upstream spawns its own proxy. Without an explicit `proxy_port`, it takes the next pair no other proxy in the process holds: the first gets 7932 (dashboard 7933), the second 7934 (dashboard 7935), and so on. An explicit `proxy_port` is used as given; stopping a proxy frees its ports.
+Each `start()` for a different upstream spawns its own proxy. Without an explicit `proxy_port`, it takes the first pair that no other proxy in the process holds and nothing else on the machine is listening on: usually 7932 (dashboard 7933), then 7934 (dashboard 7935), and so on. An explicit `proxy_port` is used as given. If something else already holds it, the proxy refuses to start and the error says which port. Stopping a proxy frees its ports.
+
+Calling `start()` again for an upstream that's already running (sync or `goldlapel.asyncio`, from any thread) shares that proxy. It keeps running until every `start()` has been matched by its `stop()`, so leaving one `with` block doesn't pull the proxy out from under other code. `goldlapel.stop(url)` stops it regardless.
+
+`gl.url` leaves out the upstream's TLS settings (`sslmode`, `sslrootcert`, `channel_binding`, …). The proxy still uses them to reach your database, but your app talks to the proxy on localhost, which only accepts TLS when you give it `tls_cert` / `tls_key`. Unknown or removed options raise `TypeError`.
 
 Async usage (`goldlapel.asyncio.start`), context managers, transactional coordination via `gl.using(conn)`, and framework integrations are in the docs.
 

@@ -121,3 +121,79 @@ class TestAsyncEndToEnd:
             coll = f"gl_v02_smoke_async_ctx_{int(time.time() * 1000)}"
             await gl.documents.create_collection(coll, unlogged=True)
         assert not gl.running
+
+
+def _listener():
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("0.0.0.0", 0))
+    sock.listen()
+    return sock
+
+
+class TestPortsAgainstRealProxy:
+    """The proxy refuses a port something else holds; the wrapper must
+    surface that, and auto-assignment must step over such ports."""
+
+    def test_explicit_busy_port_surfaces_the_proxys_refusal(self, pg_url):
+        import goldlapel
+        sock = _listener()
+        port = sock.getsockname()[1]
+        try:
+            with pytest.raises(RuntimeError) as exc:
+                goldlapel.start(pg_url, proxy_port=port, dashboard_port=0, silent=True)
+        finally:
+            sock.close()
+        assert f"port {port}, for the proxy, is already in use" in str(exc.value)
+        assert "exited with status 1" in str(exc.value)
+
+    def test_auto_assignment_steps_over_a_busy_port(self, pg_url):
+        import goldlapel
+        import goldlapel.proxy as proxy_mod
+        import socket
+        first = proxy_mod._pick_proxy_port(None, {})
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("0.0.0.0", first))
+        sock.listen()
+        try:
+            gl = goldlapel.start(pg_url, silent=True)
+            try:
+                assert first not in (gl.proxy_port, gl.dashboard_port)
+                import psycopg2
+                conn = psycopg2.connect(gl.url)
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                assert cur.fetchone() == (1,)
+                conn.close()
+            finally:
+                gl.stop()
+        finally:
+            sock.close()
+
+    def test_upstream_tls_params_stay_upstream(self, pg_url):
+        import goldlapel
+        sep = "&" if "?" in pg_url else "?"
+        upstream = f"{pg_url}{sep}sslmode=prefer&channel_binding=prefer"
+        gl = goldlapel.start(upstream, silent=True)
+        try:
+            assert "sslmode" not in gl.url and "channel_binding" not in gl.url
+            cur = gl.conn.cursor()
+            cur.execute("SELECT 1")
+            assert cur.fetchone() == (1,)
+        finally:
+            gl.stop()
+
+    def test_two_upstreams_each_reach_their_own_database(self, pg_url):
+        import goldlapel
+        sep = "&" if "?" in pg_url else "?"
+        a = goldlapel.start(f"{pg_url}{sep}application_name=gl-a", silent=True)
+        b = goldlapel.start(f"{pg_url}{sep}application_name=gl-b", silent=True)
+        try:
+            assert {a.proxy_port, a.dashboard_port}.isdisjoint({b.proxy_port, b.dashboard_port})
+            for gl, name in ((a, "gl-a"), (b, "gl-b")):
+                cur = gl.conn.cursor()
+                cur.execute("SHOW application_name")
+                assert cur.fetchone()[0] == name
+        finally:
+            a.stop()
+            b.stop()

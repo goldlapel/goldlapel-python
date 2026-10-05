@@ -1,5 +1,11 @@
 import os
 import platform
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -7,6 +13,7 @@ import pytest
 
 import goldlapel.proxy as proxy_mod
 from goldlapel.proxy import (
+    _port_free as _real_port_free,
     _application_name_marker,
     _config_to_args,
     _find_binary,
@@ -159,7 +166,7 @@ class TestMakeProxyUrl:
 
     def test_preserves_params(self):
         url = "postgresql://user:pass@remote:5432/mydb?sslmode=require"
-        assert _make_proxy_url(url, 7932) == f"postgresql://user:pass@localhost:7932/mydb?sslmode=require&{_APP_NAME_SUFFIX}"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:pass@localhost:7932/mydb?{_APP_NAME_SUFFIX}"
 
     def test_preserves_percent_encoded_password(self):
         url = "postgresql://user:p%40ss@remote:5432/mydb"
@@ -187,7 +194,7 @@ class TestMakeProxyUrl:
 
     def test_at_sign_in_password_with_query_params(self):
         url = "postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue"
-        assert _make_proxy_url(url, 7932) == f"postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&{_APP_NAME_SUFFIX}"
+        assert _make_proxy_url(url, 7932) == f"postgresql://user:p@ss@localhost:7932/mydb?param=val@ue&{_APP_NAME_SUFFIX}"
 
     def test_password_starting_with_digit_with_port(self):
         url = "postgresql://user:9password@host:5432/mydb"
@@ -232,9 +239,9 @@ class TestApplicationNameMarker:
         assert f"?{_APP_NAME_SUFFIX}" in out
 
     def test_marker_appended_with_existing_query(self):
-        url = "postgresql://localhost:5432/mydb?sslmode=require"
+        url = "postgresql://localhost:5432/mydb?connect_timeout=5"
         out = _make_proxy_url(url, 7932)
-        assert "sslmode=require" in out
+        assert "connect_timeout=5" in out
         assert f"&{_APP_NAME_SUFFIX}" in out
 
     def test_user_override_via_url_respected(self):
@@ -917,31 +924,6 @@ class TestExplicitPortCollision:
         assert mock_popen.call_count == 1
 
 
-class TestKillOrphanOnPort:
-    def test_only_targets_goldlapel_listeners(self):
-        # lsof ORs its selectors unless -a is given: without it,
-        # `-i :PORT -c goldlapel` matches whatever owns the port *or* every
-        # goldlapel process on the machine.
-        with patch("goldlapel.proxy._port_in_use", return_value=True), \
-             patch("goldlapel.proxy.shutil.which", return_value="/usr/bin/lsof"), \
-             patch("goldlapel.proxy.subprocess.check_output", return_value="") as mock_lsof, \
-             patch("goldlapel.proxy.os.kill") as mock_kill:
-            proxy_mod._kill_orphan_on_port(7934)
-
-        cmd = mock_lsof.call_args[0][0]
-        assert "-a" in cmd
-        assert "-iTCP:7934" in cmd
-        assert "-sTCP:LISTEN" in cmd
-        assert cmd[cmd.index("-c") + 1] == "goldlapel"
-        mock_kill.assert_not_called()
-
-    def test_free_port_skips_lsof(self):
-        with patch("goldlapel.proxy._port_in_use", return_value=False), \
-             patch("goldlapel.proxy.subprocess.check_output") as mock_lsof:
-            proxy_mod._kill_orphan_on_port(7934)
-        mock_lsof.assert_not_called()
-
-
 class TestStartupBanner:
     """Regression tests for the startup banner stream + silent opt-out.
 
@@ -1341,3 +1323,454 @@ class TestPromotedDisableFlags:
     def test_removed_matview_config_keys_rejected(self, key):
         with pytest.raises(ValueError, match="Unknown config keys"):
             _config_to_args({key: True})
+
+
+# -- Port claims, readiness, sharing and cleanup ---------------------------
+
+_SYNC_SPAWN_PATCHES = (
+    ("goldlapel.proxy._find_binary", {"return_value": "/usr/bin/goldlapel"}),
+    ("goldlapel.proxy._kill_orphan_on_port", {}),
+)
+
+
+def _spawn_patches(popen=None, wait=True, driver=True):
+    """Patch the spawn so no binary runs. Returns (ExitStack, Popen mock)."""
+    from contextlib import ExitStack
+    stack = ExitStack()
+    for target, kwargs in _SYNC_SPAWN_PATCHES:
+        stack.enter_context(patch(target, **kwargs))
+    if isinstance(wait, bool):
+        stack.enter_context(patch("goldlapel.proxy._wait_for_port", return_value=wait))
+    else:
+        stack.enter_context(patch("goldlapel.proxy._wait_for_port", side_effect=wait))
+    if driver:
+        stack.enter_context(patch(
+            "goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver(),
+        ))
+    mock_popen = stack.enter_context(patch("goldlapel.proxy.subprocess.Popen"))
+    mock_popen.side_effect = popen or (lambda *a, **kw: _mock_popen())
+    return stack, mock_popen
+
+
+def _exited_popen(status, stderr):
+    proc = MagicMock()
+    proc.poll.return_value = status
+    proc.wait.return_value = status
+    proc.stderr.read.return_value = stderr
+    return proc
+
+
+_REFUSAL = (
+    "I'm afraid port 7940, for the proxy, is already in use — perhaps "
+    "another Gold Lapel. Choose another with --proxy-port.\n"
+).encode()
+
+
+class TestClientUrlDropsUpstreamTls:
+    """The proxy declines client TLS unless it serves it, so the app's URL
+    must not carry the upstream hop's TLS/GSS parameters."""
+
+    def test_ssl_and_channel_binding_dropped_others_kept(self):
+        url = ("postgresql://u:p@db.example.com:5432/app"
+               "?sslmode=require&channel_binding=require&application_name=web")
+        assert _make_proxy_url(url, 7932) == "postgresql://u:p@localhost:7932/app?application_name=web"
+
+    def test_every_tls_and_gss_key_dropped_case_insensitively(self):
+        url = ("postgresql://u:p@h/db?SSLMode=verify-full&sslrootcert=/ca.pem"
+               "&sslcert=/c&sslkey=/k&sslcrl=/l&sslcrldir=/d&sslpassword=x&sslsni=1"
+               "&sslnegotiation=direct&ssl_min_protocol_version=TLSv1.2"
+               "&ssl_max_protocol_version=TLSv1.3&requiressl=1&Channel_Binding=prefer"
+               "&gssencmode=disable&krbsrvname=postgres&gsslib=gssapi&connect_timeout=5")
+        assert _make_proxy_url(url, 7932) == (
+            f"postgresql://u:p@localhost:7932/db?connect_timeout=5&{_APP_NAME_SUFFIX}"
+        )
+
+    def test_url_with_only_tls_params_gets_a_clean_query(self):
+        url = "postgresql://u:p@h:5432/db?sslmode=require"
+        assert _make_proxy_url(url, 7932) == f"postgresql://u:p@localhost:7932/db?{_APP_NAME_SUFFIX}"
+
+    def test_kept_when_proxy_serves_client_tls(self):
+        url = "postgresql://u:p@h:5432/db?sslmode=require"
+        assert _make_proxy_url(url, 7932, client_tls=True) == (
+            f"postgresql://u:p@localhost:7932/db?sslmode=require&{_APP_NAME_SUFFIX}"
+        )
+
+    def test_start_keeps_upstream_tls_and_strips_client_url(self):
+        url = "postgresql://u:p@h:5432/db?sslmode=require&channel_binding=require"
+        stack, mock_popen = _spawn_patches()
+        with stack:
+            gl = start(url, silent=True)
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("--upstream") + 1] == url
+        assert "sslmode" not in gl.url
+        assert "channel_binding" not in gl.url
+
+    def test_start_with_client_tls_keeps_client_url_params(self):
+        stack, _ = _spawn_patches()
+        with stack:
+            gl = start("postgresql://u:p@h:5432/db?sslmode=require", silent=True,
+                       config={"tls_cert": "/c.pem", "tls_key": "/k.pem"})
+        assert "sslmode=require" in gl.url
+
+
+class TestOsLevelPortProbe:
+    def test_probe_sees_a_listener(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("0.0.0.0", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        try:
+            assert _real_port_free(port) is False
+        finally:
+            listener.close()
+        assert _real_port_free(port) is True
+
+    def test_auto_assignment_skips_ports_bound_elsewhere(self, monkeypatch):
+        # 7932 and 7935 are held by something outside this process.
+        monkeypatch.setattr(proxy_mod, "_port_free", lambda port: port not in (7932, 7935))
+        stack, _ = _spawn_patches()
+        with stack:
+            a = start("postgresql://host-a:5432/db_a", silent=True)
+            b = start("postgresql://host-b:5432/db_b", silent=True)
+        assert (a.proxy_port, a.dashboard_port) == (7933, 7934)
+        assert (b.proxy_port, b.dashboard_port) == (7936, 7937)
+
+    def test_explicit_dashboard_only_probes_the_proxy_port(self, monkeypatch):
+        monkeypatch.setattr(proxy_mod, "_port_free", lambda port: port != 7932)
+        stack, _ = _spawn_patches()
+        with stack:
+            gl = start("postgresql://host-a:5432/db_a", dashboard_port=9000, silent=True)
+        assert gl.proxy_port == 7933
+
+
+class TestReadiness:
+    """A start succeeds only if the port answers and the spawned proxy is
+    still alive — otherwise its exit status and stderr are surfaced."""
+
+    def test_exited_proxy_fails_even_if_port_answers(self):
+        # The port answered — but it was some other listener: our proxy
+        # refused the port and exited.
+        stack, _ = _spawn_patches(popen=lambda *a, **kw: _exited_popen(1, _REFUSAL))
+        url = "postgresql://host:5432/db"
+        with stack, pytest.raises(RuntimeError) as exc:
+            start(url, silent=True)
+        msg = str(exc.value)
+        assert "exited with status 1" in msg
+        assert "already in use" in msg
+        assert url not in proxy_mod._instances
+        assert not proxy_mod._live
+
+    def test_busy_port_waits_for_the_proxy_to_refuse(self, monkeypatch):
+        # An explicit port something else listens on: a connect would
+        # reach that listener, so readiness waits for the proxy's verdict.
+        monkeypatch.setattr(proxy_mod, "_port_free", lambda port: port != 7940)
+        proc = _exited_popen(None, _REFUSAL)
+        proc.wait.side_effect = lambda timeout=None: setattr(proc.poll, "return_value", 1) or 1
+        stack, _ = _spawn_patches(popen=lambda *a, **kw: proc)
+        with stack, patch("goldlapel.proxy._wait_for_port") as mock_wait, \
+                pytest.raises(RuntimeError) as exc:
+            start("postgresql://host:5432/db", proxy_port=7940, silent=True)
+        mock_wait.assert_not_called()
+        assert "status 1" in str(exc.value)
+        assert "port 7940, for the proxy, is already in use" in str(exc.value)
+
+    def test_busy_port_proxy_that_never_exits_is_killed(self, monkeypatch):
+        monkeypatch.setattr(proxy_mod, "_port_free", lambda port: port != 7940)
+        proc = _exited_popen(None, b"")
+        proc.wait.side_effect = subprocess.TimeoutExpired("goldlapel", 10)
+        stack, _ = _spawn_patches(popen=lambda *a, **kw: proc)
+        with stack, pytest.raises(RuntimeError, match="port 7940 was already in use"):
+            start("postgresql://host:5432/db", proxy_port=7940, silent=True)
+        proc.kill.assert_called()
+        assert not proxy_mod._live
+
+    def test_wait_for_port_returns_when_process_exits(self):
+        proc = MagicMock()
+        proc.poll.return_value = 1
+        began = time.monotonic()
+        assert _wait_for_port("127.0.0.1", 1, timeout=5.0, process=proc) is False
+        assert time.monotonic() - began < 1.0
+
+
+class TestConcurrentStarts:
+    """Threads starting the same upstream at once share one proxy: the
+    late arrival waits for the start in progress and gets the finished
+    instance — never a second spawn, never url/conn still None."""
+
+    def test_late_arrival_waits_and_shares(self):
+        def slow_wait(*args, **kwargs):
+            time.sleep(0.3)
+            return True
+
+        stack, mock_popen = _spawn_patches(wait=slow_wait)
+        url = "postgresql://host:5432/db"
+        results, errors = [], []
+
+        def run():
+            try:
+                results.append(start(url, silent=True))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with stack:
+            threads = [threading.Thread(target=run) for _ in range(2)]
+            threads[0].start()
+            time.sleep(0.1)
+            threads[1].start()
+            for t in threads:
+                t.join()
+
+        assert not errors
+        assert mock_popen.call_count == 1
+        a, b = results
+        assert a is b
+        assert a.url is not None and a._conn is not None
+        assert a._holders == 2
+
+    def test_late_arrival_starts_its_own_after_a_failed_start(self):
+        outcomes = iter([False, True])
+
+        def wait(*args, **kwargs):
+            time.sleep(0.3)
+            return next(outcomes)
+
+        stack, mock_popen = _spawn_patches(wait=wait)
+        url = "postgresql://host:5432/db"
+        results, errors = [], []
+
+        def run():
+            try:
+                results.append(start(url, silent=True))
+            except RuntimeError as exc:
+                errors.append(exc)
+
+        with stack:
+            threads = [threading.Thread(target=run) for _ in range(2)]
+            threads[0].start()
+            time.sleep(0.1)
+            threads[1].start()
+            for t in threads:
+                t.join()
+
+        assert len(errors) == 1 and len(results) == 1
+        assert mock_popen.call_count == 2
+        assert proxy_mod._instances[url] is results[0]
+        assert results[0].running
+
+
+class TestDirectInstancesClaimPorts:
+    """A GoldLapel constructed directly claims its ports on start() like a
+    factory-started one, and releases them on stop()."""
+
+    def test_direct_start_claims_its_pair(self):
+        stack, _ = _spawn_patches()
+        with stack:
+            direct = GoldLapel("postgresql://host-a:5432/db_a", silent=True)
+            direct.start()
+            b = start("postgresql://host-b:5432/db_b", silent=True)
+            assert direct.proxy_port == 7932
+            assert b.proxy_port == 7934
+
+            direct.stop()
+            c = start("postgresql://host-c:5432/db_c", silent=True)
+            assert c.proxy_port == 7932
+
+    def test_two_direct_instances_get_distinct_pairs(self):
+        stack, _ = _spawn_patches()
+        with stack:
+            a = GoldLapel("postgresql://host-a:5432/db_a", silent=True)
+            b = GoldLapel("postgresql://host-b:5432/db_b", silent=True)
+            a.start()
+            b.start()
+        assert (a.proxy_port, b.proxy_port) == (7932, 7934)
+
+    def test_direct_explicit_port_held_by_another_proxy_raises(self):
+        stack, mock_popen = _spawn_patches()
+        with stack:
+            start("postgresql://host-a:5432/db_a", silent=True)
+            direct = GoldLapel("postgresql://host-b:5432/db_b", proxy_port=7933)
+            with pytest.raises(RuntimeError, match="port 7933"):
+                direct.start()
+        assert mock_popen.call_count == 1
+
+
+class TestSharedProxyHolders:
+    """Every start() of a running upstream shares its proxy; each stop()
+    gives up one hold and the last one stops the proxy."""
+
+    def test_stop_by_one_holder_keeps_the_proxy_for_the_other(self):
+        stack, _ = _spawn_patches()
+        url = "postgresql://host:5432/db"
+        with stack:
+            first = start(url, silent=True)
+            second = start(url, silent=True)
+            process = first._process
+
+            second.stop()
+            assert first.running
+            process.terminate.assert_not_called()
+            assert proxy_mod._instances[url] is first
+
+            first.stop()
+        process.terminate.assert_called_once()
+        assert url not in proxy_mod._instances
+        assert not proxy_mod._live
+
+    def test_with_block_on_a_shared_proxy_leaves_it_running(self):
+        stack, _ = _spawn_patches()
+        url = "postgresql://host:5432/db"
+        with stack:
+            outer = start(url, silent=True)
+            with start(url, silent=True):
+                pass
+            assert outer.running
+
+    def test_module_stop_stops_outright(self):
+        stack, _ = _spawn_patches()
+        url = "postgresql://host:5432/db"
+        with stack:
+            gl = start(url, silent=True)
+            start(url, silent=True)
+            process = gl._process
+            stop(url)
+        process.terminate.assert_called_once()
+        assert not gl.running
+        assert not proxy_mod._live
+
+
+class TestInterruptedStartReleasesPorts:
+    @pytest.mark.parametrize("where", ["readiness", "connect"])
+    def test_keyboard_interrupt_releases_everything(self, where):
+        procs = []
+
+        def popen(*args, **kwargs):
+            procs.append(_mock_popen())
+            return procs[-1]
+
+        wait = True
+        if where == "readiness":
+            def wait(*args, **kwargs):
+                raise KeyboardInterrupt
+        stack, _ = _spawn_patches(popen=popen, wait=wait, driver=False)
+        driver_name, driver = _mock_driver()
+        if where == "connect":
+            driver.connect.side_effect = KeyboardInterrupt
+        url = "postgresql://host:5432/db"
+        with stack, patch("goldlapel.proxy._detect_sync_driver",
+                          return_value=(driver_name, driver)):
+            with pytest.raises(KeyboardInterrupt):
+                start(url, silent=True)
+        procs[0].terminate.assert_called_once()
+        assert url not in proxy_mod._instances
+        assert not proxy_mod._live
+
+    def test_invalid_option_claims_nothing(self):
+        stack, mock_popen = _spawn_patches()
+        url = "postgresql://host:5432/db"
+        with stack:
+            with pytest.raises(ValueError, match="log_level"):
+                start(url, log_level="loud")
+            assert url not in proxy_mod._instances
+            assert not proxy_mod._live
+            assert start("postgresql://other:5432/db", silent=True).proxy_port == 7932
+        mock_popen.assert_called_once()
+
+
+class TestUnknownOptions:
+    @pytest.mark.parametrize("factory", [
+        lambda **kw: start("postgresql://host:5432/db", **kw),
+        lambda **kw: GoldLapel("postgresql://host:5432/db", **kw),
+    ])
+    def test_removed_option_says_why(self, factory):
+        with pytest.raises(TypeError) as exc:
+            factory(invalidation_port=7934)
+        assert "Unknown Gold Lapel options: invalidation_port (removed with the in-process cache)" in str(exc.value)
+
+    def test_unknown_option_named(self):
+        with pytest.raises(TypeError, match="Unknown Gold Lapel options: disable_matviews .*materialized views.*, prot$"):
+            start("postgresql://host:5432/db", prot=1, disable_matviews=True)
+
+
+def _fake_proc_entry(root, pid, ppid, argv):
+    d = root / str(pid)
+    d.mkdir()
+    (d / "stat").write_bytes(f"{pid} (goldlapel) S {ppid} {pid} {pid} 0 -1".encode())
+    (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+
+
+class TestKillOrphanOnPort:
+    """Only a true orphan of this upstream is stopped: a goldlapel process
+    reparented to init whose --upstream and --proxy-port are ours."""
+
+    UPSTREAM = "postgresql://u:p@db:5432/app"
+
+    @pytest.fixture
+    def fake_proc(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(proxy_mod, "_PROC", str(tmp_path))
+        monkeypatch.setattr(proxy_mod, "_port_in_use", lambda port: True)
+        killed = []
+
+        def fake_kill(pid, sig):
+            killed.append(pid)
+            import shutil
+            shutil.rmtree(tmp_path / str(pid))
+
+        monkeypatch.setattr(proxy_mod.os, "kill", fake_kill)
+        return tmp_path, killed
+
+    def _argv(self, upstream=None, port="7932", binary="/opt/bin/goldlapel-linux-x86_64"):
+        return [binary, "--upstream", upstream or self.UPSTREAM, "--proxy-port", port]
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="orphans are only detected on Linux")
+    def test_kills_orphan_of_this_upstream_only(self, fake_proc):
+        root, killed = fake_proc
+        _fake_proc_entry(root, 501, 1, self._argv())                      # orphan: ours
+        _fake_proc_entry(root, 502, 4242, self._argv())                   # another live app's
+        _fake_proc_entry(root, 503, os.getpid(), self._argv())            # our own child
+        _fake_proc_entry(root, 504, 1, self._argv(upstream="postgresql://other/db"))
+        _fake_proc_entry(root, 505, 1, self._argv(port="7934"))
+        _fake_proc_entry(root, 506, 1, self._argv(binary="/usr/bin/python3"))
+
+        began = time.monotonic()
+        proxy_mod._kill_orphan_on_port(7932, self.UPSTREAM)
+
+        assert killed == [501]
+        assert time.monotonic() - began < 1.5
+
+    def test_no_kill_off_linux(self, fake_proc, monkeypatch):
+        root, killed = fake_proc
+        _fake_proc_entry(root, 501, 1, self._argv())
+        monkeypatch.setattr(proxy_mod.sys, "platform", "darwin")
+        proxy_mod._kill_orphan_on_port(7932, self.UPSTREAM)
+        assert killed == []
+
+    def test_free_port_skips_the_scan(self, monkeypatch):
+        monkeypatch.setattr(proxy_mod, "_port_in_use", lambda port: False)
+        with patch("goldlapel.proxy.os.listdir") as listdir:
+            proxy_mod._kill_orphan_on_port(7932, self.UPSTREAM)
+        listdir.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-only")
+class TestSpawnOutlivesStartingThread:
+    def test_proxy_survives_the_thread_that_started_it(self):
+        # PR_SET_PDEATHSIG fires when the spawning *thread* exits: a proxy
+        # started from a short-lived thread (a request thread) must not die
+        # with it.
+        box = {}
+
+        def run():
+            box["proc"] = proxy_mod._popen(
+                ["sleep", "30"], preexec_fn=proxy_mod._set_pdeathsig,
+            )
+
+        t = threading.Thread(target=run)
+        t.start()
+        t.join()
+        proc = box["proc"]
+        try:
+            time.sleep(0.3)
+            assert proc.poll() is None
+        finally:
+            proc.kill()
+            proc.wait()

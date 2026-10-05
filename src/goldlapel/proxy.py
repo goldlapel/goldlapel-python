@@ -1,6 +1,7 @@
 import atexit
 import os
 import platform
+import queue
 import re
 import shutil
 import signal
@@ -65,10 +66,39 @@ _LOG_LEVEL_TO_VERBOSE = {
     "error": None,
 }
 
+# Options `goldlapel.start` / `GoldLapel(...)` no longer take, with why —
+# named in the error a caller gets for passing one.
+_REMOVED_OPTIONS = {
+    "invalidation_port": "removed with the in-process cache",
+    "disable_native_cache": "removed with the in-process cache",
+    "native_cache": "removed with the in-process cache",
+    "native_cache_size": "removed with the in-process cache",
+    "aggressive_verify": "removed with the in-process cache",
+    "disable_matviews": "removed: the proxy no longer builds materialized views",
+}
+
+# Connection parameters for the proxy's TLS/GSS hop to the upstream. The
+# client URL handed to the app drops them: the proxy declines client TLS
+# unless it was given --tls-cert/--tls-key, so `?sslmode=require` (every
+# Neon / Supabase / RDS URL) would fail the app's connection to it.
+_UPSTREAM_ONLY_PARAMS = frozenset({
+    "sslmode", "sslcert", "sslkey", "sslrootcert", "sslcrl", "sslcrldir",
+    "sslpassword", "sslsni", "sslnegotiation", "ssl_min_protocol_version",
+    "ssl_max_protocol_version", "requiressl", "channel_binding",
+    "gssencmode", "krbsrvname", "gsslib",
+})
+
+# Proxies started by the factories (`goldlapel.start`, `goldlapel.asyncio.start`),
+# by upstream. An entry whose `_ready` event is unset is still starting.
 _instances = {}
+# Every GoldLapel holding its ports — factory-started or constructed
+# directly — from the moment it picks them until it stops.
+_live = set()
 _cleanup_registered = False
-_lock = threading.Lock()
+_lock = threading.RLock()
 _utils_mod = None
+_spawner = None
+_spawner_lock = threading.Lock()
 
 
 def _utils():
@@ -111,6 +141,48 @@ def _config_to_args(config):
             args.extend([flag, str(value)])
 
     return args
+
+
+def _unknown_options_message(names, prefix=""):
+    """Error text for options Gold Lapel doesn't take — saying why, for
+    the ones that were removed. `prefix` is stripped before the lookup
+    (`goldlapel_` for SQLAlchemy engine kwargs)."""
+    described = []
+    for name in sorted(names):
+        reason = _REMOVED_OPTIONS.get(name[len(prefix):] if name.startswith(prefix) else name)
+        described.append(f"{name} ({reason})" if reason else name)
+    return f"Unknown Gold Lapel options: {', '.join(described)}"
+
+
+def _reject_unknown_options(unknown):
+    if unknown:
+        raise TypeError(_unknown_options_message(unknown))
+
+
+def _client_tls(config, extra_args):
+    """True when the proxy is told to serve TLS to its clients
+    (`tls_cert`/`tls_key` in `config`, or the flags in `extra_args`) — then
+    the app's URL keeps its TLS parameters."""
+    config = config or {}
+    extra_args = extra_args or []
+    return bool(
+        config.get("tls_cert") or config.get("tls_key")
+        or "--tls-cert" in extra_args or "--tls-key" in extra_args
+    )
+
+
+def _strip_upstream_only_params(url):
+    """`url` without the query parameters in _UPSTREAM_ONLY_PARAMS (keys
+    compared case-insensitively). Everything else is kept byte for byte."""
+    m = re.match(r'^([^?#]*)\?([^#]*)(#.*)?$', url)
+    if not m:
+        return url
+    kept = [
+        param for param in m.group(2).split("&")
+        if param and param.split("=", 1)[0].lower() not in _UPSTREAM_ONLY_PARAMS
+    ]
+    query = "?" + "&".join(kept) if kept else ""
+    return f"{m.group(1)}{query}{m.group(3) or ''}"
 
 
 def _log_level_to_verbose_flag(level):
@@ -266,10 +338,14 @@ def _inject_application_name(url):
     return f"{url}{sep}application_name={marker}"
 
 
-def _make_proxy_url(upstream, port):
+def _make_proxy_url(upstream, port, client_tls=False):
     # Build a proxy URL: replace host with localhost and set the proxy port.
     # Uses regex instead of urlparse to avoid decoding percent-encoded characters
     # in passwords (e.g. %40 for @), which would corrupt the URL on reconstruction.
+    # TLS/GSS parameters are for the proxy's upstream hop and are dropped
+    # unless the proxy serves client TLS (see _UPSTREAM_ONLY_PARAMS).
+    if not client_tls:
+        upstream = _strip_upstream_only_params(upstream)
 
     # pg URL with explicit port: scheme://[userinfo@]host:PORT[/path][?query]
     # The port must be followed by /, ?, #, or end-of-string — not alphanumeric chars.
@@ -294,9 +370,13 @@ def _make_proxy_url(upstream, port):
     return f"localhost:{port}"
 
 
-def _wait_for_port(host, port, timeout):
+def _wait_for_port(host, port, timeout, process=None):
+    """True once `port` accepts a connection. False on timeout, or as soon
+    as `process` (the proxy being started) has exited."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            return False
         try:
             sock = socket.create_connection((host, port), timeout=0.5)
             sock.close()
@@ -315,25 +395,76 @@ def _port_in_use(port):
         return False
 
 
-def _kill_orphan_on_port(port):
-    if not _port_in_use(port):
+def _port_free(port):
+    """True if `port` can be bound on all interfaces right now — the probe
+    the proxy itself makes before it starts. SO_REUSEADDR (as Rust's std
+    sets it on Unix) so a port with only TIME_WAIT connections counts as
+    free; it never lets a bind share a port another socket listens on."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name != "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+_PROC = "/proc"
+
+
+def _arg_value(argv, flag):
+    try:
+        return argv[argv.index(flag) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _kill_orphan_on_port(port, upstream):
+    """Stop a proxy an earlier run of this app left behind: a `goldlapel`
+    process started for `upstream` on `port` whose parent has gone (it was
+    reparented to init, pid 1). Never another live app's proxy, never one
+    of our own children. Linux only — /proc gives each process's parent and
+    exact argv. Elsewhere nothing is killed; the proxy refuses the busy port
+    and says so."""
+    if sys.platform != "linux" or os.getpid() == 1 or not _port_in_use(port):
         return
-    if shutil.which("lsof"):
+    killed = []
+    try:
+        entries = os.listdir(_PROC)
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.isdigit():
+            continue
         try:
-            # -a ANDs the selectors (lsof ORs them by default): only a
-            # goldlapel process listening on this port, never whatever else
-            # holds it or every goldlapel process on the machine.
-            out = subprocess.check_output(
-                ["lsof", "-a", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-c", "goldlapel"],
-                stderr=subprocess.DEVNULL, text=True,
-            )
-            for pid_str in out.strip().split():
-                pid = int(pid_str)
-                if pid != os.getpid():
-                    os.kill(pid, signal.SIGTERM)
-            time.sleep(0.5)
-        except (subprocess.CalledProcessError, ValueError, OSError):
+            with open(os.path.join(_PROC, entry, "stat"), "rb") as f:
+                stat = f.read()
+            with open(os.path.join(_PROC, entry, "cmdline"), "rb") as f:
+                cmdline = f.read()
+            # Fields after the parenthesised command name: state, ppid, ...
+            ppid = int(stat.rsplit(b")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        argv = [arg.decode(errors="surrogateescape") for arg in cmdline.rstrip(b"\0").split(b"\0")]
+        if (
+            ppid != 1
+            or not os.path.basename(argv[0]).startswith("goldlapel")
+            or _arg_value(argv, "--upstream") != upstream
+            or _arg_value(argv, "--proxy-port") != str(port)
+        ):
+            continue
+        try:
+            os.kill(int(entry), signal.SIGTERM)
+            killed.append(int(entry))
+        except OSError:
             pass
+    deadline = time.monotonic() + 2.0
+    while killed and time.monotonic() < deadline:
+        time.sleep(_STARTUP_POLL_INTERVAL)
+        killed = [pid for pid in killed if os.path.exists(os.path.join(_PROC, str(pid)))]
 
 
 def _redact_password(url):
@@ -342,13 +473,15 @@ def _redact_password(url):
     return re.sub(r'^([^:/?#]+://[^:/?#@]*:).*@', r'\1***@', url)
 
 
-def _claimed_ports():
+def _claimed_ports(exclude=None):
     """Ports held by the proxies this process has started (or is starting),
-    as {port: (upstream, "proxy" | "dashboard")}: each one's proxy port plus
-    its dashboard port (none when disabled with 0). A proxy whose process has
-    exited holds nothing. Caller holds `_lock`."""
+    other than `exclude`, as {port: (upstream, "proxy" | "dashboard")}: each
+    one's proxy port plus its dashboard port (none when disabled with 0). A
+    proxy whose process has exited holds nothing. Caller holds `_lock`."""
     claimed = {}
-    for inst in _instances.values():
+    for inst in _live:
+        if inst is exclude:
+            continue
         if inst._process is not None and inst._process.poll() is not None:
             continue
         claimed[int(inst._proxy_port)] = (inst._upstream, "proxy")
@@ -357,12 +490,10 @@ def _claimed_ports():
     return claimed
 
 
-def _check_ports_free(proxy_port, dashboard_port):
+def _check_ports_free(proxy_port, dashboard_port, claimed):
     """Raise if the proxy or dashboard port a new proxy would listen on is
-    held by another live proxy of this process. Without this an explicit
-    port would hand the caller the other upstream's proxy, or the stale-proxy
-    cleanup would kill it. Caller holds `_lock`."""
-    claimed = _claimed_ports()
+    held by another live proxy of this process (`claimed`). Without this an
+    explicit port would hand the caller the other upstream's proxy."""
     proxy_port = int(proxy_port)
     if dashboard_port is None:
         dashboard_port = proxy_port + 1
@@ -377,21 +508,22 @@ def _check_ports_free(proxy_port, dashboard_port):
             )
 
 
-def _pick_proxy_port(dashboard_port):
+def _pick_proxy_port(dashboard_port, claimed):
     """Auto-assign a proxy port: the smallest P >= DEFAULT_PROXY_PORT such
     that neither P nor its dashboard port (P + 1 unless `dashboard_port` is
-    given) is claimed by another proxy of this process. An explicit dashboard
-    port is the caller's choice, so only P is checked against the claims.
-    Caller holds `_lock`."""
-    claimed = _claimed_ports()
+    given) is claimed by another proxy of this process, and both can be
+    bound right now — so another app's proxy, or anything else listening,
+    is stepped over too. An explicit dashboard port is the caller's choice,
+    so only P is checked."""
     for port in range(DEFAULT_PROXY_PORT, 65535):
         if port in claimed:
             continue
         if dashboard_port is None:
-            if port + 1 not in claimed:
-                return port
-        elif port != int(dashboard_port):
-            return port
+            if port + 1 in claimed or not (_port_free(port) and _port_free(port + 1)):
+                continue
+        elif port == int(dashboard_port) or not _port_free(port):
+            continue
+        return port
     raise RuntimeError("Gold Lapel could not find a free proxy port")
 
 
@@ -404,6 +536,53 @@ def _set_pdeathsig():
             libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
         except Exception:
             pass
+
+
+def _spawn_loop(requests):
+    while True:
+        cmd, kwargs, result, done = requests.get()
+        try:
+            result["process"] = subprocess.Popen(cmd, **kwargs)
+        except BaseException as exc:
+            result["error"] = exc
+        finally:
+            done.set()
+
+
+def _popen(cmd, **kwargs):
+    """subprocess.Popen — on Linux from one long-lived thread. The proxy's
+    PR_SET_PDEATHSIG fires when the *thread* that spawned it exits, not the
+    process: started from a short-lived thread (a request thread of Django's
+    runserver, a pool worker that is retired) the proxy would die with it."""
+    global _spawner
+    if sys.platform != "linux":
+        return subprocess.Popen(cmd, **kwargs)
+    with _spawner_lock:
+        # After a fork the old thread is gone (is_alive() is False in the
+        # child), so the child starts its own.
+        if _spawner is None or not _spawner[0].is_alive():
+            requests = queue.Queue()
+            thread = threading.Thread(
+                target=_spawn_loop, args=(requests,), name="goldlapel-spawner", daemon=True,
+            )
+            thread.start()
+            _spawner = (thread, requests)
+        requests = _spawner[1]
+    result, done = {}, threading.Event()
+    requests.put((cmd, kwargs, result, done))
+    done.wait()
+    if "error" in result:
+        raise result["error"]
+    return result["process"]
+
+
+def _stderr_tail(process, lines=20):
+    try:
+        text = process.stderr.read().decode(errors="replace")
+        process.stderr.close()
+    except Exception:
+        return ""
+    return "\n".join(text.strip().splitlines()[-lines:])
 
 
 class GoldLapel:
@@ -427,8 +606,13 @@ class GoldLapel:
         disable_proxy_cache=False,
         disable_sqloptimize=False,
         disable_auto_indexes=False,
+        **unknown,
     ):
+        _reject_unknown_options(unknown)
         self._upstream = upstream
+        # Without an explicit proxy_port, start() assigns the first free
+        # pair; 7932 is the answer when nothing else holds it.
+        self._proxy_port_explicit = proxy_port is not None
         self._proxy_port = proxy_port if proxy_port is not None else DEFAULT_PROXY_PORT
 
         # Dashboard port defaults to proxyPort + 1 when unset. An explicit
@@ -481,6 +665,12 @@ class GoldLapel:
         self._process = None
         self._proxy_url = None
         self._conn = None
+        # Callers sharing this proxy: every start() of a running upstream
+        # adds one, every stop() drops one, the last one stops the proxy.
+        self._holders = 1
+        # Set once a factory start of this instance has finished, either
+        # way; concurrent starts of the same upstream wait on it.
+        self._ready = threading.Event()
         # Dashboard token — resolved at start() time. When we spawn the proxy
         # ourselves, we generate a random token per-session and pass it via
         # env. When the proxy is externally launched, we read the token from
@@ -546,10 +736,37 @@ class GoldLapel:
         return self.conn  # raises if not started
 
     def start(self):
-        if self._process and self._process.poll() is None:
+        if self.running:
             return self._proxy_url
+        self._spawn()
+        # If connect() raises (network hiccup, bad creds, KeyboardInterrupt,
+        # ...) the subprocess is already running and would leak, holding its
+        # ports. Clean it up before re-raising.
+        try:
+            self._open_conn()
+        except BaseException:
+            self._kill_process()
+            self._release_ports()
+            raise
+        self._print_banner()
+        return self._proxy_url
 
-        binary = _find_binary()
+    def _open_conn(self):
+        driver_name, driver = _detect_sync_driver()
+        # The factory entry point `goldlapel.start(url)` raises ImportError if no
+        # driver is available, so in that flow `driver` is always non-None here.
+        # This guard protects direct `GoldLapel(...)` construction (a supported
+        # public entry point, re-exported from `goldlapel.__init__`), which doesn't
+        # pre-check: without a driver we skip opening the internal connection, and
+        # the user can still use `gl.url` with their own async/raw driver.
+        if driver is None:
+            return
+        if driver_name == "psycopg3":
+            self._conn = driver.connect(self._proxy_url, autocommit=True)
+        else:
+            self._conn = driver.connect(self._proxy_url)
+
+    def _command(self, binary):
         cmd = [
             binary,
             "--upstream", self._upstream,
@@ -584,100 +801,159 @@ class GoldLapel:
             cmd.append("--disable-sqloptimize")
         if self._disable_auto_indexes:
             cmd.append("--disable-auto-indexes")
-        cmd += _config_to_args(self._config) + self._extra_args
+        return cmd + _config_to_args(self._config) + self._extra_args
 
-        _kill_orphan_on_port(self._proxy_port)
+    def _claim_ports(self):
+        """Pick this proxy's ports (unless given) and claim them, so no
+        other proxy of this process is handed them until it stops."""
+        global _cleanup_registered
+        with _lock:
+            claimed = _claimed_ports(exclude=self)
+            dashboard_port = self._dashboard_port if self._dashboard_port_explicit else None
+            if not self._proxy_port_explicit:
+                self._proxy_port = _pick_proxy_port(dashboard_port, claimed)
+                if dashboard_port is None:
+                    self._dashboard_port = self._proxy_port + 1
+            _check_ports_free(self._proxy_port, dashboard_port, claimed)
+            _live.add(self)
+            if not _cleanup_registered:
+                atexit.register(_cleanup)
+                _cleanup_registered = True
 
-        env = os.environ.copy()
-        # GOLDLAPEL_CLIENT env var is only set when the user hasn't opted in
-        # via the top-level `client` kwarg (which emits --client and takes
-        # precedence over the env var).
-        if self._client is None:
-            env.setdefault("GOLDLAPEL_CLIENT", "python")
-        # Pass api_key to the binary as an env var rather than CLI flag so
-        # it doesn't show up in `ps` output (credentials hygiene). The
-        # Rust binary reads `GOLDLAPEL_API_KEY` at startup and uses it
-        # to fetch + auto-renew the license from HQ. Pre-set env wins
-        # (caller may already have it set deliberately).
-        if self._api_key is not None:
-            env["GOLDLAPEL_API_KEY"] = self._api_key
-        # Provision a session-scoped dashboard token so the wrapper can call
-        # /api/ddl/* without depending on ~/.goldlapel/dashboard-token. Pre-set
-        # env wins (user may already have a token they want to use).
-        if "GOLDLAPEL_DASHBOARD_TOKEN" in env and env["GOLDLAPEL_DASHBOARD_TOKEN"]:
-            self._dashboard_token = env["GOLDLAPEL_DASHBOARD_TOKEN"]
-        else:
-            import secrets
-            self._dashboard_token = secrets.token_hex(32)
-            env["GOLDLAPEL_DASHBOARD_TOKEN"] = self._dashboard_token
-        popen_kwargs = dict(
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        if sys.platform == "linux":
-            popen_kwargs["preexec_fn"] = _set_pdeathsig
-        self._process = subprocess.Popen(cmd, **popen_kwargs)
+    def _release_ports(self):
+        with _lock:
+            _live.discard(self)
 
-        if not _wait_for_port("127.0.0.1", self._proxy_port, _STARTUP_TIMEOUT):
-            self._process.kill()
-            stderr = self._process.stderr.read().decode(errors="replace")
-            self._process.stderr.close()
-            raise RuntimeError(
-                f"Gold Lapel failed to start on port {self._proxy_port} "
-                f"within {_STARTUP_TIMEOUT}s.\nstderr: {stderr}"
+    def _spawn(self):
+        """Claim ports, spawn the proxy and wait until it serves them.
+        Shared by the sync and async starts. Any failure — KeyboardInterrupt
+        and cancellation included — kills the child and releases the ports."""
+        # Validate everything that can be validated before claiming anything.
+        binary = _find_binary()
+        self._command(binary)
+        self._claim_ports()
+        try:
+            cmd = self._command(binary)
+            _kill_orphan_on_port(self._proxy_port, self._upstream)
+            busy = [
+                port for port in (self._proxy_port, self._dashboard_port)
+                if port and not _port_free(port)
+            ]
+
+            env = os.environ.copy()
+            # GOLDLAPEL_CLIENT env var is only set when the user hasn't opted in
+            # via the top-level `client` kwarg (which emits --client and takes
+            # precedence over the env var).
+            if self._client is None:
+                env.setdefault("GOLDLAPEL_CLIENT", "python")
+            # Pass api_key to the binary as an env var rather than CLI flag so
+            # it doesn't show up in `ps` output (credentials hygiene). The
+            # Rust binary reads `GOLDLAPEL_API_KEY` at startup and uses it
+            # to fetch + auto-renew the license from HQ.
+            if self._api_key is not None:
+                env["GOLDLAPEL_API_KEY"] = self._api_key
+            # Provision a session-scoped dashboard token so the wrapper can call
+            # /api/ddl/* without depending on ~/.goldlapel/dashboard-token. Pre-set
+            # env wins (user may already have a token they want to use).
+            if "GOLDLAPEL_DASHBOARD_TOKEN" in env and env["GOLDLAPEL_DASHBOARD_TOKEN"]:
+                self._dashboard_token = env["GOLDLAPEL_DASHBOARD_TOKEN"]
+            else:
+                import secrets
+                self._dashboard_token = secrets.token_hex(32)
+                env["GOLDLAPEL_DASHBOARD_TOKEN"] = self._dashboard_token
+            popen_kwargs = dict(
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
+            if sys.platform == "linux":
+                popen_kwargs["preexec_fn"] = _set_pdeathsig
+            self._process = _popen(cmd, **popen_kwargs)
+            self._wait_ready(busy)
+            self._process.stderr.close()
+            self._proxy_url = _make_proxy_url(
+                self._upstream, self._proxy_port,
+                client_tls=_client_tls(self._config, self._extra_args),
+            )
+            self._holders = 1
+        except BaseException:
+            self._kill_process()
+            self._release_ports()
+            raise
 
-        self._process.stderr.close()
-        self._proxy_url = _make_proxy_url(self._upstream, self._proxy_port)
-
-        driver_name, driver = _detect_sync_driver()
-        # The factory entry point `goldlapel.start(url)` raises ImportError if no
-        # driver is available, so in that flow `driver` is always non-None here.
-        # This guard protects direct `GoldLapel(...)` construction (a supported
-        # public entry point, re-exported from `goldlapel.__init__`), which doesn't
-        # pre-check: without a driver we skip opening the internal connection, and
-        # the user can still use `gl.url` with their own async/raw driver.
-        if driver is not None:
-            # If driver.connect() raises (network hiccup, bad creds, auth failure, etc.),
-            # the subprocess is already running and would leak. Clean it up before re-raising.
+    def _wait_ready(self, busy):
+        """Return once the proxy answers on its port and is still alive;
+        otherwise raise with its exit status and the tail of its stderr
+        (where the proxy says why — e.g. a port already in use)."""
+        port = self._proxy_port
+        if busy:
+            # Something already listens on a port this proxy needs, so a
+            # connect would reach it, not our proxy. The proxy refuses a
+            # busy port and exits: wait for that.
             try:
-                if driver_name == "psycopg3":
-                    self._conn = driver.connect(self._proxy_url, autocommit=True)
-                else:
-                    self._conn = driver.connect(self._proxy_url)
-            except BaseException:
-                # Kill the subprocess we just spawned; leaked running processes = port
-                # collisions on retry + zombie resources. BaseException catches KeyboardInterrupt too.
-                try:
-                    self._process.terminate()
-                    try:
-                        self._process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        self._process.kill()
-                        self._process.wait()
-                finally:
-                    self._process = None
-                    self._proxy_url = None
-                raise
+                self._process.wait(timeout=_STARTUP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                pass
+        elif (
+            _wait_for_port("127.0.0.1", port, _STARTUP_TIMEOUT, self._process)
+            and self._process.poll() is None
+        ):
+            return
+        status = self._process.poll()
+        if status is None:
+            self._process.kill()
+            reason = f"within {_STARTUP_TIMEOUT}s"
+            if busy:
+                reason += f" (port {busy[0]} was already in use)"
+        else:
+            reason = f"— the proxy exited with status {status}"
+        raise RuntimeError(
+            f"Gold Lapel failed to start on port {port} {reason}.\n"
+            f"stderr: {_stderr_tail(self._process)}"
+        )
 
+    def _kill_process(self):
+        process, self._process, self._proxy_url = self._process, None, None
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            except Exception:
+                pass
+
+    def _print_banner(self):
         # Startup banner: stderr, not stdout. Library code writing to stdout
         # pollutes app output, CI logs, and anything that captures stdout
         # (pytest -s, subprocess piping). Suppressed entirely when the caller
         # passes `silent=True`.
-        if not self._silent:
-            if self._dashboard_port:
-                banner = (
-                    f"goldlapel → :{self._proxy_port} (proxy) | "
-                    f"http://127.0.0.1:{self._dashboard_port} (dashboard)"
-                )
-            else:
-                banner = f"goldlapel → :{self._proxy_port} (proxy)"
-            print(banner, file=sys.stderr)
-
-        return self._proxy_url
+        if self._silent:
+            return
+        if self._dashboard_port:
+            banner = (
+                f"goldlapel → :{self._proxy_port} (proxy) | "
+                f"http://127.0.0.1:{self._dashboard_port} (dashboard)"
+            )
+        else:
+            banner = f"goldlapel → :{self._proxy_port} (proxy)"
+        print(banner, file=sys.stderr)
 
     def stop(self):
+        """Stop the proxy — or, when other callers started the same
+        upstream and share it, just this caller's hold on it: the last
+        stop() stops the proxy."""
+        with _lock:
+            if self._holders > 1:
+                self._holders -= 1
+                return
+            self._holders = 0
+            # Only `self`: a directly-constructed GoldLapel for the same
+            # upstream must not evict the factory's live one.
+            if _instances.get(self._upstream) is self:
+                del _instances[self._upstream]
         # Drop any cached DDL patterns — they are tied to the proxy
         # instance we're about to kill, and they must not leak into the
         # next start() of the same upstream URL.
@@ -692,17 +968,10 @@ class GoldLapel:
             except Exception:
                 pass
             self._conn = None
-        if self._process and self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
-        self._process = None
-        self._proxy_url = None
+        self._kill_process()
         self._dashboard_token = None
-        _unregister(self)
+        # Released only once the process is gone, so its ports are free.
+        self._release_ports()
 
     @property
     def conn(self):
@@ -812,79 +1081,41 @@ class GoldLapel:
         return _utils().explain_score(self._effective_conn(conn), *args, **kwargs)
 
 
-def _unregister(inst):
-    """Drop a stopped proxy from the registry so its ports are free for the
-    next auto-assignment and the next start(same_url) gets a fresh instance
-    (Option A from the v0.2 review findings). Only removes `inst` itself — a
-    directly-constructed GoldLapel for the same upstream must not evict the
-    factory's live one. Runs without `_lock`: the bulk stop()/atexit paths
-    hold it while iterating, and reacquiring it here would deadlock."""
-    if _instances.get(inst._upstream) is inst:
-        _instances.pop(inst._upstream, None)
+def _ensure_running(upstream, **options):
+    """The running factory proxy for `upstream` — started now, or shared
+    with the callers that started it (each holds it until its stop()).
+    A start already in progress for `upstream` in another thread is waited
+    for, never raced: no second spawn on the same ports, and never an
+    instance whose url or conn aren't set yet."""
+    while True:
+        with _lock:
+            inst = _instances.get(upstream)
+            if inst is not None and inst._ready.is_set():
+                if inst.running:
+                    # Started by goldlapel.asyncio: open the sync conn.
+                    if inst._conn is None:
+                        inst._open_conn()
+                    inst._holders += 1
+                    return inst
+                del _instances[upstream]
+                inst = None
+            if inst is None:
+                # Option errors raise here, before anything is registered.
+                inst = GoldLapel(upstream, **options)
+                _instances[upstream] = inst
+                break
+        inst._ready.wait()
 
-
-def _ensure_running(
-    upstream,
-    *,
-    proxy_port=None,
-    dashboard_port=None,
-    log_level=None,
-    mode=None,
-    license=None,
-    api_key=None,
-    client=None,
-    config_file=None,
-    config=None,
-    extra_args=None,
-    silent=False,
-    mesh=False,
-    mesh_tag=None,
-    disable_proxy_cache=False,
-    disable_sqloptimize=False,
-    disable_auto_indexes=False,
-):
-    global _cleanup_registered
-    with _lock:
-        if upstream in _instances:
-            inst = _instances[upstream]
-            if inst.running:
-                return inst
-            del _instances[upstream]
-
-        if proxy_port is None:
-            proxy_port = _pick_proxy_port(dashboard_port)
-        _check_ports_free(proxy_port, dashboard_port)
-
-        inst = GoldLapel(
-            upstream,
-            proxy_port=proxy_port,
-            dashboard_port=dashboard_port,
-            log_level=log_level,
-            mode=mode,
-            license=license,
-            api_key=api_key,
-            client=client,
-            config_file=config_file,
-            config=config,
-            extra_args=extra_args,
-            silent=silent,
-            mesh=mesh,
-            mesh_tag=mesh_tag,
-            disable_proxy_cache=disable_proxy_cache,
-            disable_sqloptimize=disable_sqloptimize,
-            disable_auto_indexes=disable_auto_indexes,
-        )
-        _instances[upstream] = inst
-        if not _cleanup_registered:
-            atexit.register(_cleanup)
-            _cleanup_registered = True
     try:
         inst.start()
-        return inst
-    except Exception:
+    except BaseException:
         with _lock:
-            _instances.pop(upstream, None)
+            if _instances.get(upstream) is inst:
+                del _instances[upstream]
         raise
+    finally:
+        inst._ready.set()
+    return inst
 
 
 def _detect_sync_driver():
@@ -934,6 +1165,7 @@ def start(
     disable_proxy_cache=False,
     disable_sqloptimize=False,
     disable_auto_indexes=False,
+    **unknown,
 ):
     """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
     GoldLapel instance. Call wrapper methods on the returned instance
@@ -981,7 +1213,13 @@ def start(
         with goldlapel.start("postgresql://...") as gl:
             gl.search(...)
         # proxy stopped automatically on exit
+
+    Starting an upstream that is already running in this process returns
+    that proxy; it keeps running until every start() of it has been
+    matched by a stop() (sync and async alike). `goldlapel.stop(url)`
+    stops it outright.
     """
+    _reject_unknown_options(unknown)
     _, driver = _detect_sync_driver()
     if driver is None:
         raise ImportError(
@@ -1030,19 +1268,24 @@ def connect(upstream=None):
     return driver.connect(inst.url)
 
 
+def _stop_outright(inst):
+    """Stop `inst` whoever else holds it."""
+    with _lock:
+        inst._holders = 1
+    inst.stop()
+
+
 def stop(upstream=None):
+    """Stop the proxy for `upstream`, or every proxy the factories started —
+    outright, however many callers share it."""
     with _lock:
         if upstream is not None:
-            inst = _instances.pop(upstream, None)
-            if inst:
-                inst.stop()
+            inst = _instances.get(upstream)
+            insts = [inst] if inst is not None else []
         else:
-            # Snapshot values — inst.stop() pops itself from _instances, so
-            # iterating the live view would raise "dict changed size during
-            # iteration".
-            for inst in list(_instances.values()):
-                inst.stop()
-            _instances.clear()
+            insts = list(_instances.values())
+        for inst in insts:
+            _stop_outright(inst)
 
 
 def proxy_url(upstream=None):
@@ -1082,9 +1325,8 @@ def config_keys():
 
 
 def _cleanup():
+    # Every proxy this process started, factory-started or not.
     with _lock:
-        # Snapshot values — inst.stop() pops itself from _instances, so
-        # iterating the live view would raise during shutdown.
-        for inst in list(_instances.values()):
-            inst.stop()
+        for inst in list(_live):
+            _stop_outright(inst)
         _instances.clear()
