@@ -81,15 +81,13 @@ class TestCreateEngine:
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
     def test_starts_proxy_and_returns_engine(self, mock_sa, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         mock_sa.return_value = MagicMock()
 
         engine = create_engine("postgresql://user:pass@host:5432/db")
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:pass@host:5432/db", client="sqlalchemy"
         )
         # No wrapper-side cache: SQLAlchemy connects to the proxy URL with
         # its own driver — no creator is injected.
@@ -102,7 +100,7 @@ class TestCreateEngine:
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
     def test_user_creator_passed_through(self, mock_sa, mock_gl):
-        mock_gl.proxy_url.return_value = PROXY_URL
+        mock_gl.start.return_value.url = PROXY_URL
         user_creator = MagicMock()
 
         create_engine("postgresql://host/db", creator=user_creator)
@@ -112,45 +110,39 @@ class TestCreateEngine:
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
     def test_strips_and_restores_dialect(self, mock_sa, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
 
         create_engine("postgresql+asyncpg://user:pass@host:5432/db")
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:pass@host:5432/db", client="sqlalchemy"
         )
         assert mock_sa.call_args[0] == ("postgresql+asyncpg://localhost:7932/mydb",)
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
     def test_pops_goldlapel_port(self, mock_sa, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
 
         create_engine("postgresql://host/db", goldlapel_proxy_port=9000)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=9000, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://host/db", client="sqlalchemy", proxy_port=9000
         )
-        # goldlapel_port must not leak to SQLAlchemy
+        # goldlapel_proxy_port must not leak to SQLAlchemy
         sa_kwargs = mock_sa.call_args[1]
-        assert "goldlapel_port" not in sa_kwargs
+        assert "goldlapel_proxy_port" not in sa_kwargs
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
     def test_pops_goldlapel_extra_args(self, mock_sa, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         extra = ["--threshold-duration-ms", "200"]
 
         create_engine("postgresql://host/db", goldlapel_extra_args=extra)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=extra
+            "postgresql://host/db", client="sqlalchemy", extra_args=extra
         )
         sa_kwargs = mock_sa.call_args[1]
         assert "goldlapel_extra_args" not in sa_kwargs
@@ -158,15 +150,13 @@ class TestCreateEngine:
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
     def test_pops_goldlapel_config(self, mock_sa, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         cfg = {"mode": "waiter", "pool_size": 30}
 
         create_engine("postgresql://host/db", goldlapel_config=cfg)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=cfg, extra_args=None
+            "postgresql://host/db", client="sqlalchemy", config=cfg
         )
         # goldlapel_config must not leak to SQLAlchemy
         sa_kwargs = mock_sa.call_args[1]
@@ -175,9 +165,7 @@ class TestCreateEngine:
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
     def test_passes_remaining_kwargs(self, mock_sa, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
 
         create_engine("postgresql://host/db", echo=True, pool_size=5)
 
@@ -188,23 +176,19 @@ class TestCreateEngine:
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
     def test_url_object_preserves_password(self, mock_sa, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         url = _make_url_object("postgresql://user:s3cret@host:5432/db", password="s3cret")
 
         create_engine(url)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:s3cret@host:5432/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:s3cret@host:5432/db", client="sqlalchemy"
         )
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("goldlapel.sqlalchemy._sa_create_engine")
     def test_url_object_with_dialect_preserves_password(self, mock_sa, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         url = _make_url_object(
             "postgresql+psycopg://user:s3cret@host:5432/db", password="s3cret"
         )
@@ -212,7 +196,7 @@ class TestCreateEngine:
         create_engine(url)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:s3cret@host:5432/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:s3cret@host:5432/db", client="sqlalchemy"
         )
 
 
@@ -220,15 +204,13 @@ class TestCreateAsyncEngine:
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("sqlalchemy.ext.asyncio.create_async_engine")
     def test_starts_proxy_and_returns_async_engine(self, mock_sa_async, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         mock_sa_async.return_value = MagicMock()
 
         engine = create_async_engine("postgresql+asyncpg://user:pass@host:5432/db")
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:pass@host:5432/db", client="sqlalchemy"
         )
         mock_sa_async.assert_called_once_with("postgresql+asyncpg://localhost:7932/mydb")
         assert engine is mock_sa_async.return_value
@@ -236,15 +218,13 @@ class TestCreateAsyncEngine:
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("sqlalchemy.ext.asyncio.create_async_engine")
     def test_pops_goldlapel_config(self, mock_sa_async, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         cfg = {"mode": "waiter", "pool_size": 30}
 
         create_async_engine("postgresql+asyncpg://host/db", goldlapel_config=cfg)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=cfg, extra_args=None
+            "postgresql://host/db", client="sqlalchemy", config=cfg
         )
         # goldlapel_config must not leak to SQLAlchemy
         mock_sa_async.assert_called_once_with("postgresql+asyncpg://localhost:7932/mydb")
@@ -252,9 +232,7 @@ class TestCreateAsyncEngine:
     @patch("goldlapel.sqlalchemy.goldlapel")
     @patch("sqlalchemy.ext.asyncio.create_async_engine")
     def test_passes_remaining_kwargs(self, mock_sa_async, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
 
         create_async_engine("postgresql+asyncpg://host/db", echo=True, pool_size=5)
 
@@ -273,9 +251,7 @@ class TestInit:
     @patch("goldlapel.sqlalchemy.goldlapel")
     def test_rewrites_database_url(self, mock_gl, monkeypatch):
         monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@host:5432/db")
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
 
         init()
 
@@ -284,14 +260,12 @@ class TestInit:
     @patch("goldlapel.sqlalchemy.goldlapel")
     def test_explicit_url_over_env(self, mock_gl, monkeypatch):
         monkeypatch.setenv("DATABASE_URL", "postgresql://old@host/db")
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
 
         init(url="postgresql://new@host/db")
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://new@host/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://new@host/db", client="sqlalchemy"
         )
 
     def test_raises_when_no_url(self, monkeypatch):
@@ -301,9 +275,7 @@ class TestInit:
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     def test_returns_proxy_url(self, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
 
         result = init(url="postgresql://host/db")
 
@@ -311,42 +283,36 @@ class TestInit:
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     def test_preserves_dialect_suffix(self, mock_gl, monkeypatch):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@host:5432/db")
 
         init()
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:pass@host:5432/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:pass@host:5432/db", client="sqlalchemy"
         )
         assert os.environ["DATABASE_URL"] == "postgresql+asyncpg://localhost:7932/mydb"
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     def test_passes_config(self, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         cfg = {"mode": "waiter", "pool_size": 30}
 
         init(url="postgresql://host/db", config=cfg)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://host/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=cfg, extra_args=None
+            "postgresql://host/db", client="sqlalchemy", config=cfg
         )
 
     @patch("goldlapel.sqlalchemy.goldlapel")
     def test_url_object_preserves_password(self, mock_gl):
-        mock_gl.start.return_value = PROXY_URL
-        mock_gl.proxy_url.return_value = PROXY_URL
-        mock_gl.DEFAULT_PROXY_PORT = 7932
+        mock_gl.start.return_value.url = PROXY_URL
         url = _make_url_object("postgresql://user:s3cret@host:5432/db", password="s3cret")
 
         init(url=url)
 
         mock_gl.start.assert_called_once_with(
-            "postgresql://user:s3cret@host:5432/db", proxy_port=None, dashboard_port=None, log_level=None, mode=None, client="sqlalchemy", config=None, extra_args=None
+            "postgresql://user:s3cret@host:5432/db", client="sqlalchemy"
         )
 
 
@@ -366,3 +332,108 @@ class TestReExports:
     def test_default_port(self):
         assert goldlapel_sqlalchemy.DEFAULT_PROXY_PORT is goldlapel_sqlalchemy.goldlapel.DEFAULT_PROXY_PORT
 
+
+
+# Every keyword option of the core `goldlapel.start`, with a non-default
+# value. The SQLAlchemy integration forwards each one as
+# `goldlapel_<name>` (engine kwargs) or `<name>` (init).
+_ALL_START_OPTIONS = {
+    "proxy_port": 9000,
+    "dashboard_port": 9001,
+    "log_level": "debug",
+    "mode": "waiter",
+    "license": "/etc/gl/license.pem",
+    "api_key": "gl_test_abc",
+    "client": "my-app",
+    "config_file": "/etc/gl/goldlapel.toml",
+    "config": {"pool_size": 30},
+    "extra_args": ["--verbose"],
+    "silent": True,
+    "mesh": True,
+    "mesh_tag": "eu",
+    "disable_proxy_cache": True,
+    "disable_sqloptimize": True,
+    "disable_auto_indexes": True,
+}
+
+
+def _core_start_options():
+    import inspect
+    from goldlapel.proxy import start as core_start
+    return {
+        name for name, p in inspect.signature(core_start).parameters.items()
+        if p.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+
+
+class TestOptionForwarding:
+    def test_option_table_covers_core_signature(self):
+        assert set(_ALL_START_OPTIONS) == _core_start_options()
+
+    @patch("goldlapel.sqlalchemy.goldlapel")
+    @patch("goldlapel.sqlalchemy._sa_create_engine")
+    def test_create_engine_forwards_every_option(self, mock_sa, mock_gl):
+        mock_gl.start.return_value.url = PROXY_URL
+        kwargs = {f"goldlapel_{k}": v for k, v in _ALL_START_OPTIONS.items()}
+
+        create_engine("postgresql://host/db", echo=True, **kwargs)
+
+        mock_gl.start.assert_called_once_with("postgresql://host/db", **_ALL_START_OPTIONS)
+        # None of the goldlapel_* kwargs leak to SQLAlchemy.
+        assert mock_sa.call_args[1] == {"echo": True}
+
+    @patch("goldlapel.sqlalchemy.goldlapel")
+    @patch("sqlalchemy.ext.asyncio.create_async_engine")
+    def test_create_async_engine_forwards_every_option(self, mock_sa_async, mock_gl):
+        mock_gl.start.return_value.url = PROXY_URL
+        kwargs = {f"goldlapel_{k}": v for k, v in _ALL_START_OPTIONS.items()}
+
+        create_async_engine("postgresql+asyncpg://host/db", **kwargs)
+
+        mock_gl.start.assert_called_once_with("postgresql://host/db", **_ALL_START_OPTIONS)
+        mock_sa_async.assert_called_once_with("postgresql+asyncpg://localhost:7932/mydb")
+
+    @patch("goldlapel.sqlalchemy.goldlapel")
+    def test_init_forwards_every_option(self, mock_gl, monkeypatch):
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        mock_gl.start.return_value.url = PROXY_URL
+
+        init("postgresql://host/db", **_ALL_START_OPTIONS)
+
+        mock_gl.start.assert_called_once_with("postgresql://host/db", **_ALL_START_OPTIONS)
+
+
+class TestMultipleEngines:
+    """Two engines for different databases each get their own proxy, and
+    each engine connects to its own proxy's URL."""
+
+    def setup_method(self):
+        import goldlapel.proxy as proxy_mod
+        proxy_mod._instances.clear()
+
+    def teardown_method(self):
+        import goldlapel.proxy as proxy_mod
+        proxy_mod._instances.clear()
+
+    @patch("goldlapel.proxy._detect_sync_driver",
+           side_effect=lambda: ("psycopg3", MagicMock()))
+    @patch("goldlapel.proxy._kill_orphan_on_port")
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    @patch("goldlapel.sqlalchemy._sa_create_engine")
+    def test_two_engines_get_their_own_proxy_urls(
+        self, mock_sa, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect,
+    ):
+        def popen(*args, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = None
+            return proc
+        mock_popen.side_effect = popen
+
+        create_engine("postgresql+psycopg://u:p@h:5432/main", goldlapel_silent=True)
+        create_engine("postgresql+psycopg://u:p@h:5432/analytics", goldlapel_silent=True)
+
+        first, second = (c[0][0] for c in mock_sa.call_args_list)
+        assert first.startswith("postgresql+psycopg://u:p@localhost:7932/main")
+        assert second.startswith("postgresql+psycopg://u:p@localhost:7934/analytics")

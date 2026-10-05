@@ -842,6 +842,81 @@ class TestMultiInstance:
         assert proxy_mod._instances[url] is registered
 
 
+class TestExplicitPortCollision:
+    """An explicit port that a live proxy of this process already holds for
+    a different upstream raises before anything is spawned or killed."""
+
+    def setup_method(self):
+        _reset_module_state()
+
+    def teardown_method(self):
+        _reset_module_state()
+
+    def _start_a(self):
+        return start("postgresql://u:secret@host-a:5432/db_a", silent=True)
+
+    @pytest.mark.parametrize("kwargs, port", [
+        ({"proxy_port": 7932}, 7932),            # A's proxy port
+        ({"proxy_port": 7933}, 7933),            # A's dashboard port
+        ({"proxy_port": 7931}, 7932),            # B's derived dashboard lands on A's proxy
+        ({"proxy_port": 8000, "dashboard_port": 7933}, 7933),
+        ({"dashboard_port": 7932}, 7932),        # auto proxy port, explicit dashboard
+    ])
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._kill_orphan_on_port")
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_port_held_by_other_upstream_raises(
+        self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect, kwargs, port,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+        self._start_a()
+        mock_orphan.reset_mock()
+
+        url_b = "postgresql://host-b:5432/db_b"
+        with pytest.raises(RuntimeError) as exc:
+            start(url_b, silent=True, **kwargs)
+
+        msg = str(exc.value)
+        assert f"port {port}" in msg
+        assert "postgresql://u:***@host-a:5432/db_a" in msg
+        assert "secret" not in msg
+        assert mock_popen.call_count == 1
+        mock_orphan.assert_not_called()
+        assert url_b not in proxy_mod._instances
+
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._kill_orphan_on_port")
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_port_of_exited_proxy_is_free(
+        self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+        gl_a = self._start_a()
+        gl_a._process.poll.return_value = 1  # proxy died
+
+        gl_b = start("postgresql://host-b:5432/db_b", proxy_port=7932, silent=True)
+        assert gl_b._proxy_port == 7932
+
+    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
+    @patch("goldlapel.proxy._kill_orphan_on_port")
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_same_upstream_with_its_own_port_reuses(
+        self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect,
+    ):
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+        gl_a = self._start_a()
+
+        again = start("postgresql://u:secret@host-a:5432/db_a", proxy_port=7932)
+        assert again is gl_a
+        assert mock_popen.call_count == 1
+
+
 class TestKillOrphanOnPort:
     def test_only_targets_goldlapel_listeners(self):
         # lsof ORs its selectors unless -a is given: without it,

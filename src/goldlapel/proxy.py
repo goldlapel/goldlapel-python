@@ -336,18 +336,45 @@ def _kill_orphan_on_port(port):
             pass
 
 
+def _redact_password(url):
+    """`url` with the password in its userinfo replaced by `***`, for error
+    messages."""
+    return re.sub(r'^([^:/?#]+://[^:/?#@]*:).*@', r'\1***@', url)
+
+
 def _claimed_ports():
-    """Ports held by the proxies this process has started (or is starting):
-    each one's proxy port plus its dashboard port (none when disabled with 0).
-    A proxy whose process has exited holds nothing. Caller holds `_lock`."""
-    claimed = set()
+    """Ports held by the proxies this process has started (or is starting),
+    as {port: (upstream, "proxy" | "dashboard")}: each one's proxy port plus
+    its dashboard port (none when disabled with 0). A proxy whose process has
+    exited holds nothing. Caller holds `_lock`."""
+    claimed = {}
     for inst in _instances.values():
         if inst._process is not None and inst._process.poll() is not None:
             continue
-        claimed.add(inst._proxy_port)
+        claimed[int(inst._proxy_port)] = (inst._upstream, "proxy")
         if inst._dashboard_port:
-            claimed.add(inst._dashboard_port)
+            claimed[inst._dashboard_port] = (inst._upstream, "dashboard")
     return claimed
+
+
+def _check_ports_free(proxy_port, dashboard_port):
+    """Raise if the proxy or dashboard port a new proxy would listen on is
+    held by another live proxy of this process. Without this an explicit
+    port would hand the caller the other upstream's proxy, or the stale-proxy
+    cleanup would kill it. Caller holds `_lock`."""
+    claimed = _claimed_ports()
+    proxy_port = int(proxy_port)
+    if dashboard_port is None:
+        dashboard_port = proxy_port + 1
+    for port, role in ((proxy_port, "proxy"), (int(dashboard_port), "dashboard")):
+        if port and port in claimed:
+            upstream, held_as = claimed[port]
+            raise RuntimeError(
+                f"Gold Lapel cannot use port {port} as the {role} port: this "
+                f"process's proxy for {_redact_password(upstream)} already "
+                f"holds it as its {held_as} port. Choose another port, or omit "
+                "proxy_port and dashboard_port to have a free pair assigned."
+            )
 
 
 def _pick_proxy_port(dashboard_port):
@@ -826,6 +853,7 @@ def _ensure_running(
 
         if proxy_port is None:
             proxy_port = _pick_proxy_port(dashboard_port)
+        _check_ports_free(proxy_port, dashboard_port)
 
         inst = GoldLapel(
             upstream,

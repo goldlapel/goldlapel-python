@@ -281,3 +281,50 @@ class TestConnectionIsNotWrapped:
         # No wrapper-side cache: the backend only rewrites host/port and
         # leaves connection creation to Django's PostgreSQL backend.
         assert "get_new_connection" not in DatabaseWrapper.__dict__
+
+
+class TestOptionForwarding:
+    """OPTIONS["goldlapel"] accepts every keyword option of the core
+    `goldlapel.start` and forwards each one unchanged."""
+
+    ALL_OPTIONS = {
+        "proxy_port": 9000,
+        "dashboard_port": 9001,
+        "log_level": "debug",
+        "mode": "waiter",
+        "license": "/etc/gl/license.pem",
+        "api_key": "gl_test_abc",
+        "client": "my-app",
+        "config_file": "/etc/gl/goldlapel.toml",
+        "config": {"pool_size": 30},
+        "extra_args": ["--verbose"],
+        "silent": True,
+        "mesh": True,
+        "mesh_tag": "eu",
+        "disable_proxy_cache": True,
+        "disable_sqloptimize": True,
+        "disable_auto_indexes": True,
+    }
+
+    def test_option_table_covers_core_signature(self):
+        import inspect
+        from goldlapel.proxy import start as core_start
+        core = {
+            name for name, p in inspect.signature(core_start).parameters.items()
+            if p.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+        assert set(self.ALL_OPTIONS) == core
+
+    @patch("goldlapel.django.base.goldlapel")
+    @patch("goldlapel.django.base.PgDatabaseWrapper.get_connection_params")
+    def test_forwards_every_option(self, mock_super, mock_gl):
+        mock_gl.start.return_value.proxy_port = 9000
+        mock_super.return_value = {"host": "h", "port": 5432,
+                                   "goldlapel": dict(self.ALL_OPTIONS)}
+        wrapper = _make_wrapper({"HOST": "h", "PORT": "5432", "NAME": "db",
+                                 "USER": "u", "PASSWORD": "p"})
+        DatabaseWrapper.get_connection_params(wrapper)
+
+        mock_gl.start.assert_called_once_with(
+            _build_upstream_url(wrapper.settings_dict), **self.ALL_OPTIONS,
+        )

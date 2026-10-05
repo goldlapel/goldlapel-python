@@ -26,26 +26,32 @@ def _restore_dialect(proxy_url, dialect):
     return proxy_url
 
 
-def _start_proxy(url, kwargs):
-    proxy_port = kwargs.pop("goldlapel_proxy_port", None)
-    config = kwargs.pop("goldlapel_config", None)
-    extra_args = kwargs.pop("goldlapel_extra_args", None)
-    dashboard_port = kwargs.pop("goldlapel_dashboard_port", None)
-    log_level = kwargs.pop("goldlapel_log_level", None)
-    mode = kwargs.pop("goldlapel_mode", None)
+# Keyword options of `goldlapel.start`. Engine factories take each one as a
+# `goldlapel_<name>` kwarg (popped before SQLAlchemy sees the rest); init()
+# takes them under their own names.
+_START_OPTIONS = (
+    "proxy_port", "dashboard_port", "log_level", "mode", "license",
+    "api_key", "client", "config_file", "config", "extra_args", "silent",
+    "mesh", "mesh_tag", "disable_proxy_cache", "disable_sqloptimize",
+    "disable_auto_indexes",
+)
+
+
+def _proxy_url_for(url, options):
+    # Start (or reuse) the proxy for `url` and return the URL of that
+    # proxy — not goldlapel.proxy_url(), which can't tell several apart.
     clean_url, dialect = _strip_dialect(_url_to_str(url))
-    goldlapel.start(
-        clean_url,
-        proxy_port=proxy_port,
-        dashboard_port=dashboard_port,
-        log_level=log_level,
-        mode=mode,
-        client="sqlalchemy",
-        config=config,
-        extra_args=extra_args,
-    )
-    proxy_url = goldlapel.proxy_url() or clean_url
-    return _restore_dialect(proxy_url, dialect)
+    inst = goldlapel.start(clean_url, **{"client": "sqlalchemy", **options})
+    return _restore_dialect(inst.url, dialect)
+
+
+def _start_proxy(url, kwargs):
+    options = {}
+    for name in _START_OPTIONS:
+        key = "goldlapel_" + name
+        if key in kwargs:
+            options[name] = kwargs.pop(key)
+    return _proxy_url_for(url, options)
 
 
 def create_engine(url, **kwargs):
@@ -59,35 +65,14 @@ def create_async_engine(url, **kwargs):
     return _sa_create_async_engine(proxy, **kwargs)
 
 
-def init(
-    url=None,
-    *,
-    config=None,
-    proxy_port=None,
-    dashboard_port=None,
-    log_level=None,
-    mode=None,
-    extra_args=None,
-):
+# Start the proxy for `url` (default: $DATABASE_URL), point DATABASE_URL at
+# it and return the proxy URL. `options` are the keyword options of
+# `goldlapel.start`.
+def init(url=None, **options):
     url = url or os.environ.get("DATABASE_URL")
     if not url:
         raise ValueError("Gold Lapel: DATABASE_URL not set. Pass a URL or set DATABASE_URL.")
-    clean_url, dialect = _strip_dialect(_url_to_str(url))
-    inst = goldlapel.start(
-        clean_url,
-        proxy_port=proxy_port,
-        dashboard_port=dashboard_port,
-        log_level=log_level,
-        mode=mode,
-        client="sqlalchemy",
-        config=config,
-        extra_args=extra_args,
-    )
-    if hasattr(inst, "url"):
-        proxy = inst.url
-    else:
-        proxy = inst  # legacy mock: returned a bare URL string
-    proxy = _restore_dialect(proxy, dialect)
+    proxy = _proxy_url_for(url, options)
     os.environ["DATABASE_URL"] = proxy
     return proxy
 

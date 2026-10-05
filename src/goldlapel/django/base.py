@@ -38,15 +38,16 @@ class DatabaseWrapper(PgDatabaseWrapper):
         params = super().get_connection_params()
 
         gl_opts = params.pop("goldlapel", {})
-        # Django OPTIONS dict uses the canonical snake_case surface —
-        # `proxy_port`, `dashboard_port`, `log_level`, `mode`, etc. —
-        # matching `goldlapel.start(**opts)`. Without a configured
-        # proxy_port the core picks one, so several DATABASES each get
-        # their own proxy + dashboard pair.
+        # Django OPTIONS dict takes the keyword options of
+        # `goldlapel.start(**opts)` under the same snake_case names.
+        # Without a configured proxy_port the core picks one, so several
+        # DATABASES each get their own proxy + dashboard pair.
         start_kwargs = {"client": "django"}
         for key in (
-            "proxy_port", "dashboard_port", "log_level", "mode",
-            "license", "config_file", "config", "extra_args", "silent",
+            "proxy_port", "dashboard_port", "log_level", "mode", "license",
+            "api_key", "client", "config_file", "config", "extra_args",
+            "silent", "mesh", "mesh_tag", "disable_proxy_cache",
+            "disable_sqloptimize", "disable_auto_indexes",
         ):
             if key in gl_opts:
                 start_kwargs[key] = gl_opts[key]

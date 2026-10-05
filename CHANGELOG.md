@@ -25,6 +25,31 @@ same allocation.
   and every `goldlapel` process on the machine, including this process's
   other proxies.
 
+### Fixed — several databases from frameworks, async reuse, explicit ports
+
+- SQLAlchemy: a second `create_engine` / `create_async_engine` for another
+  database raised "Multiple Gold Lapel instances are running". Each engine
+  now connects to the URL of the proxy started for its own database.
+- Django and SQLAlchemy accept every option `goldlapel.start` takes —
+  newly `api_key`, `client`, `mesh`, `mesh_tag`, `disable_proxy_cache`,
+  `disable_sqloptimize` and `disable_auto_indexes` (plus `license`,
+  `config_file` and `silent` for SQLAlchemy) — under the same names: in
+  `OPTIONS["goldlapel"]` for Django, as `goldlapel_<name>` engine kwargs or
+  plain `init()` kwargs for SQLAlchemy. Only options you set are passed on.
+- `goldlapel.asyncio.start` on an upstream whose proxy is already running
+  returned an object without `documents`, `streams`, `counters`, `zsets`,
+  `hashes`, `queues` or `geos`. It now returns a complete `AsyncGoldLapel`
+  on the running proxy, the same as a fresh start.
+- `goldlapel.asyncio.start(api_key=...)` never handed the key to the proxy;
+  it now sets `GOLDLAPEL_API_KEY` for it, as the sync path does.
+- An explicit `proxy_port` or `dashboard_port` that one of this process's
+  running proxies already holds for a different upstream now raises a
+  `RuntimeError` naming the port and that upstream (password masked).
+  Previously the stale-proxy cleanup could kill that proxy, or the new
+  upstream's connections went to the other upstream's proxy. In Django the
+  error is logged and the connection falls back to the database directly,
+  like any other proxy start failure.
+
 ### Breaking changes — the in-process cache (L1) is gone
 
 **The wrapper no longer caches anything itself.** The proxy's result cache

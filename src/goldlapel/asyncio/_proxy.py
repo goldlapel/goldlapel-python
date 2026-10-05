@@ -113,7 +113,7 @@ class AsyncGoldLapel:
     ):
         # Piggyback on the sync GoldLapel for subprocess/lifecycle state so
         # `using(conn)` / ContextVar semantics and stop-on-exit are identical.
-        self._sync = GoldLapel(
+        self._init_state(GoldLapel(
             upstream,
             proxy_port=proxy_port,
             dashboard_port=dashboard_port,
@@ -131,7 +131,19 @@ class AsyncGoldLapel:
             disable_proxy_cache=disable_proxy_cache,
             disable_sqloptimize=disable_sqloptimize,
             disable_auto_indexes=disable_auto_indexes,
-        )
+        ))
+
+    @classmethod
+    def _wrapping(cls, sync):
+        """An AsyncGoldLapel over `sync`, a proxy that is already running —
+        the reuse path of `start()`. Same state as a fresh instance, so every
+        helper works either way."""
+        inst = cls.__new__(cls)
+        inst._init_state(sync)
+        return inst
+
+    def _init_state(self, sync):
+        self._sync = sync
         self._conn = None  # asyncpg.Connection
 
         # Nested namespaces — mirror the sync GoldLapel but with async sub-API
@@ -235,6 +247,10 @@ class AsyncGoldLapel:
             env = os.environ.copy()
             if sync._client is None:
                 env.setdefault("GOLDLAPEL_CLIENT", "python")
+            # api_key goes by env, not CLI flag, to keep it out of `ps`
+            # (see GoldLapel.start).
+            if sync._api_key is not None:
+                env["GOLDLAPEL_API_KEY"] = sync._api_key
             # Provision a session-scoped dashboard token so ddl.py can
             # authenticate against /api/ddl/*. See GoldLapel.start in proxy.py
             # for the sync-side mirror of this logic.
@@ -499,9 +515,7 @@ async def _actual_start(upstream, **kwargs):
 
     Mirrors goldlapel.proxy._ensure_running but for AsyncGoldLapel and with
     async connect inlined so we don't block the loop via threadpool bounces.
-    `kwargs` carries the canonical-surface options (proxy_port,
-    dashboard_port, log_level, mode, license, client, config_file, config,
-    extra_args, silent).
+    `kwargs` carries the keyword options of `start()`.
     """
     asyncpg = _detect_asyncpg()
     if asyncpg is None:
@@ -519,9 +533,7 @@ async def _actual_start(upstream, **kwargs):
         existing = proxy_mod._instances.get(upstream)
         if existing and existing.running:
             # Wrap the already-running subprocess in an AsyncGoldLapel.
-            inst = AsyncGoldLapel.__new__(AsyncGoldLapel)
-            inst._sync = existing
-            inst._conn = None
+            inst = AsyncGoldLapel._wrapping(existing)
             # Fall through to connect below — don't re-spawn.
             need_spawn = False
         else:
@@ -530,6 +542,7 @@ async def _actual_start(upstream, **kwargs):
                 del proxy_mod._instances[existing._upstream]
             if proxy_port is None:
                 proxy_port = proxy_mod._pick_proxy_port(kwargs.get("dashboard_port"))
+            proxy_mod._check_ports_free(proxy_port, kwargs.get("dashboard_port"))
             inst = AsyncGoldLapel(upstream, **{**kwargs, "proxy_port": proxy_port})
             proxy_mod._instances[upstream] = inst._sync
             need_spawn = True
