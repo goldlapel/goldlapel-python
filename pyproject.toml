@@ -8,13 +8,13 @@ name = "goldlapel"
 # Release CI rewrites this from the git tag at publish time — the in-source value
 # only matters for local dev installs.
 version = "0.3.0"
-description = "Self-optimizing Postgres proxy — automatic materialized views and indexes"
+description = "Self-optimizing Postgres proxy — automatic query caching and indexes"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "THIRD-PARTY-NOTICES.md"]
 requires-python = ">=3.9"
 authors = [{name = "The Waiter of Gold Lapel", email = "thewaiter@goldlapel.com"}]
-keywords = ["postgres", "proxy", "optimization", "materialized-views", "database", "cache", "redis-compat", "mongo-compat", "query-optimization"]
+keywords = ["postgres", "proxy", "optimization", "database", "cache", "redis-compat", "mongo-compat", "query-optimization"]
 classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Database",
@@ -32,7 +32,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "django",
-    "sqlalchemy",
+    "sqlalchemy[asyncio]",
     "psycopg2-binary",
     "psycopg[binary]",
     "asyncpg",

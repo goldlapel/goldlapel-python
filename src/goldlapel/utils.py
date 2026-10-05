@@ -39,10 +39,9 @@ def _validate_identifier(name):
 def publish(conn, channel, message):
     """Publish a message to a channel. Like redis.publish()."""
     _validate_identifier(channel)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute("SELECT pg_notify(%s, %s)", (channel, str(message)))
-    raw.commit()
+    conn.commit()
     cur.close()
 
 
@@ -53,10 +52,9 @@ def subscribe(conn, channel, callback, blocking=True):
     Like redis.subscribe().
     """
     _validate_identifier(channel)
-    raw = _get_raw_connection(conn)
 
     def _listen():
-        listen_conn = _make_listen_connection(raw)
+        listen_conn = _make_listen_connection(conn)
         cur = listen_conn.cursor()
         cur.execute(f"LISTEN {channel}")
         listen_conn.commit()
@@ -110,11 +108,10 @@ def _pattern_sql(patterns, key, family):
 def counter_incr(conn, name, key, amount=1, *, patterns=None):
     """Increment-or-insert a counter; returns the new value."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "incr", "counter"), (key, int(amount)))
     result = cur.fetchone()[0]
-    raw.commit()
+    conn.commit()
     cur.close()
     return result
 
@@ -128,11 +125,10 @@ def counter_decr(conn, name, key, amount=1, *, patterns=None):
 def counter_set(conn, name, key, value, *, patterns=None):
     """Idempotent set-key; returns the value just stored."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "set", "counter"), (key, int(value)))
     result = cur.fetchone()[0]
-    raw.commit()
+    conn.commit()
     cur.close()
     return result
 
@@ -141,8 +137,7 @@ def counter_get(conn, name, key, *, patterns=None):
     """Get a counter's current value. Returns 0 for unknown keys (matches
     the Redis convention — no NULL surprise on cold cache)."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "get", "counter"), (key,))
     row = cur.fetchone()
     cur.close()
@@ -153,11 +148,10 @@ def counter_delete(conn, name, key, *, patterns=None):
     """Delete a counter row. Returns True if a row was deleted, False if
     the key was already absent."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "delete", "counter"), (key,))
     removed = cur.rowcount > 0
-    raw.commit()
+    conn.commit()
     cur.close()
     return removed
 
@@ -165,8 +159,7 @@ def counter_delete(conn, name, key, *, patterns=None):
 def counter_count_keys(conn, name, *, patterns=None):
     """Total distinct keys in the counter namespace."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "count_keys", "counter"))
     row = cur.fetchone()
     cur.close()
@@ -181,14 +174,13 @@ def counter_count_keys(conn, name, *, patterns=None):
 def zset_add(conn, name, zset_key, member, score, *, patterns=None):
     """Set-or-update a member's score under `zset_key`; returns the new score."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "zadd", "zset"),
         (str(zset_key), str(member), float(score)),
     )
     result = cur.fetchone()[0]
-    raw.commit()
+    conn.commit()
     cur.close()
     return result
 
@@ -196,14 +188,13 @@ def zset_add(conn, name, zset_key, member, score, *, patterns=None):
 def zset_incr_by(conn, name, zset_key, member, delta=1, *, patterns=None):
     """Atomic increment-or-insert; returns the new score."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "zincrby", "zset"),
         (str(zset_key), str(member), float(delta)),
     )
     result = cur.fetchone()[0]
-    raw.commit()
+    conn.commit()
     cur.close()
     return result
 
@@ -211,8 +202,7 @@ def zset_incr_by(conn, name, zset_key, member, delta=1, *, patterns=None):
 def zset_score(conn, name, zset_key, member, *, patterns=None):
     """Get a member's score, or None if absent."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "zscore", "zset"),
         (str(zset_key), str(member)),
@@ -225,14 +215,13 @@ def zset_score(conn, name, zset_key, member, *, patterns=None):
 def zset_remove(conn, name, zset_key, member, *, patterns=None):
     """Remove a member; True if removed, False if absent."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "zrem", "zset"),
         (str(zset_key), str(member)),
     )
     removed = cur.rowcount > 0
-    raw.commit()
+    conn.commit()
     cur.close()
     return removed
 
@@ -245,8 +234,7 @@ def zset_range(conn, name, zset_key, start=0, stop=10, desc=True, *, patterns=No
     bounds Redis-style; the SQL converts to LIMIT/OFFSET.
     """
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     key = "zrange_desc" if desc else "zrange_asc"
     limit = max(0, int(stop) - int(start) + 1)
     cur.execute(
@@ -261,8 +249,7 @@ def zset_range(conn, name, zset_key, start=0, stop=10, desc=True, *, patterns=No
 def zset_range_by_score(conn, name, zset_key, min_score, max_score, limit=100, offset=0, *, patterns=None):
     """Get members whose score is between min and max (inclusive)."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "zrangebyscore", "zset"),
         (str(zset_key), float(min_score), float(max_score), int(limit), int(offset)),
@@ -275,8 +262,7 @@ def zset_range_by_score(conn, name, zset_key, min_score, max_score, limit=100, o
 def zset_rank(conn, name, zset_key, member, desc=True, *, patterns=None):
     """0-based rank within `zset_key`, or None if member absent."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     key = "zrank_desc" if desc else "zrank_asc"
     cur.execute(
         _pattern_sql(patterns, key, "zset"),
@@ -290,8 +276,7 @@ def zset_rank(conn, name, zset_key, member, desc=True, *, patterns=None):
 def zset_card(conn, name, zset_key, *, patterns=None):
     """Cardinality of one zset_key namespace."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "zcard", "zset"), (str(zset_key),))
     row = cur.fetchone()
     cur.close()
@@ -325,14 +310,13 @@ def _decode_jsonb(value):
 def hash_set(conn, name, hash_key, field, value, *, patterns=None):
     """Set a field's value (single-row UPSERT). Value is JSON-encoded."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "hset", "hash"),
         (str(hash_key), str(field), json.dumps(value)),
     )
     row = cur.fetchone()
-    raw.commit()
+    conn.commit()
     cur.close()
     if row and row[0] is not None:
         return _decode_jsonb(row[0])
@@ -342,8 +326,7 @@ def hash_set(conn, name, hash_key, field, value, *, patterns=None):
 def hash_get(conn, name, hash_key, field, *, patterns=None):
     """Get a field's value, or None if (key, field) absent."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "hget", "hash"),
         (str(hash_key), str(field)),
@@ -359,8 +342,7 @@ def hash_get_all(conn, name, hash_key, *, patterns=None):
     """Reassemble every (field, value) under `hash_key` into a Python dict.
     Empty dict if the key has no fields."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "hgetall", "hash"), (str(hash_key),))
     out = {}
     for row in cur.fetchall():
@@ -372,8 +354,7 @@ def hash_get_all(conn, name, hash_key, *, patterns=None):
 def hash_keys(conn, name, hash_key, *, patterns=None):
     """List every field name under `hash_key`."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "hkeys", "hash"), (str(hash_key),))
     result = [row[0] for row in cur.fetchall()]
     cur.close()
@@ -383,8 +364,7 @@ def hash_keys(conn, name, hash_key, *, patterns=None):
 def hash_values(conn, name, hash_key, *, patterns=None):
     """List every value under `hash_key` (in field-name order)."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "hvals", "hash"), (str(hash_key),))
     result = [_decode_jsonb(row[0]) for row in cur.fetchall()]
     cur.close()
@@ -394,8 +374,7 @@ def hash_values(conn, name, hash_key, *, patterns=None):
 def hash_exists(conn, name, hash_key, field, *, patterns=None):
     """Does (hash_key, field) exist?"""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "hexists", "hash"),
         (str(hash_key), str(field)),
@@ -408,14 +387,13 @@ def hash_exists(conn, name, hash_key, field, *, patterns=None):
 def hash_delete(conn, name, hash_key, field, *, patterns=None):
     """Delete a field; True if deleted, False if absent."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "hdel", "hash"),
         (str(hash_key), str(field)),
     )
     removed = cur.rowcount > 0
-    raw.commit()
+    conn.commit()
     cur.close()
     return removed
 
@@ -423,8 +401,7 @@ def hash_delete(conn, name, hash_key, field, *, patterns=None):
 def hash_len(conn, name, hash_key, *, patterns=None):
     """Number of fields under `hash_key`."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "hlen", "hash"), (str(hash_key),))
     row = cur.fetchone()
     cur.close()
@@ -439,14 +416,13 @@ def hash_len(conn, name, hash_key, *, patterns=None):
 def queue_enqueue(conn, name, payload, *, patterns=None):
     """Add a message; returns its assigned `id`."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "enqueue", "queue"),
         (json.dumps(payload),),
     )
     row = cur.fetchone()
-    raw.commit()
+    conn.commit()
     cur.close()
     return row[0] if row else None
 
@@ -456,14 +432,13 @@ def queue_claim(conn, name, visibility_timeout_ms=30000, *, patterns=None):
     queue is empty. Caller MUST `ack` or `abandon` (alias for `nack`) the id
     or the message becomes visible again after `visibility_timeout_ms`."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "claim", "queue"),
         (int(visibility_timeout_ms),),
     )
     row = cur.fetchone()
-    raw.commit()
+    conn.commit()
     cur.close()
     if not row:
         return None
@@ -474,11 +449,10 @@ def queue_ack(conn, name, message_id, *, patterns=None):
     """Mark a claimed message done (DELETEs the row). Returns True if the
     message existed and was removed."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "ack", "queue"), (int(message_id),))
     removed = cur.rowcount > 0
-    raw.commit()
+    conn.commit()
     cur.close()
     return removed
 
@@ -489,11 +463,10 @@ def queue_abandon(conn, name, message_id, *, patterns=None):
     parlance — the message stays in the queue and is redelivered to the
     next claim."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "nack", "queue"), (int(message_id),))
     row = cur.fetchone()
-    raw.commit()
+    conn.commit()
     cur.close()
     return row is not None
 
@@ -509,14 +482,13 @@ def queue_extend(conn, name, message_id, additional_ms, *, patterns=None):
     same `(id, ms)` tuple as native-$N drivers.
     """
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "extend", "queue"),
         (int(message_id), int(additional_ms)),
     )
     row = cur.fetchone()
-    raw.commit()
+    conn.commit()
     cur.close()
     return row[0] if row else None
 
@@ -526,8 +498,7 @@ def queue_peek(conn, name, *, patterns=None):
     with `id`, `payload`, `visible_at`, `status`, `created_at`, or None
     when nothing is ready."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "peek", "queue"))
     row = cur.fetchone()
     cur.close()
@@ -546,8 +517,7 @@ def queue_peek(conn, name, *, patterns=None):
 def queue_count_ready(conn, name, *, patterns=None):
     """Count of messages currently ready (status='ready' and visible)."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "count_ready", "queue"))
     row = cur.fetchone()
     cur.close()
@@ -557,8 +527,7 @@ def queue_count_ready(conn, name, *, patterns=None):
 def queue_count_claimed(conn, name, *, patterns=None):
     """Count of currently-claimed messages (in flight)."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "count_claimed", "queue"))
     row = cur.fetchone()
     cur.close()
@@ -574,14 +543,13 @@ def geo_add(conn, name, member, lon, lat, *, patterns=None):
     """Set-or-update a member's lon/lat. Idempotent on the member name (PK).
     Returns the just-stored (lon, lat) tuple."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "geoadd", "geo"),
         (str(member), float(lon), float(lat)),
     )
     row = cur.fetchone()
-    raw.commit()
+    conn.commit()
     cur.close()
     return (row[0], row[1]) if row else None
 
@@ -589,8 +557,7 @@ def geo_add(conn, name, member, lon, lat, *, patterns=None):
 def geo_pos(conn, name, member, *, patterns=None):
     """Fetch a member's (lon, lat) tuple, or None if absent."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "geopos", "geo"), (str(member),))
     row = cur.fetchone()
     cur.close()
@@ -601,8 +568,7 @@ def geo_dist(conn, name, member_a, member_b, unit="m", *, patterns=None):
     """Distance between two members. `unit` accepts m / km / mi / ft.
     Returns float in the requested unit, or None if either member is absent."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _pattern_sql(patterns, "geodist", "geo"),
         (str(member_a), str(member_b)),
@@ -624,8 +590,7 @@ def geo_radius(conn, name, lon, lat, radius, unit="m", limit=50, *, patterns=Non
     native-$N drivers.
     """
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     radius_m = _to_meters(radius, unit)
     cur.execute(
         _pattern_sql(patterns, "georadius_with_dist", "geo"),
@@ -648,8 +613,7 @@ def geo_radius_by_member(conn, name, member, radius, unit="m", limit=50, *, patt
     drivers.
     """
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     radius_m = _to_meters(radius, unit)
     cur.execute(
         _pattern_sql(patterns, "geosearch_member", "geo"),
@@ -664,11 +628,10 @@ def geo_radius_by_member(conn, name, member, radius, unit="m", limit=50, *, patt
 def geo_remove(conn, name, member, *, patterns=None):
     """Delete a member; True if removed, False if absent."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "geo_remove", "geo"), (str(member),))
     removed = cur.rowcount > 0
-    raw.commit()
+    conn.commit()
     cur.close()
     return removed
 
@@ -676,8 +639,7 @@ def geo_remove(conn, name, member, *, patterns=None):
 def geo_count(conn, name, *, patterns=None):
     """Total members in the namespace."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_pattern_sql(patterns, "geo_count", "geo"))
     row = cur.fetchone()
     cur.close()
@@ -704,10 +666,9 @@ def _convert_distance_meters(meters, unit):
 
 
 def script(conn, lua_code, *args):
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute("CREATE EXTENSION IF NOT EXISTS pllua")
-    raw.commit()
+    conn.commit()
     func_name = "_gl_lua_" + format(abs(hash(lua_code)), 'x')[:8]
     tag = f"$_gl_{hashlib.md5(lua_code.encode()).hexdigest()[:8]}$"
     n = len(args)
@@ -731,8 +692,7 @@ def script(conn, lua_code, *args):
 def count_distinct(conn, table, column):
     _validate_identifier(table)
     _validate_identifier(column)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(f"SELECT COUNT(DISTINCT {column}) FROM {table}")
     result = cur.fetchone()[0]
     cur.close()
@@ -752,14 +712,13 @@ def stream_add(conn, stream, payload, *, patterns=None):
             "`gl.stream_add(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _stream_sql(patterns, "insert"),
         (json.dumps(payload),),
     )
     msg_id = cur.fetchone()[0]
-    raw.commit()
+    conn.commit()
     cur.close()
     return msg_id
 
@@ -771,10 +730,9 @@ def stream_create_group(conn, stream, group, *, patterns=None):
             "`gl.stream_create_group(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_stream_sql(patterns, "create_group"), (group,))
-    raw.commit()
+    conn.commit()
     cur.close()
 
 
@@ -785,8 +743,7 @@ def stream_read(conn, stream, group, consumer, count=1, *, patterns=None):
             "`gl.stream_read(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_stream_sql(patterns, "group_get_cursor"), (group,))
     row = cur.fetchone()
     if not row:
@@ -811,7 +768,7 @@ def stream_read(conn, stream, group, consumer, count=1, *, patterns=None):
         pending_insert = _stream_sql(patterns, "pending_insert")
         for msg in messages:
             cur.execute(pending_insert, (msg["id"], group, consumer))
-    raw.commit()
+    conn.commit()
     cur.close()
     return messages
 
@@ -823,11 +780,10 @@ def stream_ack(conn, stream, group, message_id, *, patterns=None):
             "`gl.stream_ack(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(_stream_sql(patterns, "ack"), (group, message_id))
     removed = cur.rowcount > 0
-    raw.commit()
+    conn.commit()
     cur.close()
     return removed
 
@@ -839,8 +795,7 @@ def stream_claim(conn, stream, group, consumer, min_idle_ms=60000, *, patterns=N
             "`gl.stream_claim(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         _stream_sql(patterns, "claim"),
         (consumer, group, min_idle_ms),
@@ -858,7 +813,7 @@ def stream_claim(conn, stream, group, consumer, min_idle_ms=60000, *, patterns=N
                     "payload": r[1] if isinstance(r[1], dict) else json.loads(r[1]),
                     "created_at": str(r[2]),
                 })
-    raw.commit()
+    conn.commit()
     cur.close()
     return messages
 
@@ -872,8 +827,7 @@ def search(conn, table, column, query, limit=50, lang='english', highlight=False
         columns = list(column)
     for col in columns:
         _validate_identifier(col)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     tsvec = " || ' ' || ".join(f"coalesce({col}, '')" for col in columns)
     if highlight:
         hl_col = columns[0]
@@ -904,8 +858,7 @@ def search_fuzzy(conn, table, column, query, limit=50, threshold=0.3):
     """Typo-tolerant search. Like Elasticsearch fuzzy query."""
     _validate_identifier(table)
     _validate_identifier(column)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(f"""
         SELECT *, similarity({column}, %s) AS _score
         FROM {table}
@@ -922,8 +875,7 @@ def search_phonetic(conn, table, column, query, limit=50):
     """Sound-alike search. Like Elasticsearch phonetic plugin."""
     _validate_identifier(table)
     _validate_identifier(column)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(f"""
         SELECT *, similarity({column}, %s) AS _score
         FROM {table}
@@ -940,8 +892,7 @@ def similar(conn, table, column, vector, limit=10):
     """Vector similarity search. Like Elasticsearch kNN."""
     _validate_identifier(table)
     _validate_identifier(column)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     vec_literal = "[" + ",".join(str(float(v)) for v in vector) + "]"
     cur.execute(f"""
         SELECT *, ({column} <=> %s::vector) AS _score
@@ -958,8 +909,7 @@ def suggest(conn, table, column, prefix, limit=10):
     """Autocomplete/typeahead. Like Elasticsearch completion suggester."""
     _validate_identifier(table)
     _validate_identifier(column)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     pattern = prefix + "%"
     cur.execute(f"""
         SELECT *, similarity({column}, %s) AS _score
@@ -977,8 +927,7 @@ def facets(conn, table, column, limit=50, query=None, query_column=None, lang='e
     """Get value counts for a column. Like Elasticsearch terms aggregation."""
     _validate_identifier(table)
     _validate_identifier(column)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     if query and query_column:
         if isinstance(query_column, str):
             query_columns = [query_column]
@@ -1014,8 +963,7 @@ def aggregate(conn, table, column, func, group_by=None, limit=50):
     allowed = {'count', 'sum', 'avg', 'min', 'max'}
     if func not in allowed:
         raise ValueError(f"func must be one of {allowed}")
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     agg_expr = "COUNT(*)" if func == 'count' else f"{func.upper()}({column})"
     if group_by:
         _validate_identifier(group_by)
@@ -1043,20 +991,18 @@ def create_search_config(conn, name, copy_from='english'):
     """
     _validate_identifier(name)
     _validate_identifier(copy_from)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute("SELECT 1 FROM pg_ts_config WHERE cfgname = %s", (name,))
     if not cur.fetchone():
         cur.execute(f"CREATE TEXT SEARCH CONFIGURATION {name} (COPY = {copy_from})")
-        raw.commit()
+        conn.commit()
     cur.close()
 
 
 def percolate_add(conn, name, query_id, query, lang='english', metadata=None):
     """Register a named query for reverse matching. Like Elasticsearch percolator."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(f"""
         CREATE TABLE IF NOT EXISTS {name} (
             query_id TEXT PRIMARY KEY,
@@ -1078,15 +1024,14 @@ def percolate_add(conn, name, query_id, query, lang='english', metadata=None):
             lang = EXCLUDED.lang,
             metadata = EXCLUDED.metadata
     """, (query_id, query, lang, query, lang, metadata_json))
-    raw.commit()
+    conn.commit()
     cur.close()
 
 
 def percolate(conn, name, text, lang='english', limit=50):
     """Match a document against stored queries. Like Elasticsearch percolate API."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(f"""
         SELECT query_id, query_text, metadata,
             ts_rank(to_tsvector(%s, %s), tsquery) AS _score
@@ -1103,19 +1048,17 @@ def percolate(conn, name, text, lang='english', limit=50):
 def percolate_delete(conn, name, query_id):
     """Remove a stored query from a percolator index."""
     _validate_identifier(name)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(f"DELETE FROM {name} WHERE query_id = %s RETURNING query_id", (query_id,))
     deleted = cur.fetchone() is not None
-    raw.commit()
+    conn.commit()
     cur.close()
     return deleted
 
 
 def analyze(conn, text, lang='english'):
     """Show how text is tokenized. Like Elasticsearch _analyze API."""
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute("SELECT alias, description, token, dictionaries, dictionary, lexemes FROM ts_debug(%s, %s)", (lang, text))
     cols = [desc[0] for desc in cur.description]
     results = [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -1128,8 +1071,7 @@ def explain_score(conn, table, column, query, id_column, id_value, lang='english
     _validate_identifier(table)
     _validate_identifier(column)
     _validate_identifier(id_column)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(f"""
         SELECT
             {column} AS document_text,
@@ -1465,15 +1407,14 @@ def doc_create_collection(conn, collection, unlogged=False, *, patterns=None):
 def doc_insert(conn, collection, document, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(
         f"INSERT INTO {table} (data) VALUES (%s::jsonb) RETURNING _id, data, created_at",
         (json.dumps(document),),
     )
     cols = [desc[0] for desc in cur.description]
     row = cur.fetchone()
-    raw.commit()
+    conn.commit()
     cur.close()
     return dict(zip(cols, row))
 
@@ -1481,8 +1422,7 @@ def doc_insert(conn, collection, document, *, patterns=None):
 def doc_insert_many(conn, collection, documents, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     placeholders = ", ".join(["(%s::jsonb)"] * len(documents))
     params = tuple(json.dumps(d) for d in documents)
     cur.execute(
@@ -1491,7 +1431,7 @@ def doc_insert_many(conn, collection, documents, *, patterns=None):
     )
     cols = [desc[0] for desc in cur.description]
     results = [dict(zip(cols, row)) for row in cur.fetchall()]
-    raw.commit()
+    conn.commit()
     cur.close()
     return results
 
@@ -1499,8 +1439,7 @@ def doc_insert_many(conn, collection, documents, *, patterns=None):
 def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     sql = f"SELECT _id, data, created_at FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
@@ -1530,8 +1469,7 @@ def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None, *,
 def doc_find_cursor(conn, collection, filter=None, sort=None, limit=None, skip=None, batch_size=100, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor(name=f"gl_cursor_{id(raw)}")
+    cur = conn.cursor(name=f"gl_cursor_{id(conn)}")
     sql = f"SELECT _id, data, created_at FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
@@ -1567,8 +1505,7 @@ def doc_find_cursor(conn, collection, filter=None, sort=None, limit=None, skip=N
 def doc_find_one(conn, collection, filter=None, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     sql = f"SELECT _id, data, created_at FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
@@ -1588,8 +1525,7 @@ def doc_find_one(conn, collection, filter=None, *, patterns=None):
 def doc_update(conn, collection, filter, update, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     where_clause, filter_params = _build_filter(filter)
     update_expr, update_params = _build_update(update)
     sql = f"UPDATE {table} SET data = {update_expr}"
@@ -1599,7 +1535,7 @@ def doc_update(conn, collection, filter, update, *, patterns=None):
         params.extend(filter_params)
     cur.execute(sql, tuple(params))
     rowcount = cur.rowcount
-    raw.commit()
+    conn.commit()
     cur.close()
     return rowcount
 
@@ -1607,8 +1543,7 @@ def doc_update(conn, collection, filter, update, *, patterns=None):
 def doc_update_one(conn, collection, filter, update, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     where_clause, filter_params = _build_filter(filter)
     update_expr, update_params = _build_update(update)
     if where_clause:
@@ -1622,7 +1557,7 @@ def doc_update_one(conn, collection, filter, update, *, patterns=None):
     params = list(filter_params) + list(update_params)
     cur.execute(sql, tuple(params))
     rowcount = cur.rowcount
-    raw.commit()
+    conn.commit()
     cur.close()
     return rowcount
 
@@ -1630,15 +1565,14 @@ def doc_update_one(conn, collection, filter, update, *, patterns=None):
 def doc_delete(conn, collection, filter, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     where_clause, filter_params = _build_filter(filter)
     sql = f"DELETE FROM {table}"
     if where_clause:
         sql += " WHERE " + where_clause
     cur.execute(sql, tuple(filter_params))
     rowcount = cur.rowcount
-    raw.commit()
+    conn.commit()
     cur.close()
     return rowcount
 
@@ -1646,8 +1580,7 @@ def doc_delete(conn, collection, filter, *, patterns=None):
 def doc_delete_one(conn, collection, filter, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     where_clause, filter_params = _build_filter(filter)
     if where_clause:
         cte_where = " WHERE " + where_clause
@@ -1659,7 +1592,7 @@ def doc_delete_one(conn, collection, filter, *, patterns=None):
         tuple(filter_params),
     )
     rowcount = cur.rowcount
-    raw.commit()
+    conn.commit()
     cur.close()
     return rowcount
 
@@ -1667,8 +1600,7 @@ def doc_delete_one(conn, collection, filter, *, patterns=None):
 def doc_count(conn, collection, filter=None, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     sql = f"SELECT COUNT(*) FROM {table}"
     params = []
     where_clause, filter_params = _build_filter(filter)
@@ -1684,8 +1616,7 @@ def doc_count(conn, collection, filter=None, *, patterns=None):
 def doc_find_one_and_update(conn, collection, filter, update, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     where_clause, filter_params = _build_filter(filter)
     update_expr, update_params = _build_update(update)
     if where_clause:
@@ -1702,7 +1633,7 @@ def doc_find_one_and_update(conn, collection, filter, update, *, patterns=None):
     cur.execute(sql, tuple(params))
     cols = [desc[0] for desc in cur.description]
     row = cur.fetchone()
-    raw.commit()
+    conn.commit()
     cur.close()
     if row is None:
         return None
@@ -1712,8 +1643,7 @@ def doc_find_one_and_update(conn, collection, filter, update, *, patterns=None):
 def doc_find_one_and_delete(conn, collection, filter, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     where_clause, filter_params = _build_filter(filter)
     if where_clause:
         cte_where = " WHERE " + where_clause
@@ -1728,7 +1658,7 @@ def doc_find_one_and_delete(conn, collection, filter, *, patterns=None):
     cur.execute(sql, tuple(filter_params))
     cols = [desc[0] for desc in cur.description]
     row = cur.fetchone()
-    raw.commit()
+    conn.commit()
     cur.close()
     if row is None:
         return None
@@ -1738,8 +1668,7 @@ def doc_find_one_and_delete(conn, collection, filter, *, patterns=None):
 def doc_distinct(conn, collection, field, filter=None, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     field_expr = _field_path(field)
     sql = f"SELECT DISTINCT {field_expr} FROM {table}"
     params = []
@@ -1758,8 +1687,7 @@ def doc_distinct(conn, collection, field, filter=None, *, patterns=None):
 def doc_create_index(conn, collection, keys=None, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     if keys is None:
         idx = _doc_index_name(table, "gin")
         cur.execute(
@@ -1773,7 +1701,7 @@ def doc_create_index(conn, collection, keys=None, *, patterns=None):
             cur.execute(
                 f"CREATE INDEX IF NOT EXISTS {idx} ON {table} ((data->>'{key}'))"
             )
-    raw.commit()
+    conn.commit()
     cur.close()
 
 
@@ -1928,8 +1856,7 @@ def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=No
     """
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     _SUPPORTED_STAGES = {
         "$match", "$group", "$sort", "$limit", "$skip",
         "$project", "$unwind", "$lookup",
@@ -2096,13 +2023,6 @@ def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=No
     return results
 
 
-def _get_raw_connection(conn):
-    """Extract the raw psycopg/psycopg2 connection from a wrapped connection."""
-    if hasattr(conn, '_conn'):
-        return conn._conn
-    return conn
-
-
 def _make_listen_connection(conn):
     """Create a separate connection for LISTEN (reuses the same DSN)."""
     dsn = conn.info.dsn if hasattr(conn, 'info') else conn.dsn
@@ -2116,8 +2036,7 @@ def doc_watch(conn, collection, callback, blocking=True, *, patterns=None):
     """Watch a collection for changes via triggers + pg_notify. Like MongoDB change streams."""
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
 
     # Trigger / function / channel names are keyed off the user's collection
     # name (validated identifier — safe to interpolate). The trigger fires on
@@ -2145,13 +2064,13 @@ def doc_watch(conn, collection, callback, blocking=True, *, patterns=None):
             AFTER INSERT OR UPDATE OR DELETE ON {table}
             FOR EACH ROW EXECUTE FUNCTION _gl_watch_{collection}()
     """)
-    raw.commit()
+    conn.commit()
     cur.close()
 
     channel = f"_gl_changes_{collection}"
 
     def _listen():
-        listen_conn = _make_listen_connection(raw)
+        listen_conn = _make_listen_connection(conn)
         lcur = listen_conn.cursor()
         lcur.execute(f"LISTEN {channel}")
         listen_conn.commit()
@@ -2176,11 +2095,10 @@ def doc_unwatch(conn, collection, *, patterns=None):
     """Remove change stream trigger from a collection."""
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(f"DROP TRIGGER IF EXISTS _gl_watch_{collection}_trigger ON {table}")
     cur.execute(f"DROP FUNCTION IF EXISTS _gl_watch_{collection}()")
-    raw.commit()
+    conn.commit()
     cur.close()
 
 
@@ -2191,8 +2109,7 @@ def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_
     if not isinstance(expire_after_seconds, int):
         raise ValueError("expire_after_seconds must be an integer")
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
 
     idx_ttl = _doc_index_name(table, "ttl")
     cur.execute(
@@ -2216,7 +2133,7 @@ def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_
             BEFORE INSERT ON {table}
             FOR EACH STATEMENT EXECUTE FUNCTION _gl_ttl_{collection}()
     """)
-    raw.commit()
+    conn.commit()
     cur.close()
 
 
@@ -2224,13 +2141,12 @@ def doc_remove_ttl_index(conn, collection, *, patterns=None):
     """Remove TTL trigger, function, and index from a collection."""
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     idx_ttl = _doc_index_name(table, "ttl")
     cur.execute(f"DROP TRIGGER IF EXISTS _gl_ttl_{collection}_trigger ON {table}")
     cur.execute(f"DROP FUNCTION IF EXISTS _gl_ttl_{collection}()")
     cur.execute(f"DROP INDEX IF EXISTS {idx_ttl}")
-    raw.commit()
+    conn.commit()
     cur.close()
 
 
@@ -2245,8 +2161,7 @@ def doc_create_capped(conn, collection, max_documents, *, patterns=None):
     if not isinstance(max_documents, int):
         raise ValueError("max_documents must be an integer")
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
 
     idx_created = _doc_index_name(table, "created_at")
     cur.execute(
@@ -2276,7 +2191,7 @@ def doc_create_capped(conn, collection, max_documents, *, patterns=None):
             AFTER INSERT ON {table}
             FOR EACH STATEMENT EXECUTE FUNCTION _gl_cap_{collection}()
     """)
-    raw.commit()
+    conn.commit()
     cur.close()
 
 
@@ -2284,9 +2199,8 @@ def doc_remove_cap(conn, collection, *, patterns=None):
     """Remove capped collection trigger and function."""
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    raw = _get_raw_connection(conn)
-    cur = raw.cursor()
+    cur = conn.cursor()
     cur.execute(f"DROP TRIGGER IF EXISTS _gl_cap_{collection}_trigger ON {table}")
     cur.execute(f"DROP FUNCTION IF EXISTS _gl_cap_{collection}()")
-    raw.commit()
+    conn.commit()
     cur.close()

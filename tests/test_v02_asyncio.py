@@ -1,8 +1,7 @@
 """Tests for the v0.2.x async factory API in goldlapel.asyncio.
 
 Native asyncpg path: wrapper methods call goldlapel.asyncio._utils functions
-directly with an asyncpg.Connection (wrapped in AsyncCachedConnection) — no
-thread-pool bridge. These tests mock asyncpg.connect + subprocess spawn to
+directly with a plain asyncpg.Connection — no thread-pool bridge. These tests mock asyncpg.connect + subprocess spawn to
 verify wiring, lifecycle, `using()` semantics, and the startup banner
 without touching a real Postgres.
 """
@@ -48,8 +47,7 @@ class TestAsyncStart:
         with patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
              patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
              patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-             patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
-             patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c):
+             patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"):
             import subprocess as sp_mod
             with patch("subprocess.Popen") as mock_popen:
                 proc = MagicMock()
@@ -60,7 +58,7 @@ class TestAsyncStart:
                     _reset_proxy_state()
                     result = await gl_async.start("postgresql://host/db")
                     assert isinstance(result, AsyncGoldLapel)
-                    # Internal conn is set to the wrapped asyncpg raw conn.
+                    # Internal conn is the plain asyncpg conn.
                     assert result._conn is fake_raw
                     # Sync struct exists for using() + subprocess bookkeeping.
                     assert result._sync is not None
@@ -454,7 +452,6 @@ class TestAsyncStartupBanner:
                  patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
                  patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
                  patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
-                 patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c), \
                  patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
                 await gl_async.start("postgresql://host:5432/mydb")
                 captured = capsys.readouterr()
@@ -473,7 +470,6 @@ class TestAsyncStartupBanner:
                  patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
                  patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
                  patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
-                 patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c), \
                  patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
                 await gl_async.start("postgresql://host:5432/mydb", silent=True)
                 captured = capsys.readouterr()
@@ -483,181 +479,8 @@ class TestAsyncStartupBanner:
             _reset_proxy_state()
 
 
-class TestAsyncDisableNativeCache:
-    """`disable_native_cache` is plumbed through the async factory the same
-    way as the sync surface — stored on the underlying GoldLapel and
-    forwarded to wrap() at internal-conn open time."""
-
-    def _base_patches(self):
-        fake_asyncpg = MagicMock()
-        fake_raw = MagicMock()
-        fake_raw.set_type_codec = AsyncMock()
-        fake_raw.close = AsyncMock()
-        fake_asyncpg.connect = AsyncMock(return_value=fake_raw)
-        return fake_asyncpg
-
-    def test_async_disable_native_cache_defaults_false(self):
-        gl = AsyncGoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._sync._disable_native_cache is False
-
-    def test_async_disable_native_cache_true_stored(self):
-        gl = AsyncGoldLapel(
-            "postgresql://localhost:5432/mydb",
-            disable_native_cache=True,
-        )
-        assert gl._sync._disable_native_cache is True
-
-    @pytest.mark.asyncio
-    async def test_async_disable_native_cache_forwarded_to_wrap(self):
-        _reset_proxy_state()
-        try:
-            fake_asyncpg = self._base_patches()
-            wrap_calls = []
-
-            def fake_wrap(c, **kw):
-                wrap_calls.append(kw)
-                return c
-
-            with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
-                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
-                 patch("goldlapel.wrap.wrap", side_effect=fake_wrap), \
-                 patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
-                await gl_async.start(
-                    "postgresql://host:5432/mydb",
-                    disable_native_cache=True,
-                    silent=True,
-                )
-            assert wrap_calls, "wrap() was not called"
-            assert wrap_calls[0].get("disable_native_cache") is True
-        finally:
-            _reset_proxy_state()
-
-    @pytest.mark.asyncio
-    async def test_async_disable_native_cache_default_passes_false_to_wrap(self):
-        _reset_proxy_state()
-        try:
-            fake_asyncpg = self._base_patches()
-            wrap_calls = []
-
-            def fake_wrap(c, **kw):
-                wrap_calls.append(kw)
-                return c
-
-            with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
-                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
-                 patch("goldlapel.wrap.wrap", side_effect=fake_wrap), \
-                 patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
-                await gl_async.start("postgresql://host:5432/mydb", silent=True)
-            assert wrap_calls, "wrap() was not called"
-            assert wrap_calls[0].get("disable_native_cache") is False
-        finally:
-            _reset_proxy_state()
-
-
-class TestAsyncAggressiveVerifyKwarg:
-    """`aggressive_verify="auto"|"on"|"off"` is a top-level kwarg on
-    `AsyncGoldLapel(...)` / `goldlapel.asyncio.start(...)`. Stored on
-    the underlying sync GoldLapel; forwarded to wrap() at internal-conn
-    open time along with the upstream URL as `db_key=`."""
-
-    def _base_patches(self):
-        fake_asyncpg = MagicMock()
-        fake_raw = MagicMock()
-        fake_raw.set_type_codec = AsyncMock()
-        fake_raw.close = AsyncMock()
-        fake_asyncpg.connect = AsyncMock(return_value=fake_raw)
-        return fake_asyncpg
-
-    def test_async_aggressive_verify_defaults_to_auto(self):
-        gl = AsyncGoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._sync._aggressive_verify == "auto"
-
-    def test_async_aggressive_verify_on_stored(self):
-        gl = AsyncGoldLapel(
-            "postgresql://localhost:5432/mydb",
-            aggressive_verify="on",
-        )
-        assert gl._sync._aggressive_verify == "on"
-
-    def test_async_aggressive_verify_off_stored(self):
-        gl = AsyncGoldLapel(
-            "postgresql://localhost:5432/mydb",
-            aggressive_verify="off",
-        )
-        assert gl._sync._aggressive_verify == "off"
-
-    def test_async_aggressive_verify_invalid_raises(self):
-        with pytest.raises(ValueError):
-            AsyncGoldLapel(
-                "postgresql://localhost:5432/mydb",
-                aggressive_verify="bogus",
-            )
-
-    @pytest.mark.asyncio
-    async def test_async_aggressive_verify_forwarded_to_wrap(self):
-        _reset_proxy_state()
-        try:
-            fake_asyncpg = self._base_patches()
-            wrap_calls = []
-
-            def fake_wrap(c, **kw):
-                wrap_calls.append(kw)
-                return c
-
-            with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
-                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
-                 patch("goldlapel.wrap.wrap", side_effect=fake_wrap), \
-                 patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
-                await gl_async.start(
-                    "postgresql://host:5432/mydb",
-                    aggressive_verify="on",
-                    silent=True,
-                )
-            assert wrap_calls, "wrap() was not called"
-            assert wrap_calls[0].get("aggressive_verify") == "on"
-            # Upstream URL → db_key (used today for the one-shot
-            # `aggressive_verify="off"` warning; reserved for future
-            # per-database telemetry).
-            assert wrap_calls[0].get("db_key") == "postgresql://host:5432/mydb"
-        finally:
-            _reset_proxy_state()
-
-    @pytest.mark.asyncio
-    async def test_async_aggressive_verify_default_auto_passes_to_wrap(self):
-        _reset_proxy_state()
-        try:
-            fake_asyncpg = self._base_patches()
-            wrap_calls = []
-
-            def fake_wrap(c, **kw):
-                wrap_calls.append(kw)
-                return c
-
-            with patch("goldlapel.asyncio._proxy._detect_asyncpg", return_value=fake_asyncpg), \
-                 patch("goldlapel.asyncio._proxy._find_binary", return_value="/usr/bin/goldlapel"), \
-                 patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
-                 patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
-                 patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
-                 patch("goldlapel.wrap.wrap", side_effect=fake_wrap), \
-                 patch("subprocess.Popen", side_effect=lambda *a, **kw: _mock_popen_instance()):
-                await gl_async.start("postgresql://host:5432/mydb", silent=True)
-            assert wrap_calls, "wrap() was not called"
-            assert wrap_calls[0].get("aggressive_verify") == "auto"
-        finally:
-            _reset_proxy_state()
-
-
 class TestAsyncPromotedDisableKwargs:
-    """The 4 promoted disable flags (proxy_cache / matviews / sqloptimize /
+    """The 3 promoted disable flags (proxy_cache / sqloptimize /
     auto_indexes) must reach the proxy CLI on the async path the same way
     they do on sync. The async constructor stores them on the underlying
     GoldLapel; AsyncGoldLapel.start() emits the matching `--disable-X`
@@ -683,12 +506,6 @@ class TestAsyncPromotedDisableKwargs:
         )
         assert gl._sync._disable_proxy_cache is True
 
-    def test_async_disable_matviews_true_stored(self):
-        gl = AsyncGoldLapel(
-            "postgresql://localhost:5432/mydb", disable_matviews=True,
-        )
-        assert gl._sync._disable_matviews is True
-
     def test_async_disable_sqloptimize_true_stored(self):
         gl = AsyncGoldLapel(
             "postgresql://localhost:5432/mydb", disable_sqloptimize=True,
@@ -701,11 +518,20 @@ class TestAsyncPromotedDisableKwargs:
         )
         assert gl._sync._disable_auto_indexes is True
 
+    @pytest.mark.parametrize("kwarg", [
+        "invalidation_port", "disable_native_cache", "aggressive_verify",
+        "disable_matviews",
+    ])
+    def test_async_removed_cache_kwargs_raise(self, kwarg):
+        # The in-process cache and matviews are gone — no aliases.
+        with pytest.raises(TypeError):
+            gl_async.start("postgresql://localhost:5432/mydb", **{kwarg: True})
+
     # -- argv emission --------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_async_all_four_flags_emit(self):
-        # All 4 flags set → all 4 --disable-* CLI args present in spawn argv.
+    async def test_async_all_three_flags_emit(self):
+        # All 3 flags set → all 3 --disable-* CLI args present in spawn argv.
         _reset_proxy_state()
         try:
             fake_asyncpg = self._base_patches()
@@ -720,12 +546,10 @@ class TestAsyncPromotedDisableKwargs:
                  patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
                  patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
                  patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
-                 patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c), \
                  patch("subprocess.Popen", side_effect=capture_popen):
                 await gl_async.start(
                     "postgresql://host:5432/mydb",
                     disable_proxy_cache=True,
-                    disable_matviews=True,
                     disable_sqloptimize=True,
                     disable_auto_indexes=True,
                     silent=True,
@@ -733,7 +557,7 @@ class TestAsyncPromotedDisableKwargs:
             assert captured_cmd, "Popen was not called"
             cmd = captured_cmd[0]
             for flag in (
-                "--disable-proxy-cache", "--disable-matviews",
+                "--disable-proxy-cache",
                 "--disable-sqloptimize", "--disable-auto-indexes",
             ):
                 assert flag in cmd, f"{flag} missing from async spawn argv"
@@ -742,7 +566,7 @@ class TestAsyncPromotedDisableKwargs:
 
     @pytest.mark.asyncio
     async def test_async_no_disable_flags_in_default_argv(self):
-        # Default state: none of the 4 promoted flags should appear.
+        # Default state: none of the 3 promoted flags should appear.
         _reset_proxy_state()
         try:
             fake_asyncpg = self._base_patches()
@@ -757,13 +581,12 @@ class TestAsyncPromotedDisableKwargs:
                  patch("goldlapel.asyncio._proxy._wait_for_port", return_value=True), \
                  patch("goldlapel.asyncio._proxy._kill_orphan_on_port"), \
                  patch("goldlapel.asyncio._proxy._make_proxy_url", return_value="postgresql://localhost:7932/db"), \
-                 patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c), \
                  patch("subprocess.Popen", side_effect=capture_popen):
                 await gl_async.start("postgresql://host:5432/mydb", silent=True)
             assert captured_cmd, "Popen was not called"
             cmd = captured_cmd[0]
             for flag in (
-                "--disable-proxy-cache", "--disable-matviews",
+                "--disable-proxy-cache",
                 "--disable-sqloptimize", "--disable-auto-indexes",
             ):
                 assert flag not in cmd, (

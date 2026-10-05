@@ -73,19 +73,17 @@ def search_table(pg_url):
 
 @pytest.mark.asyncio
 class TestNativeAsyncpgPath:
-    """End-to-end tests: AsyncGoldLapel's internal conn is an asyncpg
-    connection (wrapped in AsyncCachedConnection), no thread-pool bounce."""
+    """End-to-end tests: AsyncGoldLapel's internal conn is a plain asyncpg
+    connection, no thread-pool bounce."""
 
     async def test_internal_conn_is_asyncpg(self, pg_url):
         from goldlapel.asyncio import start
-        async with start(pg_url, port=7840) as gl:
-            # The internal conn is AsyncCachedConnection wrapping asyncpg.
-            raw = gl.conn._real
-            assert isinstance(raw, asyncpg.Connection)
+        async with start(pg_url, proxy_port=7840) as gl:
+            assert isinstance(gl.conn, asyncpg.Connection)
 
     async def test_doc_insert_and_find(self, pg_url, collection_name):
         from goldlapel.asyncio import start
-        async with start(pg_url, port=7841) as gl:
+        async with start(pg_url, proxy_port=7841) as gl:
             await gl.documents.create_collection(collection_name, unlogged=True)
             inserted = await gl.documents.insert(
                 collection_name, {"hello": "asyncpg", "count": 1},
@@ -108,7 +106,7 @@ class TestNativeAsyncpgPath:
 
     async def test_doc_update_and_delete(self, pg_url, collection_name):
         from goldlapel.asyncio import start
-        async with start(pg_url, port=7842) as gl:
+        async with start(pg_url, proxy_port=7842) as gl:
             await gl.documents.create_collection(collection_name, unlogged=True)
             await gl.documents.insert(collection_name, {"k": "a", "n": 1})
             await gl.documents.insert(collection_name, {"k": "b", "n": 2})
@@ -126,7 +124,7 @@ class TestNativeAsyncpgPath:
 
     async def test_search_native_async(self, pg_url, search_table):
         from goldlapel.asyncio import start
-        async with start(pg_url, port=7843) as gl:
+        async with start(pg_url, proxy_port=7843) as gl:
             results = await gl.search(search_table, "body", "postgres")
             # Two docs mention 'postgres' in our seed data.
             assert len(results) >= 2
@@ -140,7 +138,7 @@ class TestNativeAsyncpgPath:
         """gl.using(user_conn) must route wrapper calls through the
         user-supplied asyncpg connection — matching sync semantics."""
         from goldlapel.asyncio import start
-        async with start(pg_url, port=7844) as gl:
+        async with start(pg_url, proxy_port=7844) as gl:
             # Pre-create the collection using the internal conn.
             await gl.documents.create_collection(collection_name, unlogged=True)
 
@@ -173,7 +171,7 @@ class TestNativeAsyncpgPath:
     async def test_using_rollback_discards_writes(self, pg_url, collection_name):
         """If the user-supplied transaction rolls back, writes must be gone."""
         from goldlapel.asyncio import start
-        async with start(pg_url, port=7845) as gl:
+        async with start(pg_url, proxy_port=7845) as gl:
             await gl.documents.create_collection(collection_name, unlogged=True)
 
             # Match the internal conn's settings: disable statement cache to
@@ -205,7 +203,7 @@ class TestNativeAsyncpgPath:
         self, pg_url, collection_name,
     ):
         from goldlapel.asyncio import start
-        async with start(pg_url, port=7846) as gl:
+        async with start(pg_url, proxy_port=7846) as gl:
             await gl.documents.create_collection(collection_name, unlogged=True)
             # Match the internal conn's settings: disable statement cache to
             # avoid the Gold Lapel proxy's CloseComplete-framing interaction
@@ -236,10 +234,10 @@ class TestSyncAsyncParity:
         import goldlapel
         from goldlapel.asyncio import start
 
-        with goldlapel.start(pg_url, port=7850) as sync_gl:
+        with goldlapel.start(pg_url, proxy_port=7850) as sync_gl:
             sync_results = sync_gl.search(search_table, "body", "postgres")
 
-        async with start(pg_url, port=7851) as async_gl:
+        async with start(pg_url, proxy_port=7851) as async_gl:
             async_results = await async_gl.search(
                 search_table, "body", "postgres",
             )
@@ -257,7 +255,7 @@ class TestSyncAsyncParity:
         from goldlapel.asyncio import start
 
         # Sync path: insert + find
-        with goldlapel.start(pg_url, port=7852) as sync_gl:
+        with goldlapel.start(pg_url, proxy_port=7852) as sync_gl:
             sync_gl.documents.create_collection(collection_name, unlogged=True)
             sync_gl.documents.insert(collection_name, {"tag": "a", "n": 1})
             sync_gl.documents.insert(collection_name, {"tag": "a", "n": 2})
@@ -267,7 +265,7 @@ class TestSyncAsyncParity:
             )
 
         # Async path on the same table
-        async with start(pg_url, port=7853) as async_gl:
+        async with start(pg_url, proxy_port=7853) as async_gl:
             async_results = await async_gl.documents.find(
                 collection_name, {"tag": "a"}, sort={"n": 1},
             )

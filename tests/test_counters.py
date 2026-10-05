@@ -130,9 +130,7 @@ class TestVerbDispatch:
 
 
 class _FakeConn:
-    """Stand-in for a raw psycopg connection. Plain class (not a MagicMock)
-    so `_get_raw_connection` doesn't recurse via the auto-`_conn` attribute
-    that bare MagicMocks expose."""
+    """Plain stand-in for a raw psycopg connection."""
     def __init__(self, cursor):
         self._cursor = cursor
         self.commit = MagicMock()

@@ -40,7 +40,7 @@ def gl(pg_url):
     import goldlapel
     # Use a high port to avoid conflicts with default installs
     port = 7900 + (int(time.time()) % 50)
-    inst = goldlapel.start(pg_url, port=port)
+    inst = goldlapel.start(pg_url, proxy_port=port)
     yield inst
     inst.stop()
 
@@ -96,7 +96,7 @@ class TestFactoryEndToEnd:
 class TestContextManager:
     def test_with_statement_starts_and_stops(self, pg_url):
         import goldlapel
-        with goldlapel.start(pg_url, port=7949) as gl:
+        with goldlapel.start(pg_url, proxy_port=7949) as gl:
             assert gl.running
         assert not gl.running
 
@@ -105,7 +105,7 @@ class TestContextManager:
 class TestAsyncEndToEnd:
     async def test_async_factory_and_method(self, pg_url):
         from goldlapel.asyncio import start
-        gl = await start(pg_url, port=7948)
+        gl = await start(pg_url, proxy_port=7948)
         assert gl.running
         coll = f"gl_v02_smoke_async_{int(time.time() * 1000)}"
         await gl.documents.create_collection(coll, unlogged=True)
@@ -116,7 +116,7 @@ class TestAsyncEndToEnd:
 
     async def test_async_context_manager(self, pg_url):
         from goldlapel.asyncio import start
-        async with start(pg_url, port=7947) as gl:
+        async with start(pg_url, proxy_port=7947) as gl:
             assert gl.running
             coll = f"gl_v02_smoke_async_ctx_{int(time.time() * 1000)}"
             await gl.documents.create_collection(coll, unlogged=True)

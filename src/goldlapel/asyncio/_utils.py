@@ -14,7 +14,7 @@ asyncpg differences handled here:
 
   - No explicit commit: asyncpg connections are auto-committed by default
     (every `execute()` is its own transaction). The sync path calls
-    `raw.commit()` after writes; the async path omits that, since writes
+    `conn.commit()` after writes; the async path omits that, since writes
     are visible immediately. Inside `async with conn.transaction():` (opened
     by asyncpg or by `gl.using()` with a user-supplied transaction), writes
     are deferred as expected.
@@ -86,36 +86,24 @@ def _to_asyncpg(sql, params):
     return "".join(out), tuple(params)
 
 
-def _get_raw_connection(conn):
-    """Extract the raw asyncpg.Connection from an AsyncCachedConnection wrapper."""
-    # AsyncCachedConnection stores the real asyncpg conn as `_real`.
-    if hasattr(conn, "_real") and hasattr(conn._real, "fetch"):
-        return conn._real
-    return conn
-
-
 async def _execute(conn, sql, params=()):
     sql2, params2 = _to_asyncpg(sql, params)
-    raw = _get_raw_connection(conn)
-    return await raw.execute(sql2, *params2)
+    return await conn.execute(sql2, *params2)
 
 
 async def _fetch(conn, sql, params=()):
     sql2, params2 = _to_asyncpg(sql, params)
-    raw = _get_raw_connection(conn)
-    return await raw.fetch(sql2, *params2)
+    return await conn.fetch(sql2, *params2)
 
 
 async def _fetchrow(conn, sql, params=()):
     sql2, params2 = _to_asyncpg(sql, params)
-    raw = _get_raw_connection(conn)
-    return await raw.fetchrow(sql2, *params2)
+    return await conn.fetchrow(sql2, *params2)
 
 
 async def _fetchval(conn, sql, params=()):
     sql2, params2 = _to_asyncpg(sql, params)
-    raw = _get_raw_connection(conn)
-    return await raw.fetchval(sql2, *params2)
+    return await conn.fetchval(sql2, *params2)
 
 
 def _rowcount_from_status(status):
@@ -157,8 +145,7 @@ async def subscribe(conn, channel, callback, blocking=True):
     import asyncio
 
     _validate_identifier(channel)
-    raw = _get_raw_connection(conn)
-    dsn = _dsn_for_listen(raw)
+    dsn = _dsn_for_listen(conn)
 
     import asyncpg
     listen_conn = await asyncpg.connect(dsn)
@@ -205,18 +192,15 @@ def _family_pattern(patterns, key, family):
 
 async def _family_execute(conn, sql, *params):
     """Execute SQL with native `$N` placeholders, no `%s → $N` translation."""
-    raw = _get_raw_connection(conn)
-    return await raw.execute(sql, *params)
+    return await conn.execute(sql, *params)
 
 
 async def _family_fetchrow(conn, sql, *params):
-    raw = _get_raw_connection(conn)
-    return await raw.fetchrow(sql, *params)
+    return await conn.fetchrow(sql, *params)
 
 
 async def _family_fetch(conn, sql, *params):
-    raw = _get_raw_connection(conn)
-    return await raw.fetch(sql, *params)
+    return await conn.fetch(sql, *params)
 
 
 # ---------------------------------------------------------------------------
@@ -627,9 +611,8 @@ async def stream_add(conn, stream, payload, *, patterns=None):
             "`gl.stream_add(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
     sql = _stream_pattern(patterns, "insert")
-    row = await raw.fetchrow(sql, json.dumps(payload))
+    row = await conn.fetchrow(sql, json.dumps(payload))
     return row[0]
 
 
@@ -640,8 +623,7 @@ async def stream_create_group(conn, stream, group, *, patterns=None):
             "`gl.stream_create_group(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
-    await raw.execute(_stream_pattern(patterns, "create_group"), group)
+    await conn.execute(_stream_pattern(patterns, "create_group"), group)
 
 
 async def stream_read(conn, stream, group, consumer, count=1, *, patterns=None):
@@ -653,13 +635,12 @@ async def stream_read(conn, stream, group, consumer, count=1, *, patterns=None):
             "`gl.stream_read(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
-    async with raw.transaction():
-        row = await raw.fetchrow(_stream_pattern(patterns, "group_get_cursor"), group)
+    async with conn.transaction():
+        row = await conn.fetchrow(_stream_pattern(patterns, "group_get_cursor"), group)
         if not row:
             return []
         last_id = row[0]
-        rows = await raw.fetch(_stream_pattern(patterns, "read_since"), last_id, count)
+        rows = await conn.fetch(_stream_pattern(patterns, "read_since"), last_id, count)
         messages = []
         for r in rows:
             msg_id, payload, created_at = r[0], r[1], r[2]
@@ -670,13 +651,13 @@ async def stream_read(conn, stream, group, consumer, count=1, *, patterns=None):
             })
         if messages:
             new_last = messages[-1]["id"]
-            await raw.execute(
+            await conn.execute(
                 _stream_pattern(patterns, "group_advance_cursor"),
                 new_last, group,
             )
             pending_insert = _stream_pattern(patterns, "pending_insert")
             for msg in messages:
-                await raw.execute(pending_insert, msg["id"], group, consumer)
+                await conn.execute(pending_insert, msg["id"], group, consumer)
         return messages
 
 
@@ -687,8 +668,7 @@ async def stream_ack(conn, stream, group, message_id, *, patterns=None):
             "`gl.stream_ack(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
-    status = await raw.execute(_stream_pattern(patterns, "ack"), group, message_id)
+    status = await conn.execute(_stream_pattern(patterns, "ack"), group, message_id)
     return _rowcount_from_status(status) > 0
 
 
@@ -699,8 +679,7 @@ async def stream_claim(conn, stream, group, consumer, min_idle_ms=60000, *, patt
             "`gl.stream_claim(...)` rather than the utils function directly."
         )
     _validate_identifier(stream)
-    raw = _get_raw_connection(conn)
-    rows = await raw.fetch(
+    rows = await conn.fetch(
         _stream_pattern(patterns, "claim"),
         consumer, group, min_idle_ms,
     )
@@ -709,7 +688,7 @@ async def stream_claim(conn, stream, group, consumer, min_idle_ms=60000, *, patt
     if claimed_ids:
         read_by_id = _stream_pattern(patterns, "read_by_id")
         for msg_id in claimed_ids:
-            r = await raw.fetchrow(read_by_id, msg_id)
+            r = await conn.fetchrow(read_by_id, msg_id)
             if r:
                 payload = r[1]
                 messages.append({
@@ -1032,9 +1011,8 @@ async def doc_find_cursor(
     table = _doc_table(patterns)
     sql, params = _build_doc_find_sql(table, filter, sort, limit, skip)
     sql2, params2 = _to_asyncpg(sql, tuple(params))
-    raw = _get_raw_connection(conn)
-    async with raw.transaction():
-        cur = await raw.cursor(sql2, *params2)
+    async with conn.transaction():
+        cur = await conn.cursor(sql2, *params2)
         while True:
             rows = await cur.fetch(batch_size)
             if not rows:
@@ -1451,8 +1429,7 @@ async def doc_watch(conn, collection, callback, blocking=True, *, patterns=None)
     """)
 
     channel = f"_gl_changes_{collection}"
-    raw = _get_raw_connection(conn)
-    dsn = _dsn_for_listen(raw)
+    dsn = _dsn_for_listen(conn)
 
     import asyncpg
     listen_conn = await asyncpg.connect(dsn)

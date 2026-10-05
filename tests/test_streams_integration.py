@@ -47,7 +47,7 @@ def gl(pg_url):
     import goldlapel
     # Random high port range unlikely to collide with a dev install
     port = 7700 + (int(time.time() * 1000) % 100)
-    inst = goldlapel.start(pg_url, port=port)
+    inst = goldlapel.start(pg_url, proxy_port=port)
     yield inst
     inst.stop()
 
@@ -104,37 +104,6 @@ class TestStreamDdlOwnership:
             assert row == ("stream", stream_name, "v1")
         finally:
             conn.close()
-
-    def test_subsequent_calls_skip_ddl_fetch(self, gl, stream_name, monkeypatch):
-        """After the first fetch, subsequent calls use the cached patterns —
-        no extra HTTP round-trip to /api/ddl/*."""
-        from goldlapel import ddl as _ddl
-
-        real_fetch = _ddl.fetch_patterns
-        counter = {"n": 0}
-
-        def counting_fetch(*args, **kwargs):
-            counter["n"] += 1
-            return real_fetch(*args, **kwargs)
-
-        monkeypatch.setattr(_ddl, "fetch", counting_fetch)
-
-        # Three separate adds — first call hits the cache once (and performs HTTP),
-        # subsequent calls are served out of the cache layer. Our counter still ticks
-        # because the cache lookup is inside fetch() itself — but we can see the
-        # HTTP round-trip didn't repeat by checking the captured request count…
-        # Actually, the cache is inside fetch(), so fetch still runs — we measure
-        # by counting the *distinct* results it returns (should be identical).
-        gl.streams.add(stream_name, {"i": 1})
-        gl.streams.add(stream_name, {"i": 2})
-        gl.streams.add(stream_name, {"i": 3})
-
-        assert counter["n"] == 3, (
-            "fetch should be called once per stream_add invocation (but returns cached)"
-        )
-        # And the cache entry itself is shared:
-        cache = _ddl._cache_for(gl)
-        assert ("stream", stream_name) in cache
 
     def test_ddl_http_call_happens_once_per_name(self, gl, pg_url, stream_name, monkeypatch):
         """Instrument the HTTP layer directly — first stream op should POST
@@ -203,7 +172,7 @@ class TestAsyncStream:
         from goldlapel.asyncio import start
 
         port = 7800 + (int(time.time() * 1000) % 100)
-        async with start(pg_url, port=port) as gl:
+        async with start(pg_url, proxy_port=port) as gl:
             assert gl.running
             name = f"gl_async_stream_{int(time.time() * 1000)}"
             await gl.streams.create_group(name, "workers")

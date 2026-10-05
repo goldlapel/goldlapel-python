@@ -1,9 +1,9 @@
 """AsyncGoldLapel — native-asyncpg async façade over the Gold Lapel proxy.
 
 Spawns the proxy subprocess (via the sync helpers in goldlapel.proxy), opens
-an asyncpg.Connection wrapped with AsyncCachedConnection, and exposes the
-same wrapper-method surface as sync GoldLapel, implemented as native
-`async def` that calls into goldlapel.asyncio._utils.
+a plain asyncpg.Connection to it, and exposes the same wrapper-method
+surface as sync GoldLapel, implemented as native `async def` that calls
+into goldlapel.asyncio._utils.
 
 The wrapper-method surface is auto-derived at import time by walking the
 public methods on GoldLapel — see _derive_async_methods at the bottom of
@@ -16,9 +16,6 @@ Public API (unchanged from v0.2.0):
   - every wrapper method identical signature
   - gl.using(conn) scoped override — ContextVar semantics
   - conn= per-call kwarg with precedence: explicit > using > internal
-
-Internal conn is an AsyncCachedConnection wrapping asyncpg.Connection, so
-cache invalidation / read caching behaves identically to the sync path.
 
 When `asyncpg` is not importable, `start()` raises ImportError with the
 install hint. The sync fallback (psycopg3 async) is not implemented here —
@@ -89,8 +86,7 @@ class AsyncGoldLapel:
     """Native-asyncpg async façade over Gold Lapel.
 
     Spawns and owns the proxy subprocess (reusing the sync spawn helpers in
-    goldlapel.proxy) and opens an asyncpg connection wrapped with the same
-    AsyncCachedConnection used by user-supplied conns.
+    goldlapel.proxy) and opens an asyncpg connection to it.
     """
 
     def __init__(
@@ -99,7 +95,6 @@ class AsyncGoldLapel:
         *,
         proxy_port=None,
         dashboard_port=None,
-        invalidation_port=None,
         log_level=None,
         mode=None,
         license=None,
@@ -111,12 +106,9 @@ class AsyncGoldLapel:
         silent=False,
         mesh=False,
         mesh_tag=None,
-        disable_native_cache=False,
         disable_proxy_cache=False,
-        disable_matviews=False,
         disable_sqloptimize=False,
         disable_auto_indexes=False,
-        aggressive_verify="auto",
     ):
         # Piggyback on the sync GoldLapel for subprocess/lifecycle state so
         # `using(conn)` / ContextVar semantics and stop-on-exit are identical.
@@ -124,7 +116,6 @@ class AsyncGoldLapel:
             upstream,
             proxy_port=proxy_port,
             dashboard_port=dashboard_port,
-            invalidation_port=invalidation_port,
             log_level=log_level,
             mode=mode,
             license=license,
@@ -136,14 +127,11 @@ class AsyncGoldLapel:
             silent=silent,
             mesh=mesh,
             mesh_tag=mesh_tag,
-            disable_native_cache=disable_native_cache,
             disable_proxy_cache=disable_proxy_cache,
-            disable_matviews=disable_matviews,
             disable_sqloptimize=disable_sqloptimize,
             disable_auto_indexes=disable_auto_indexes,
-            aggressive_verify=aggressive_verify,
         )
-        self._conn = None  # AsyncCachedConnection (wraps asyncpg.Connection)
+        self._conn = None  # asyncpg.Connection
 
         # Nested namespaces — mirror the sync GoldLapel but with async sub-API
         # classes. State is shared via the parent reference held in each
@@ -218,8 +206,6 @@ class AsyncGoldLapel:
             # before the structured config map.
             if sync._dashboard_port_explicit:
                 cmd += ["--dashboard-port", str(sync._dashboard_port)]
-            if sync._invalidation_port_explicit:
-                cmd += ["--invalidation-port", str(sync._invalidation_port)]
             verbose_flag = _log_level_to_verbose_flag(sync._log_level)
             if verbose_flag is not None:
                 cmd.append(verbose_flag)
@@ -237,8 +223,6 @@ class AsyncGoldLapel:
                 cmd += ["--mesh-tag", sync._mesh_tag]
             if sync._disable_proxy_cache:
                 cmd.append("--disable-proxy-cache")
-            if sync._disable_matviews:
-                cmd.append("--disable-matviews")
             if sync._disable_sqloptimize:
                 cmd.append("--disable-sqloptimize")
             if sync._disable_auto_indexes:
@@ -281,7 +265,7 @@ class AsyncGoldLapel:
                 self._sync._upstream, self._sync._proxy_port,
             )
 
-        # -- asyncpg connect + cache wrap, with cleanup on failure --
+        # -- asyncpg connect, with cleanup on failure --
         asyncpg = _detect_asyncpg()
         if asyncpg is None:
             # Should not reach here — `start()` factory pre-checks — but guard
@@ -293,17 +277,7 @@ class AsyncGoldLapel:
             )
 
         try:
-            raw = await _open_asyncpg_conn(self._sync._proxy_url)
-            from goldlapel.wrap import wrap
-            # invalidation_port is resolved at construction: either the
-            # explicit kwarg or proxy_port + 2.
-            self._conn = wrap(
-                raw,
-                invalidation_port=self._sync._invalidation_port,
-                disable_native_cache=self._sync._disable_native_cache,
-                aggressive_verify=self._sync._aggressive_verify,
-                db_key=self._sync._upstream,
-            )
+            self._conn = await _open_asyncpg_conn(self._sync._proxy_url)
         except BaseException:
             # Kill subprocess + close any half-open asyncpg conn before raising.
             await self._teardown_async()
@@ -396,8 +370,6 @@ class AsyncGoldLapel:
         block will use `conn` (typically a caller-provided asyncpg Connection
         inside their own transaction) instead of the internal connection.
 
-        Users may pass either a raw asyncpg.Connection or an AsyncCachedConnection
-        wrapper. The utils layer handles both via _get_raw_connection.
         """
         token = self._sync._using_conn.set(conn)
         try:
@@ -523,8 +495,8 @@ async def _actual_start(upstream, **kwargs):
     Mirrors goldlapel.proxy._ensure_running but for AsyncGoldLapel and with
     async connect inlined so we don't block the loop via threadpool bounces.
     `kwargs` carries the canonical-surface options (proxy_port,
-    dashboard_port, invalidation_port, log_level, mode, license, client,
-    config_file, config, extra_args, silent).
+    dashboard_port, log_level, mode, license, client, config_file, config,
+    extra_args, silent).
     """
     asyncpg = _detect_asyncpg()
     if asyncpg is None:
@@ -565,16 +537,7 @@ async def _actual_start(upstream, **kwargs):
             await inst.start()
         else:
             # Reusing existing subprocess — just open the conn.
-            raw = await _open_asyncpg_conn(inst._sync._proxy_url)
-            from goldlapel.wrap import wrap
-            # invalidation_port is resolved at sync construction.
-            inst._conn = wrap(
-                raw,
-                invalidation_port=inst._sync._invalidation_port,
-                disable_native_cache=inst._sync._disable_native_cache,
-                aggressive_verify=inst._sync._aggressive_verify,
-                db_key=inst._sync._upstream,
-            )
+            inst._conn = await _open_asyncpg_conn(inst._sync._proxy_url)
         return inst
     except Exception:
         if need_spawn:
@@ -633,7 +596,6 @@ def start(
     *,
     proxy_port=None,
     dashboard_port=None,
-    invalidation_port=None,
     log_level=None,
     mode=None,
     license=None,
@@ -645,12 +607,9 @@ def start(
     silent=False,
     mesh=False,
     mesh_tag=None,
-    disable_native_cache=False,
     disable_proxy_cache=False,
-    disable_matviews=False,
     disable_sqloptimize=False,
     disable_auto_indexes=False,
-    aggressive_verify="auto",
 ):
     """Factory: spawn a Gold Lapel proxy and return an AsyncGoldLapel instance.
 
@@ -676,7 +635,6 @@ def start(
         upstream,
         proxy_port=proxy_port,
         dashboard_port=dashboard_port,
-        invalidation_port=invalidation_port,
         log_level=log_level,
         mode=mode,
         license=license,
@@ -688,10 +646,7 @@ def start(
         silent=silent,
         mesh=mesh,
         mesh_tag=mesh_tag,
-        disable_native_cache=disable_native_cache,
         disable_proxy_cache=disable_proxy_cache,
-        disable_matviews=disable_matviews,
         disable_sqloptimize=disable_sqloptimize,
         disable_auto_indexes=disable_auto_indexes,
-        aggressive_verify=aggressive_verify,
     )

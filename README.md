@@ -2,7 +2,15 @@
 
 [![Tests](https://github.com/goldlapel/goldlapel-python/actions/workflows/test.yml/badge.svg)](https://github.com/goldlapel/goldlapel-python/actions/workflows/test.yml)
 
-The Python wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that watches query patterns and creates materialized views + indexes automatically. Zero code changes beyond the connection string.
+The Python wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that caches query results and creates indexes automatically. Zero code changes beyond the connection string.
+
+The wrapper itself holds no cache. It:
+
+- runs the proxy as a managed subprocess — finds the binary, starts and stops it with your app, turns your options into proxy flags, and hands back a driver-ready URL;
+- adds Postgres-backed helpers (search, documents, streams, counters, sorted sets, hashes, queues, geo, pub/sub);
+- plugs into Django and SQLAlchemy, pointing their connection settings at the proxy.
+
+Every connection to the proxy — from the wrapper, your own driver, or an ORM — is cached the same way, by the proxy.
 
 ## Install
 
@@ -32,7 +40,9 @@ cur.execute("SELECT * FROM users WHERE id = %s", (42,))
 gl.stop()  # (also cleaned up automatically on process exit)
 ```
 
-Point your Postgres driver at `gl.url`. Gold Lapel sits between your app and your DB, watching query patterns and creating materialized views + indexes automatically. Zero code changes beyond the connection string.
+Point your Postgres driver at `gl.url`. Gold Lapel sits between your app and your DB, caching query results (invalidated as writes land) and creating indexes for the query patterns it sees. `gl.conn` is a plain psycopg/psycopg2 connection to the proxy (an asyncpg connection under `goldlapel.asyncio`).
+
+The proxy listens on two ports: the proxy itself (`proxy_port`, default 7932) and the dashboard (`dashboard_port`, default `proxy_port + 1`; `0` disables it).
 
 Async usage (`goldlapel.asyncio.start`), context managers, transactional coordination via `gl.using(conn)`, and framework integrations are in the docs.
 
@@ -59,7 +69,7 @@ for msg in messages:
 
 Tables are materialized server-side at `_goldlapel.doc_<name>` / `_goldlapel.stream_<name>` — Gold Lapel owns the schema so every wrapper produces byte-identical tables. You don't run `CREATE TABLE` for these helpers anymore; the proxy does, idempotently, on first use.
 
-Other namespaces (`gl.search`, `gl.cache`, `gl.publish` / `gl.subscribe`, `gl.incr`, `gl.zadd`, `gl.hset`, `gl.geoadd`, …) remain at the top level for now and will move under their own nested namespaces in subsequent releases.
+Counters, sorted sets, hashes, queues and geo live under `gl.counters`, `gl.zsets`, `gl.hashes`, `gl.queues` and `gl.geos`. Search, percolator and pub/sub (`gl.search`, `gl.percolate`, `gl.publish` / `gl.subscribe`, …) remain at the top level for now.
 
 ## Authentication
 
@@ -93,7 +103,7 @@ Full API reference, async usage, configuration, framework integrations (Django, 
 
 ## Uninstalling
 
-Before removing the package, drop Gold Lapel's helper schema and cached matviews from your Postgres:
+Before removing the package, drop Gold Lapel's helper schema and the indexes it created from your Postgres:
 
 ```bash
 goldlapel clean
@@ -107,7 +117,7 @@ rm -rf ~/.goldlapel
 rm -f goldlapel.toml     # only if you wrote one
 ```
 
-Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and cached matviews go away.
+Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and indexes go away.
 
 ## License
 

@@ -103,8 +103,7 @@ class TestVerbDispatch:
 
 
 class _FakeConn:
-    """Plain stand-in for a raw psycopg connection — bypasses
-    `_get_raw_connection`'s `_conn` autounwrap that bare MagicMocks trigger."""
+    """Plain stand-in for a raw psycopg connection."""
     def __init__(self, cursor):
         self._cursor = cursor
         self.commit = MagicMock()

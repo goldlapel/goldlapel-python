@@ -24,9 +24,9 @@ from goldlapel.proxy import (
 
 
 # The proxy URL gets `application_name=goldlapel:python:<version>` appended so
-# the proxy can classify wrapper-vs-raw traffic and skip its proxy cache for
-# wrappers (which already have their own native cache). The marker is
-# suppressed if the user already set application_name (URL or PGAPPNAME).
+# wrapper connections are recognisable in pg_stat_activity (the proxy caches
+# them like any other client). The marker is suppressed if the user already
+# set application_name (URL or PGAPPNAME).
 _APP_NAME_SUFFIX = f"application_name=goldlapel:python:{_wrapper_version()}"
 
 
@@ -211,9 +211,8 @@ class TestMakeProxyUrl:
 
 
 class TestApplicationNameMarker:
-    """Proxy-cache router architecture: wrappers identify themselves to the
-    proxy via PG `application_name`, so the proxy can gate its proxy cache
-    (wrappers have their own native cache; raw clients don't)."""
+    """Wrappers tag their connections with PG `application_name` so they're
+    recognisable in pg_stat_activity. The proxy doesn't gate on it."""
 
     @pytest.fixture(autouse=True)
     def _no_pgappname(self):
@@ -324,19 +323,6 @@ class TestDashboardUrl:
         )
         assert gl._dashboard_port == 9999
 
-    def test_invalidation_port_derives_from_custom_proxy_port(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", proxy_port=17932)
-        assert gl.invalidation_port == 17934
-
-    def test_explicit_invalidation_port_overrides_derivation(self):
-        gl = GoldLapel(
-            "postgresql://localhost:5432/mydb",
-            proxy_port=17932,
-            invalidation_port=9999,
-        )
-        assert gl.invalidation_port == 9999
-
-
 class TestConfigToArgs:
     def test_string_value(self):
         assert _config_to_args({"pool_mode": "transaction"}) == ["--pool-mode", "transaction"]
@@ -345,8 +331,7 @@ class TestConfigToArgs:
         assert _config_to_args({"pool_size": 50}) == ["--pool-size", "50"]
 
     def test_boolean_true(self):
-        # `disable_pool` is a representative still-in-config bool key —
-        # `disable_matviews` was promoted to a top-level kwarg.
+        # `disable_pool` is a representative still-in-config bool key.
         assert _config_to_args({"disable_pool": True}) == ["--disable-pool"]
 
     def test_boolean_false(self):
@@ -449,9 +434,9 @@ class TestConfigKeys:
         # promoted out of the structured config map on the canonical surface.
         keys = config_keys()
         for promoted in (
-            "mode", "log_level", "dashboard_port", "invalidation_port",
+            "mode", "log_level", "dashboard_port",
             "config", "license", "client", "silent",
-            "disable_proxy_cache", "disable_matviews",
+            "disable_proxy_cache",
             "disable_sqloptimize", "disable_auto_indexes",
         ):
             assert promoted not in keys
@@ -493,12 +478,11 @@ class TestMultiInstance:
     def teardown_method(self):
         _reset_module_state()
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_two_upstreams_get_different_ports(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_two_upstreams_get_different_ports(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
@@ -512,13 +496,27 @@ class TestMultiInstance:
         assert 7932 in ports
         assert 7933 in ports
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
+    @patch("goldlapel.proxy._wait_for_port", return_value=True)
+    @patch("goldlapel.proxy.subprocess.Popen")
+    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
+    def test_conn_and_connect_are_plain_driver_connections(self, mock_find, mock_popen, mock_wait):
+        # No wrapper-side cache: gl.conn and connect() hand back exactly
+        # what the driver's connect() returned.
+        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
+        driver_name, driver = _mock_driver()
+        internal, extra = MagicMock(name="internal"), MagicMock(name="extra")
+        driver.connect.side_effect = [internal, extra]
+        with patch("goldlapel.proxy._detect_sync_driver", return_value=(driver_name, driver)):
+            gl = start("postgresql://host:5432/mydb", silent=True)
+            assert gl.conn is internal
+            assert proxy_mod.connect("postgresql://host:5432/mydb") is extra
+
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._kill_orphan_on_port")
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_same_upstream_returns_existing(self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect, mock_wrap):
+    def test_same_upstream_returns_existing(self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url = "postgresql://host:5432/mydb"
@@ -528,12 +526,11 @@ class TestMultiInstance:
         assert len(proxy_mod._instances) == 1
         assert mock_popen.call_count == 1  # Only spawned once
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_stop_specific_upstream(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_stop_specific_upstream(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
@@ -547,12 +544,11 @@ class TestMultiInstance:
         assert url_a not in proxy_mod._instances
         assert url_b in proxy_mod._instances
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_stop_all(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_stop_all(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         start("postgresql://host-a:5432/db_a")
@@ -561,12 +557,11 @@ class TestMultiInstance:
         stop()
         assert len(proxy_mod._instances) == 0
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_proxy_url_single_instance(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_proxy_url_single_instance(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url = "postgresql://host:5432/mydb"
@@ -575,12 +570,11 @@ class TestMultiInstance:
         assert purl is not None
         assert "7932" in purl
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_proxy_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_proxy_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
@@ -596,12 +590,11 @@ class TestMultiInstance:
         assert proxy_url(url_a) is not None
         assert proxy_url(url_b) is not None
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_dashboard_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_dashboard_url_multi_instance_requires_upstream(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
@@ -616,12 +609,11 @@ class TestMultiInstance:
         assert dashboard_url(url_a) is not None
         assert dashboard_url(url_b) is not None
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_explicit_port_advances_next_port(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_explicit_port_advances_next_port(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url_a = "postgresql://host-a:5432/db_a"
@@ -633,24 +625,22 @@ class TestMultiInstance:
         inst_b = proxy_mod._instances[url_b]
         assert inst_b._proxy_port == 8001
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_proxy_url_unknown_upstream(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_proxy_url_unknown_upstream(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         start("postgresql://host:5432/mydb")
         assert proxy_url("postgresql://unknown:5432/nope") is None
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._kill_orphan_on_port")
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_dead_instance_gets_recreated(self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect, mock_wrap):
+    def test_dead_instance_gets_recreated(self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         url = "postgresql://host:5432/mydb"
@@ -665,12 +655,11 @@ class TestMultiInstance:
         assert proxy_2 is not None
         assert mock_popen.call_count == 2
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_cleanup_stops_all(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_cleanup_stops_all(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         start("postgresql://host-a:5432/db_a")
@@ -681,12 +670,11 @@ class TestMultiInstance:
 
         assert len(proxy_mod._instances) == 0
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=False)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_failed_start_cleans_up_instance(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_failed_start_cleans_up_instance(self, mock_find, mock_popen, mock_wait, mock_detect):
         proc = _mock_popen()
         proc.stderr.read.return_value = b"bind error"
         mock_popen.return_value = proc
@@ -697,12 +685,11 @@ class TestMultiInstance:
 
         assert url not in proxy_mod._instances
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_stop_nonexistent_upstream_is_noop(self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap):
+    def test_stop_nonexistent_upstream_is_noop(self, mock_find, mock_popen, mock_wait, mock_detect):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
         start("postgresql://host:5432/mydb")
@@ -719,14 +706,13 @@ class TestMultiInstance:
         with pytest.raises(ImportError, match="sync Postgres driver"):
             start("postgresql://host:5432/mydb")
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._kill_orphan_on_port")
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_instance_stop_removes_from_registry(
-        self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect, mock_wrap,
+        self, mock_find, mock_popen, mock_wait, mock_orphan, mock_detect,
     ):
         # Regression for v0.2 review finding (MEDIUM, Option A): after
         # gl.stop(), the _instances entry must be dropped so the next
@@ -768,13 +754,12 @@ class TestStartupBanner:
     def teardown_method(self):
         _reset_module_state()
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_banner_writes_to_stderr_not_stdout(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+        self, mock_find, mock_popen, mock_wait, mock_detect, capsys,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
@@ -790,13 +775,12 @@ class TestStartupBanner:
         assert "7932" in captured.err
         assert "7933" in captured.err
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_silent_config_suppresses_banner(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+        self, mock_find, mock_popen, mock_wait, mock_detect, capsys,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
@@ -808,13 +792,12 @@ class TestStartupBanner:
         assert "goldlapel →" not in captured.err, \
             f"Banner leaked to stderr under silent=True: {captured.err!r}"
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_silent_false_prints_banner_to_stderr(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+        self, mock_find, mock_popen, mock_wait, mock_detect, capsys,
     ):
         # Explicit silent=False should behave the same as the default — banner
         # on stderr, nothing on stdout.
@@ -826,13 +809,12 @@ class TestStartupBanner:
         assert "goldlapel →" not in captured.out
         assert "goldlapel →" in captured.err
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_silent_not_forwarded_to_binary(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+        self, mock_find, mock_popen, mock_wait, mock_detect,
     ):
         # `silent` is a wrapper-side-only kwarg — it must never appear in the
         # argv passed to the Rust binary.
@@ -851,13 +833,12 @@ class TestStartupBanner:
         with pytest.raises(ValueError, match="Unknown config keys"):
             _config_to_args({"silent": True})
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_banner_suppressed_when_dashboard_disabled(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+        self, mock_find, mock_popen, mock_wait, mock_detect, capsys,
     ):
         # With dashboard_port=0 we take the no-dashboard banner branch; it
         # must still go to stderr and still honor silent.
@@ -872,13 +853,12 @@ class TestStartupBanner:
         assert captured.out == ""
         assert "goldlapel →" not in captured.err
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_banner_without_dashboard_goes_to_stderr(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap, capsys,
+        self, mock_find, mock_popen, mock_wait, mock_detect, capsys,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
@@ -936,13 +916,12 @@ class TestMeshKwargs:
         assert "mesh" not in keys
         assert "mesh_tag" not in keys
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_mesh_flag_forwarded_to_binary(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+        self, mock_find, mock_popen, mock_wait, mock_detect,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
@@ -955,13 +934,12 @@ class TestMeshKwargs:
         idx = cmd.index("--mesh-tag")
         assert cmd[idx + 1] == "prod-east"
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_mesh_false_no_flag(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+        self, mock_find, mock_popen, mock_wait, mock_detect,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
@@ -972,13 +950,12 @@ class TestMeshKwargs:
         assert "--mesh" not in cmd
         assert "--mesh-tag" not in cmd
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_mesh_without_tag_forwards_only_bool_flag(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+        self, mock_find, mock_popen, mock_wait, mock_detect,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
 
@@ -993,9 +970,8 @@ class TestMeshKwargs:
 class TestPromotedDisableFlags:
     """Top-level disable kwargs that map 1:1 to proxy CLI flags. Each
     defaults to False; True emits the corresponding `--disable-X` flag.
-    Promoted out of the structured `config` map for parity with
-    `disable_native_cache` — passing them through `config={...}` is a
-    hard error.
+    Not valid in the structured `config` map — passing them through
+    `config={...}` is a hard error.
     """
 
     def setup_method(self):
@@ -1013,14 +989,6 @@ class TestPromotedDisableFlags:
     def test_disable_proxy_cache_true_stored(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb", disable_proxy_cache=True)
         assert gl._disable_proxy_cache is True
-
-    def test_disable_matviews_defaults_false(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._disable_matviews is False
-
-    def test_disable_matviews_true_stored(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", disable_matviews=True)
-        assert gl._disable_matviews is True
 
     def test_disable_sqloptimize_defaults_false(self):
         gl = GoldLapel("postgresql://localhost:5432/mydb")
@@ -1044,10 +1012,6 @@ class TestPromotedDisableFlags:
         with pytest.raises(ValueError, match="Unknown config keys"):
             _config_to_args({"disable_proxy_cache": True})
 
-    def test_disable_matviews_in_config_map_rejected(self):
-        with pytest.raises(ValueError, match="Unknown config keys"):
-            _config_to_args({"disable_matviews": True})
-
     def test_disable_sqloptimize_in_config_map_rejected(self):
         with pytest.raises(ValueError, match="Unknown config keys"):
             _config_to_args({"disable_sqloptimize": True})
@@ -1059,7 +1023,7 @@ class TestPromotedDisableFlags:
     def test_disable_keys_not_in_config_keys(self):
         keys = config_keys()
         for promoted in (
-            "disable_proxy_cache", "disable_matviews",
+            "disable_proxy_cache",
             "disable_sqloptimize", "disable_auto_indexes",
         ):
             assert promoted not in keys, (
@@ -1068,96 +1032,77 @@ class TestPromotedDisableFlags:
 
     # -- argv emission --------------------------------------------------
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_disable_proxy_cache_emits_flag(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+        self, mock_find, mock_popen, mock_wait, mock_detect,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
         start("postgresql://host:5432/mydb", disable_proxy_cache=True, silent=True)
         cmd = mock_popen.call_args[0][0]
         assert "--disable-proxy-cache" in cmd
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
-    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
-    @patch("goldlapel.proxy._wait_for_port", return_value=True)
-    @patch("goldlapel.proxy.subprocess.Popen")
-    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_disable_matviews_emits_flag(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
-    ):
-        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
-        start("postgresql://host:5432/mydb", disable_matviews=True, silent=True)
-        cmd = mock_popen.call_args[0][0]
-        assert "--disable-matviews" in cmd
-
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_disable_sqloptimize_emits_flag(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+        self, mock_find, mock_popen, mock_wait, mock_detect,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
         start("postgresql://host:5432/mydb", disable_sqloptimize=True, silent=True)
         cmd = mock_popen.call_args[0][0]
         assert "--disable-sqloptimize" in cmd
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_disable_auto_indexes_emits_flag(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+        self, mock_find, mock_popen, mock_wait, mock_detect,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
         start("postgresql://host:5432/mydb", disable_auto_indexes=True, silent=True)
         cmd = mock_popen.call_args[0][0]
         assert "--disable-auto-indexes" in cmd
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
     def test_default_no_disable_flags(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+        self, mock_find, mock_popen, mock_wait, mock_detect,
     ):
         # Default state: none of the promoted flags should appear in argv.
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
         start("postgresql://host:5432/mydb", silent=True)
         cmd = mock_popen.call_args[0][0]
         for flag in (
-            "--disable-proxy-cache", "--disable-matviews",
+            "--disable-proxy-cache",
             "--disable-sqloptimize", "--disable-auto-indexes",
         ):
             assert flag not in cmd, f"{flag} unexpectedly present in default argv"
 
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
     @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
     @patch("goldlapel.proxy._wait_for_port", return_value=True)
     @patch("goldlapel.proxy.subprocess.Popen")
     @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_all_four_flags_compose(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
+    def test_all_three_flags_compose(
+        self, mock_find, mock_popen, mock_wait, mock_detect,
     ):
         mock_popen.side_effect = lambda *a, **kw: _mock_popen()
         start(
             "postgresql://host:5432/mydb",
             disable_proxy_cache=True,
-            disable_matviews=True,
             disable_sqloptimize=True,
             disable_auto_indexes=True,
             silent=True,
         )
         cmd = mock_popen.call_args[0][0]
         for flag in (
-            "--disable-proxy-cache", "--disable-matviews",
+            "--disable-proxy-cache",
             "--disable-sqloptimize", "--disable-auto-indexes",
         ):
             assert flag in cmd
@@ -1174,195 +1119,22 @@ class TestPromotedDisableFlags:
                 enable_proxy_cache_for_wrappers=True,
             )
 
+    @pytest.mark.parametrize("kwarg", [
+        "invalidation_port", "disable_native_cache", "aggressive_verify",
+        "disable_matviews",
+    ])
+    def test_removed_cache_kwargs_rejected(self, kwarg):
+        # The in-process cache and matviews are gone — no aliases.
+        with pytest.raises(TypeError):
+            GoldLapel("postgresql://host:5432/mydb", **{kwarg: True})
+        with pytest.raises(TypeError):
+            start("postgresql://host:5432/mydb", **{kwarg: True})
 
-class TestDisableNativeCacheKwarg:
-    """`disable_native_cache` is a wrapper-side flag — flips the NativeCache
-    into no-op mode without changing any proxy CLI args. Default False.
-    """
-
-    def setup_method(self):
-        _reset_module_state()
-
-    def teardown_method(self):
-        _reset_module_state()
-
-    def test_disable_native_cache_defaults_false(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._disable_native_cache is False
-
-    def test_disable_native_cache_true_stored(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb", disable_native_cache=True)
-        assert gl._disable_native_cache is True
-
-    def test_disable_native_cache_in_config_map_rejected(self):
-        # Regression guard: disable_native_cache is a top-level kwarg, not
-        # a config key.
+    @pytest.mark.parametrize("key", [
+        "refresh_interval_secs", "pattern_ttl_secs", "max_tables_per_view",
+        "max_columns_per_view", "disable_consolidation", "disable_rewrite",
+        "disable_shadow_mode", "enable_coalescing",
+    ])
+    def test_removed_matview_config_keys_rejected(self, key):
         with pytest.raises(ValueError, match="Unknown config keys"):
-            _config_to_args({"disable_native_cache": True})
-
-    def test_disable_native_cache_not_in_config_keys(self):
-        keys = config_keys()
-        assert "disable_native_cache" not in keys
-
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
-    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
-    @patch("goldlapel.proxy._wait_for_port", return_value=True)
-    @patch("goldlapel.proxy.subprocess.Popen")
-    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_disable_native_cache_does_not_emit_cli_flag(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
-    ):
-        # disable_native_cache is wrapper-internal — the Rust binary doesn't
-        # need to know. Make sure we don't accidentally send a phantom flag.
-        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
-
-        start("postgresql://host:5432/mydb", disable_native_cache=True, silent=True)
-
-        call_args, _ = mock_popen.call_args
-        cmd = call_args[0]
-        # No flag with this concept in the spawned argv.
-        assert not any(
-            "disable-native-cache" in str(arg) or "disable_native_cache" in str(arg)
-            for arg in cmd
-        )
-        assert not any("--no-native-cache" in str(arg) for arg in cmd)
-
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
-    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
-    @patch("goldlapel.proxy._wait_for_port", return_value=True)
-    @patch("goldlapel.proxy.subprocess.Popen")
-    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_disable_native_cache_forwarded_to_wrap(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
-    ):
-        # The wrapper side: gl.start() must pass `disable_native_cache=True`
-        # through to wrap() so the NativeCache singleton is initialized in
-        # disabled mode.
-        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
-
-        start("postgresql://host:5432/mydb", disable_native_cache=True, silent=True)
-
-        # wrap() is called with disable_native_cache=True
-        assert mock_wrap.called
-        _, kwargs = mock_wrap.call_args
-        assert kwargs.get("disable_native_cache") is True
-
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
-    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
-    @patch("goldlapel.proxy._wait_for_port", return_value=True)
-    @patch("goldlapel.proxy.subprocess.Popen")
-    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_disable_native_cache_default_passes_false_to_wrap(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
-    ):
-        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
-
-        start("postgresql://host:5432/mydb", silent=True)
-
-        assert mock_wrap.called
-        _, kwargs = mock_wrap.call_args
-        assert kwargs.get("disable_native_cache") is False
-
-
-class TestAggressiveVerifyKwarg:
-    """Smart aggressive-verify mode is a top-level kwarg on
-    `GoldLapel(...)` / `goldlapel.start(...)`. Validates eagerly,
-    forwards to wrap() with the upstream URL as `db_key=` so all
-    connections to the same db share the trigger-detection cache.
-    """
-
-    def setup_method(self):
-        _reset_module_state()
-
-    def teardown_method(self):
-        _reset_module_state()
-
-    def test_aggressive_verify_defaults_to_auto(self):
-        gl = GoldLapel("postgresql://localhost:5432/mydb")
-        assert gl._aggressive_verify == "auto"
-
-    def test_aggressive_verify_on_stored(self):
-        gl = GoldLapel(
-            "postgresql://localhost:5432/mydb", aggressive_verify="on",
-        )
-        assert gl._aggressive_verify == "on"
-
-    def test_aggressive_verify_off_stored(self):
-        gl = GoldLapel(
-            "postgresql://localhost:5432/mydb", aggressive_verify="off",
-        )
-        assert gl._aggressive_verify == "off"
-
-    def test_aggressive_verify_invalid_raises(self):
-        with pytest.raises(ValueError, match="aggressive_verify must be one of"):
-            GoldLapel(
-                "postgresql://localhost:5432/mydb",
-                aggressive_verify="bogus",
-            )
-
-    def test_aggressive_verify_not_in_config_keys(self):
-        # Top-level kwarg, not a structured `config={...}` key.
-        keys = config_keys()
-        assert "aggressive_verify" not in keys
-
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
-    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
-    @patch("goldlapel.proxy._wait_for_port", return_value=True)
-    @patch("goldlapel.proxy.subprocess.Popen")
-    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_aggressive_verify_does_not_emit_cli_flag(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
-    ):
-        # Wrapper-internal — the Rust binary doesn't need to know.
-        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
-
-        start(
-            "postgresql://host:5432/mydb",
-            aggressive_verify="on", silent=True,
-        )
-
-        call_args, _ = mock_popen.call_args
-        cmd = call_args[0]
-        assert not any(
-            "aggressive-verify" in str(arg) or "aggressive_verify" in str(arg)
-            for arg in cmd
-        )
-
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
-    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
-    @patch("goldlapel.proxy._wait_for_port", return_value=True)
-    @patch("goldlapel.proxy.subprocess.Popen")
-    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_aggressive_verify_forwarded_to_wrap(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
-    ):
-        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
-
-        start(
-            "postgresql://host:5432/mydb",
-            aggressive_verify="on", silent=True,
-        )
-
-        assert mock_wrap.called
-        _, kwargs = mock_wrap.call_args
-        assert kwargs.get("aggressive_verify") == "on"
-        # Upstream URL is the db_key — every connection to the same
-        # db shares the trigger-detection cache.
-        assert kwargs.get("db_key") == "postgresql://host:5432/mydb"
-
-    @patch("goldlapel.wrap.wrap", side_effect=lambda c, **kw: c)
-    @patch("goldlapel.proxy._detect_sync_driver", side_effect=lambda: _mock_driver())
-    @patch("goldlapel.proxy._wait_for_port", return_value=True)
-    @patch("goldlapel.proxy.subprocess.Popen")
-    @patch("goldlapel.proxy._find_binary", return_value="/usr/bin/goldlapel")
-    def test_aggressive_verify_default_auto_forwarded(
-        self, mock_find, mock_popen, mock_wait, mock_detect, mock_wrap,
-    ):
-        # No explicit kwarg — default "auto" must reach wrap().
-        mock_popen.side_effect = lambda *a, **kw: _mock_popen()
-
-        start("postgresql://host:5432/mydb", silent=True)
-
-        assert mock_wrap.called
-        _, kwargs = mock_wrap.call_args
-        assert kwargs.get("aggressive_verify") == "auto"
+            _config_to_args({key: True})

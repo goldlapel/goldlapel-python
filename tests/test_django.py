@@ -199,7 +199,6 @@ class TestProxyStartFailureFallback:
 
         assert params["host"] == "db.example.com"
         assert params["port"] == 5432
-        assert wrapper._gl_active is False
 
     @patch("goldlapel.django.base.goldlapel")
     @patch("goldlapel.django.base.PgDatabaseWrapper.get_connection_params")
@@ -218,18 +217,6 @@ class TestProxyStartFailureFallback:
 
     @patch("goldlapel.django.base.goldlapel")
     @patch("goldlapel.django.base.PgDatabaseWrapper.get_connection_params")
-    def test_gl_active_true_on_success(self, mock_super, mock_gl):
-        mock_gl.DEFAULT_PROXY_PORT = GOLDLAPEL_DEFAULT_PROXY_PORT
-        mock_super.return_value = {"host": "h", "port": 5432}
-
-        wrapper = _make_wrapper({"HOST": "h", "PORT": "5432", "NAME": "db",
-                                 "USER": "u", "PASSWORD": "p"})
-        DatabaseWrapper.get_connection_params(wrapper)
-
-        assert wrapper._gl_active is True
-
-    @patch("goldlapel.django.base.goldlapel")
-    @patch("goldlapel.django.base.PgDatabaseWrapper.get_connection_params")
     def test_fallback_catches_file_not_found(self, mock_super, mock_gl):
         mock_gl.DEFAULT_PROXY_PORT = GOLDLAPEL_DEFAULT_PROXY_PORT
         mock_super.return_value = {"host": "h", "port": 5432}
@@ -240,96 +227,10 @@ class TestProxyStartFailureFallback:
         params = DatabaseWrapper.get_connection_params(wrapper)
 
         assert params["host"] == "h"
-        assert wrapper._gl_active is False
 
 
-class TestGetNewConnection:
-    @patch("goldlapel.django.base.goldlapel")
-    @patch("goldlapel.django.base.PgDatabaseWrapper.get_new_connection")
-    def test_wraps_connection_with_native_cache(self, mock_super, mock_gl):
-        mock_gl.DEFAULT_PROXY_PORT = GOLDLAPEL_DEFAULT_PROXY_PORT
-        mock_conn = MagicMock()
-        mock_super.return_value = mock_conn
-        mock_gl.wrap.return_value = MagicMock()
-
-        wrapper = _make_wrapper({
-            "HOST": "h", "PORT": "5432", "NAME": "db",
-            "USER": "u", "PASSWORD": "p",
-            "OPTIONS": {},
-        })
-        wrapper._gl_proxy_port = GOLDLAPEL_DEFAULT_PROXY_PORT
-        wrapper._gl_active = True
-        result = DatabaseWrapper.get_new_connection(wrapper, {"host": "127.0.0.1"})
-
-        mock_gl.wrap.assert_called_once_with(
-            mock_conn,
-            invalidation_port=GOLDLAPEL_DEFAULT_PROXY_PORT + 2,
-            aggressive_verify="auto",
-            db_key="postgresql://u:p@h:5432/db",
-        )
-        assert result == mock_gl.wrap.return_value
-
-    @patch("goldlapel.django.base.goldlapel")
-    @patch("goldlapel.django.base.PgDatabaseWrapper.get_new_connection")
-    def test_custom_invalidation_port(self, mock_super, mock_gl):
-        mock_gl.DEFAULT_PROXY_PORT = GOLDLAPEL_DEFAULT_PROXY_PORT
-        mock_super.return_value = MagicMock()
-        mock_gl.wrap.return_value = MagicMock()
-
-        wrapper = _make_wrapper({
-            "HOST": "h", "PORT": "5432", "NAME": "db",
-            "USER": "u", "PASSWORD": "p",
-            "OPTIONS": {"goldlapel": {"invalidation_port": 9999}},
-        })
-        wrapper._gl_proxy_port = GOLDLAPEL_DEFAULT_PROXY_PORT
-        wrapper._gl_active = True
-        DatabaseWrapper.get_new_connection(wrapper, {"host": "127.0.0.1"})
-
-        mock_gl.wrap.assert_called_once_with(
-            mock_super.return_value,
-            invalidation_port=9999,
-            aggressive_verify="auto",
-            db_key="postgresql://u:p@h:5432/db",
-        )
-
-    @patch("goldlapel.django.base.goldlapel")
-    @patch("goldlapel.django.base.PgDatabaseWrapper.get_new_connection")
-    def test_invalidation_port_derived_from_gl_port(self, mock_super, mock_gl):
-        mock_gl.DEFAULT_PROXY_PORT = GOLDLAPEL_DEFAULT_PROXY_PORT
-        mock_super.return_value = MagicMock()
-        mock_gl.wrap.return_value = MagicMock()
-
-        wrapper = _make_wrapper({
-            "HOST": "h", "PORT": "5432", "NAME": "db",
-            "USER": "u", "PASSWORD": "p",
-            "OPTIONS": {"goldlapel": {"proxy_port": 8000}},
-        })
-        wrapper._gl_proxy_port = 8000
-        wrapper._gl_active = True
-        DatabaseWrapper.get_new_connection(wrapper, {"host": "127.0.0.1"})
-
-        mock_gl.wrap.assert_called_once_with(
-            mock_super.return_value,
-            invalidation_port=8002,
-            aggressive_verify="auto",
-            db_key="postgresql://u:p@h:5432/db",
-        )
-
-    @patch("goldlapel.django.base.goldlapel")
-    @patch("goldlapel.django.base.PgDatabaseWrapper.get_new_connection")
-    def test_skips_wrap_when_proxy_inactive(self, mock_super, mock_gl):
-        mock_gl.DEFAULT_PROXY_PORT = GOLDLAPEL_DEFAULT_PROXY_PORT
-        mock_conn = MagicMock()
-        mock_super.return_value = mock_conn
-
-        wrapper = _make_wrapper({
-            "HOST": "h", "PORT": "5432", "NAME": "db",
-            "USER": "u", "PASSWORD": "p",
-            "OPTIONS": {},
-        })
-        wrapper._gl_proxy_port = GOLDLAPEL_DEFAULT_PROXY_PORT
-        wrapper._gl_active = False
-        result = DatabaseWrapper.get_new_connection(wrapper, {"host": "h"})
-
-        mock_gl.wrap.assert_not_called()
-        assert result == mock_conn
+class TestConnectionIsNotWrapped:
+    def test_get_new_connection_is_djangos_own(self):
+        # No wrapper-side cache: the backend only rewrites host/port and
+        # leaves connection creation to Django's PostgreSQL backend.
+        assert "get_new_connection" not in DatabaseWrapper.__dict__

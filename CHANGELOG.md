@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Breaking changes — the in-process cache (L1) is gone
+
+**The wrapper no longer caches anything itself.** The proxy's result cache
+now caches every connection the same way — the wrapper's, your own
+driver's, or an ORM's — so the wrapper-side cache, and the invalidation
+socket that kept it fresh, have been removed. The proxy no longer serves
+the invalidation port; it uses two ports: proxy (`proxy_port`) and
+dashboard (`proxy_port + 1`).
+
+- `gl.conn`, `goldlapel.connect()` and the `goldlapel.asyncio` internal
+  connection are now the plain driver connection (psycopg / psycopg2 /
+  asyncpg), not a caching wrapper around it.
+- Removed: `goldlapel.wrap()`, `goldlapel.NativeCache`, the
+  `CachedConnection` / `CachedCursor` / `AsyncCachedConnection` classes,
+  and `goldlapel.sqlalchemy.wrap` / `goldlapel.sqlalchemy.NativeCache`.
+- Removed options from `goldlapel.start`, `goldlapel.asyncio.start` and
+  `GoldLapel(...)`: `invalidation_port`, `disable_native_cache`,
+  `aggressive_verify`, `disable_matviews` (the proxy no longer builds
+  materialized views). The `invalidation_port` property is gone too.
+- Removed keys from the `config` map, all materialized-view tuning the
+  proxy no longer has: `refresh_interval_secs`, `pattern_ttl_secs`,
+  `max_tables_per_view`, `max_columns_per_view`, `disable_consolidation`,
+  `disable_rewrite`, `disable_shadow_mode`. `enable_coalescing` (never a
+  proxy flag) is replaced by `disable_coalescing`, which is.
+- Removed env vars: `GOLDLAPEL_NATIVE_CACHE`, `GOLDLAPEL_NATIVE_CACHE_SIZE`,
+  `GOLDLAPEL_REPORT_STATS`, `GOLDLAPEL_INVALIDATION_PORT`.
+- Django: the `invalidation_port` and `aggressive_verify` keys in
+  `OPTIONS["goldlapel"]` are no longer accepted; the backend still starts
+  the proxy and points Django's connection at it.
+- SQLAlchemy: `goldlapel_invalidation_port`, `goldlapel_native_cache` and
+  `goldlapel_aggressive_verify` engine kwargs are removed, and
+  `create_engine` no longer installs its own connection `creator` —
+  SQLAlchemy connects to the proxy URL with the driver named in your URL.
+  `init()` drops its `invalidation_port` argument and no longer sets
+  `GOLDLAPEL_INVALIDATION_PORT`.
+
+No aliases: passing any removed option raises `TypeError` (or `ValueError`
+for removed `config` keys).
+
+Connections are still tagged `application_name=goldlapel:python:<version>`
+so they're recognisable in `pg_stat_activity`; the proxy doesn't treat them
+differently.
+
 ### Breaking changes (Phase 5 — counter / zset / hash / queue / geo)
 
 **The five Redis-compat helper families moved to nested namespaces, and the

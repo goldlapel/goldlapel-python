@@ -21,7 +21,7 @@ from goldlapel.utils import (
 
 
 class FakeConn:
-    """A mock connection that does NOT have _conn, so _get_raw_connection returns self."""
+    """A plain stand-in connection that hands out one cursor."""
     def __init__(self, cursor):
         self._cursor = cursor
         self.commit = MagicMock()
@@ -727,36 +727,3 @@ class TestParameterBinding:
         suggest(conn, "cities", "name", "'; DROP TABLE cities; --")
         sql = cur.execute.call_args[0][0]
         assert "DROP TABLE" not in sql
-
-
-# ---------------------------------------------------------------------------
-# _get_raw_connection — wrapper unwrapping
-# ---------------------------------------------------------------------------
-
-class TestGetRawConnection:
-    def test_unwraps_conn_attribute(self):
-        inner_cursor = MagicMock()
-        inner_cursor.description = [("id",)]
-        inner_cursor.fetchall.return_value = []
-        inner = MagicMock()
-        inner.cursor.return_value = inner_cursor
-
-        class WrappedConn:
-            def __init__(self, raw):
-                self._conn = raw
-        outer = WrappedConn(inner)
-
-        search(outer, "articles", "title", "test")
-        inner.cursor.assert_called_once()
-
-    def test_plain_connection_passes_through(self):
-        conn, cur = capture_sql()
-        search(conn, "articles", "title", "test")
-        # Plain (non-wrapped) connection should run search SQL directly
-        # against the cursor we handed it — assert the actual query shape
-        # hit that cursor, not just that *anything* was executed.
-        assert cur.execute.call_count == 1
-        sql = cur.execute.call_args_list[0][0][0]
-        assert "FROM articles" in sql
-        assert "ts_rank" in sql
-        assert "plainto_tsquery" in sql

@@ -19,33 +19,32 @@ _STARTUP_TIMEOUT = 10.0
 _STARTUP_POLL_INTERVAL = 0.05
 
 # Keys that are valid inside the structured `config` map. Top-level concepts
-# (proxy_port, dashboard_port, invalidation_port, log_level, mode, license,
-# client, config_file) are exposed as top-level kwargs on `goldlapel.start`
+# (proxy_port, dashboard_port, log_level, mode, license, client,
+# config_file) are exposed as top-level kwargs on `goldlapel.start`
 # and on the `GoldLapel` constructor, and are NOT valid keys here — passing
 # them through `config` raises.
 _VALID_CONFIG_KEYS = frozenset({
-    "min_pattern_count", "refresh_interval_secs", "pattern_ttl_secs",
-    "max_tables_per_view", "max_columns_per_view", "deep_pagination_threshold",
+    "min_pattern_count", "deep_pagination_threshold",
     "report_interval_secs", "proxy_cache_size", "batch_cache_size",
     "batch_cache_ttl_secs", "pool_size", "pool_timeout_secs",
     "pool_mode", "mgmt_idle_timeout", "fallback", "read_after_write_secs",
     "n1_threshold", "n1_window_ms", "n1_cross_threshold",
     "tls_cert", "tls_key", "tls_client_ca",
-    "disable_consolidation", "disable_btree_indexes",
+    "disable_btree_indexes",
     "disable_trigram_indexes", "disable_expression_indexes",
-    "disable_partial_indexes", "disable_rewrite", "disable_rewrite_prepared_cache",
+    "disable_partial_indexes", "disable_rewrite_prepared_cache",
     "disable_pool",
-    "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
-    "enable_coalescing", "replica", "exclude_tables",
+    "disable_n1", "disable_n1_cross_connection",
+    "disable_coalescing", "replica", "exclude_tables",
 })
 
 _BOOLEAN_KEYS = frozenset({
-    "disable_consolidation", "disable_btree_indexes",
+    "disable_btree_indexes",
     "disable_trigram_indexes", "disable_expression_indexes",
-    "disable_partial_indexes", "disable_rewrite", "disable_rewrite_prepared_cache",
+    "disable_partial_indexes", "disable_rewrite_prepared_cache",
     "disable_pool",
-    "disable_n1", "disable_n1_cross_connection", "disable_shadow_mode",
-    "enable_coalescing",
+    "disable_n1", "disable_n1_cross_connection",
+    "disable_coalescing",
 })
 
 _LIST_KEYS = frozenset({
@@ -222,8 +221,7 @@ def _wrapper_version():
     """Return the wrapper's installed version, or "0.0.0" in dev installs.
 
     Used to build the application_name marker (`goldlapel:python:<version>`)
-    that the proxy reads to classify wrapper-vs-raw traffic and gate the
-    proxy cache.
+    that tags the wrapper's connections.
     """
     try:
         from importlib.metadata import version as _v, PackageNotFoundError
@@ -238,10 +236,10 @@ def _wrapper_version():
 def _application_name_marker():
     """The application_name string the wrapper sets on PG connections.
 
-    Format: `goldlapel:python:<version>`. The proxy parses the startup packet's
-    application_name parameter; values starting with `goldlapel:` are treated
-    as wrapper traffic (skips the proxy cache — the wrapper has its own
-    native cache).
+    Format: `goldlapel:python:<version>`. The proxy forwards it to Postgres
+    untouched, so `pg_stat_activity` and ops dashboards can see which
+    wrapper and version each connection came from. The proxy does not gate
+    on it — these connections are cached exactly like any other client's.
     """
     return f"goldlapel:python:{_wrapper_version()}"
 
@@ -354,7 +352,6 @@ class GoldLapel:
         *,
         proxy_port=None,
         dashboard_port=None,
-        invalidation_port=None,
         log_level=None,
         mode=None,
         license=None,
@@ -366,27 +363,19 @@ class GoldLapel:
         silent=False,
         mesh=False,
         mesh_tag=None,
-        disable_native_cache=False,
         disable_proxy_cache=False,
-        disable_matviews=False,
         disable_sqloptimize=False,
         disable_auto_indexes=False,
-        aggressive_verify="auto",
     ):
         self._upstream = upstream
         self._proxy_port = proxy_port if proxy_port is not None else DEFAULT_PROXY_PORT
 
-        # Dashboard / invalidation ports default to proxyPort + 1 / + 2 when
-        # unset. An explicit value (including 0 for "disable dashboard")
-        # overrides the derivation and is emitted as --dashboard-port /
-        # --invalidation-port at spawn time.
+        # Dashboard port defaults to proxyPort + 1 when unset. An explicit
+        # value (including 0 for "disable dashboard") overrides the
+        # derivation and is emitted as --dashboard-port at spawn time.
         self._dashboard_port_explicit = dashboard_port is not None
         self._dashboard_port = (
             int(dashboard_port) if dashboard_port is not None else self._proxy_port + 1
-        )
-        self._invalidation_port_explicit = invalidation_port is not None
-        self._invalidation_port = (
-            int(invalidation_port) if invalidation_port is not None else self._proxy_port + 2
         )
 
         self._log_level = log_level
@@ -410,33 +399,12 @@ class GoldLapel:
         # Mesh membership (startup intent — HQ enforces license).
         self._mesh = bool(mesh)
         self._mesh_tag = mesh_tag if mesh_tag else None
-        # Explicit native-cache disable knob. Default False (native cache
-        # active). When True, the wrapper's NativeCache becomes a no-op
-        # pass-through: get() always returns None, put() is silent. Lets
-        # users keep their tuned cache_size and toggle the layer with a
-        # flag instead of zeroing the size. Counters still tick (misses
-        # bump on each get) and the invalidation socket still connects so
-        # the dashboard sees a live wrapper with "0 hits, N misses" —
-        # clear "native cache off" signal vs. a silent / disconnected
-        # wrapper.
-        self._disable_native_cache = bool(disable_native_cache)
-        # Promoted disable flags (Wave: top-level options for parity
-        # with `disable_native_cache`). Each maps 1:1 to the proxy CLI
-        # flag at spawn time. Removed from the structured `config` map —
-        # passing them through `config={...}` is a hard error.
+        # Promoted disable flags. Each maps 1:1 to the proxy CLI flag at
+        # spawn time. Not valid in the structured `config` map — passing
+        # them through `config={...}` is a hard error.
         self._disable_proxy_cache = bool(disable_proxy_cache)
-        self._disable_matviews = bool(disable_matviews)
         self._disable_sqloptimize = bool(disable_sqloptimize)
         self._disable_auto_indexes = bool(disable_auto_indexes)
-        # Aggressive-verify mode (closes the trigger-internal-SET
-        # correctness gap by bumping a per-connection `dml_seq` counter
-        # on every observed write — the bump folds into the L1 cache
-        # key, so post-write reads naturally key under a fresh slot).
-        # "auto" / "on" enable the bump (default); "off" is the
-        # opt-out, warned about at wrap() time. Validated eagerly so a
-        # typo surfaces at construction, not at first wire op.
-        from goldlapel.wrap import _normalize_aggressive_verify
-        self._aggressive_verify = _normalize_aggressive_verify(aggressive_verify)
 
         # Validate structured-config keys eagerly so a test that constructs
         # without spawning still catches bad keys.
@@ -532,8 +500,6 @@ class GoldLapel:
         # defaults.
         if self._dashboard_port_explicit:
             cmd += ["--dashboard-port", str(self._dashboard_port)]
-        if self._invalidation_port_explicit:
-            cmd += ["--invalidation-port", str(self._invalidation_port)]
         verbose_flag = _log_level_to_verbose_flag(self._log_level)
         if verbose_flag is not None:
             cmd.append(verbose_flag)
@@ -553,8 +519,6 @@ class GoldLapel:
         # when False so the binary applies its own defaults.
         if self._disable_proxy_cache:
             cmd.append("--disable-proxy-cache")
-        if self._disable_matviews:
-            cmd.append("--disable-matviews")
         if self._disable_sqloptimize:
             cmd.append("--disable-sqloptimize")
         if self._disable_auto_indexes:
@@ -618,24 +582,9 @@ class GoldLapel:
             # the subprocess is already running and would leak. Clean it up before re-raising.
             try:
                 if driver_name == "psycopg3":
-                    raw_conn = driver.connect(self._proxy_url, autocommit=True)
+                    self._conn = driver.connect(self._proxy_url, autocommit=True)
                 else:
-                    raw_conn = driver.connect(self._proxy_url)
-                from goldlapel.wrap import wrap
-                # invalidation_port is resolved at construction: either the
-                # explicit kwarg or proxy_port + 2.
-                # `db_key=upstream` is opaque per-database context for
-                # the wrapper — used today to namespace the one-shot
-                # `aggressive_verify="off"` warning so multi-database
-                # apps only see it once per upstream, not once per
-                # connection.
-                self._conn = wrap(
-                    raw_conn,
-                    invalidation_port=self._invalidation_port,
-                    disable_native_cache=self._disable_native_cache,
-                    aggressive_verify=self._aggressive_verify,
-                    db_key=self._upstream,
-                )
+                    self._conn = driver.connect(self._proxy_url)
             except BaseException:
                 # Kill the subprocess we just spawned; leaked running processes = port
                 # collisions on retry + zombie resources. BaseException catches KeyboardInterrupt too.
@@ -727,12 +676,6 @@ class GoldLapel:
         return self._dashboard_port
 
     @property
-    def invalidation_port(self):
-        """Cache-invalidation port (proxy_port + 2 by default, overridden
-        via the `invalidation_port` kwarg)."""
-        return self._invalidation_port
-
-    @property
     def dashboard_token(self):
         """Dashboard token used by the DDL API. Resolved on start() when the
         wrapper spawns the proxy itself; None when the proxy is external —
@@ -819,7 +762,6 @@ def _ensure_running(
     *,
     proxy_port=None,
     dashboard_port=None,
-    invalidation_port=None,
     log_level=None,
     mode=None,
     license=None,
@@ -831,12 +773,9 @@ def _ensure_running(
     silent=False,
     mesh=False,
     mesh_tag=None,
-    disable_native_cache=False,
     disable_proxy_cache=False,
-    disable_matviews=False,
     disable_sqloptimize=False,
     disable_auto_indexes=False,
-    aggressive_verify="auto",
 ):
     global _cleanup_registered, _next_port
     with _lock:
@@ -855,7 +794,6 @@ def _ensure_running(
             upstream,
             proxy_port=proxy_port,
             dashboard_port=dashboard_port,
-            invalidation_port=invalidation_port,
             log_level=log_level,
             mode=mode,
             license=license,
@@ -867,12 +805,9 @@ def _ensure_running(
             silent=silent,
             mesh=mesh,
             mesh_tag=mesh_tag,
-            disable_native_cache=disable_native_cache,
             disable_proxy_cache=disable_proxy_cache,
-            disable_matviews=disable_matviews,
             disable_sqloptimize=disable_sqloptimize,
             disable_auto_indexes=disable_auto_indexes,
-            aggressive_verify=aggressive_verify,
         )
         _instances[upstream] = inst
         if not _cleanup_registered:
@@ -920,7 +855,6 @@ def start(
     *,
     proxy_port=None,
     dashboard_port=None,
-    invalidation_port=None,
     log_level=None,
     mode=None,
     license=None,
@@ -932,12 +866,9 @@ def start(
     silent=False,
     mesh=False,
     mesh_tag=None,
-    disable_native_cache=False,
     disable_proxy_cache=False,
-    disable_matviews=False,
     disable_sqloptimize=False,
     disable_auto_indexes=False,
-    aggressive_verify="auto",
 ):
     """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
     GoldLapel instance. Call wrapper methods on the returned instance
@@ -952,7 +883,6 @@ def start(
 
     - proxy_port: proxy listen port (default 7932)
     - dashboard_port: dashboard port (derived as proxy_port + 1 when unset; 0 disables)
-    - invalidation_port: cache-invalidation port (derived as proxy_port + 2)
     - log_level: one of 'trace', 'debug', 'info', 'warn', 'error'
     - mode: proxy operating mode ('waiter', 'consideration', ...)
     - api_key: stable customer credential (`gl_live_*` / `gl_test_*`).
@@ -966,31 +896,12 @@ def start(
     - silent: suppress the startup banner
     - mesh: opt into the mesh at startup (HQ enforces license; denial is non-fatal)
     - mesh_tag: optional tag — instances sharing a tag cluster together
-    - disable_native_cache: turn off the wrapper's native cache without
-        changing its configured size. Default False. When True, get()
-        always returns None (cache miss), put() is a silent no-op, and
-        the invalidation socket still connects so the dashboard sees a
-        live wrapper with "0 hits, N misses" — clear "native cache off"
-        signal.
-    - disable_proxy_cache: turn off the proxy's L2 cache (--disable-proxy-cache).
-        Default False.
-    - disable_matviews: skip materialized-view promotion (--disable-matviews).
+    - disable_proxy_cache: turn off the proxy's result cache (--disable-proxy-cache).
         Default False.
     - disable_sqloptimize: skip SQL rewriting (--disable-sqloptimize).
         Default False.
     - disable_auto_indexes: skip automatic index creation (--disable-auto-indexes).
         Default False.
-    - aggressive_verify: always-on DML cache-busting mode for the
-        trigger-internal-SET correctness gap. Triggers can `SET` /
-        `RESET` / `DISCARD` / `set_config()` server-side without
-        surfacing on the client wire — the wrapper closes that gap by
-        bumping a per-connection `dml_seq` counter on every observed
-        write (the counter folds into the L1 cache key, so post-write
-        reads naturally key under a fresh slot). One of:
-          * "auto" (default) — bump on every DML.
-          * "on" — alias of "auto".
-          * "off" — opt out of the bump. Warns at startup; only safe
-            on schemas with no GUC-mutating triggers.
 
     Promoted top-level concepts are rejected inside the `config` dict.
 
@@ -1014,7 +925,6 @@ def start(
         upstream,
         proxy_port=proxy_port,
         dashboard_port=dashboard_port,
-        invalidation_port=invalidation_port,
         log_level=log_level,
         mode=mode,
         license=license,
@@ -1026,12 +936,9 @@ def start(
         silent=silent,
         mesh=mesh,
         mesh_tag=mesh_tag,
-        disable_native_cache=disable_native_cache,
         disable_proxy_cache=disable_proxy_cache,
-        disable_matviews=disable_matviews,
         disable_sqloptimize=disable_sqloptimize,
         disable_auto_indexes=disable_auto_indexes,
-        aggressive_verify=aggressive_verify,
     )
     return inst
 
@@ -1052,17 +959,8 @@ def connect(upstream=None):
     if driver is None:
         raise ImportError("No supported sync Postgres driver found.")
     if driver_name == "psycopg3":
-        conn = driver.connect(inst.url, autocommit=True)
-    else:
-        conn = driver.connect(inst.url)
-    from goldlapel.wrap import wrap
-    return wrap(
-        conn,
-        invalidation_port=inst.invalidation_port,
-        disable_native_cache=inst._disable_native_cache,
-        aggressive_verify=inst._aggressive_verify,
-        db_key=inst._upstream,
-    )
+        return driver.connect(inst.url, autocommit=True)
+    return driver.connect(inst.url)
 
 
 def stop(upstream=None):

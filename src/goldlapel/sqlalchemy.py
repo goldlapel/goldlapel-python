@@ -1,6 +1,5 @@
 import os
 import re
-from urllib.parse import urlparse
 
 import goldlapel
 from sqlalchemy import create_engine as _sa_create_engine
@@ -31,103 +30,32 @@ def _start_proxy(url, kwargs):
     proxy_port = kwargs.pop("goldlapel_proxy_port", None)
     config = kwargs.pop("goldlapel_config", None)
     extra_args = kwargs.pop("goldlapel_extra_args", None)
-    invalidation_port = kwargs.pop("goldlapel_invalidation_port", None)
     dashboard_port = kwargs.pop("goldlapel_dashboard_port", None)
     log_level = kwargs.pop("goldlapel_log_level", None)
     mode = kwargs.pop("goldlapel_mode", None)
-    native_cache = kwargs.pop("goldlapel_native_cache", True)
-    aggressive_verify = kwargs.pop("goldlapel_aggressive_verify", "auto")
     clean_url, dialect = _strip_dialect(_url_to_str(url))
-    inst = goldlapel.start(
+    goldlapel.start(
         clean_url,
         proxy_port=proxy_port,
         dashboard_port=dashboard_port,
-        invalidation_port=invalidation_port,
         log_level=log_level,
         mode=mode,
         client="sqlalchemy",
         config=config,
         extra_args=extra_args,
-        aggressive_verify=aggressive_verify,
     )
     proxy_url = goldlapel.proxy_url() or clean_url
-    # `inst` is a GoldLapel instance under the canonical surface; legacy mocks
-    # in tests may return a bare URL string — fall back to the resolved-at-
-    # caller kwarg or proxy_port + 2.
-    if hasattr(inst, "invalidation_port"):
-        inv_port = inst.invalidation_port
-    elif invalidation_port is not None:
-        inv_port = int(invalidation_port)
-    else:
-        resolved_port = proxy_port if proxy_port is not None else goldlapel.DEFAULT_PROXY_PORT
-        inv_port = resolved_port + 2
-
-    return (
-        _restore_dialect(proxy_url, dialect),
-        inv_port,
-        native_cache,
-        aggressive_verify,
-        clean_url,
-    )
-
-
-def _make_creator(
-    proxy_url, invalidation_port, user_creator=None,
-    aggressive_verify="auto", db_key=None,
-):
-    def creator():
-        if user_creator is not None:
-            conn = user_creator()
-        else:
-            parsed = urlparse(proxy_url)
-            host = parsed.hostname or "127.0.0.1"
-            port = parsed.port or 7932
-            dbname = parsed.path.lstrip("/") or "postgres"
-            user = parsed.username
-            password = parsed.password
-            try:
-                import psycopg
-                conn = psycopg.connect(
-                    host=host, port=port, dbname=dbname,
-                    user=user, password=password, autocommit=True,
-                )
-            except ImportError:
-                import psycopg2
-                conn = psycopg2.connect(
-                    host=host, port=port, dbname=dbname,
-                    user=user, password=password,
-                )
-                conn.autocommit = True
-        return goldlapel.wrap(
-            conn,
-            invalidation_port=invalidation_port,
-            aggressive_verify=aggressive_verify,
-            db_key=db_key,
-        )
-    return creator
+    return _restore_dialect(proxy_url, dialect)
 
 
 def create_engine(url, **kwargs):
-    proxy, inv_port, native_cache, agg_verify, upstream = _start_proxy(url, kwargs)
-
-    if native_cache:
-        # Strip dialect for the creator — it needs a plain postgresql:// URL
-        plain_proxy = _DIALECT_RE.sub(r'\1\3', proxy)
-        user_creator = kwargs.pop("creator", None)
-        kwargs["creator"] = _make_creator(
-            plain_proxy, inv_port, user_creator,
-            aggressive_verify=agg_verify, db_key=upstream,
-        )
-
+    proxy = _start_proxy(url, kwargs)
     return _sa_create_engine(proxy, **kwargs)
 
 
 def create_async_engine(url, **kwargs):
-    # The native cache is not yet supported for async engines.
-    # Queries go through the GL proxy (proxy cache).
     from sqlalchemy.ext.asyncio import create_async_engine as _sa_create_async_engine
-    proxy, _inv_port, _native_cache, _agg_verify, _upstream = _start_proxy(url, kwargs)
-
+    proxy = _start_proxy(url, kwargs)
     return _sa_create_async_engine(proxy, **kwargs)
 
 
@@ -137,7 +65,6 @@ def init(
     config=None,
     proxy_port=None,
     dashboard_port=None,
-    invalidation_port=None,
     log_level=None,
     mode=None,
     extra_args=None,
@@ -150,7 +77,6 @@ def init(
         clean_url,
         proxy_port=proxy_port,
         dashboard_port=dashboard_port,
-        invalidation_port=invalidation_port,
         log_level=log_level,
         mode=mode,
         client="sqlalchemy",
@@ -163,14 +89,6 @@ def init(
         proxy = inst  # legacy mock: returned a bare URL string
     proxy = _restore_dialect(proxy, dialect)
     os.environ["DATABASE_URL"] = proxy
-    if hasattr(inst, "invalidation_port"):
-        os.environ["GOLDLAPEL_INVALIDATION_PORT"] = str(inst.invalidation_port)
-    elif invalidation_port is not None:
-        os.environ["GOLDLAPEL_INVALIDATION_PORT"] = str(invalidation_port)
-    else:
-        resolved_port = proxy_port if proxy_port is not None else goldlapel.DEFAULT_PROXY_PORT
-        os.environ["GOLDLAPEL_INVALIDATION_PORT"] = str(resolved_port + 2)
-
     return proxy
 
 
@@ -178,8 +96,6 @@ start = goldlapel.start
 stop = goldlapel.stop
 proxy_url = goldlapel.proxy_url
 GoldLapel = goldlapel.GoldLapel
-NativeCache = goldlapel.NativeCache
-wrap = goldlapel.wrap
 DEFAULT_PROXY_PORT = goldlapel.DEFAULT_PROXY_PORT
 
 doc_insert = goldlapel.doc_insert
