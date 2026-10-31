@@ -28,7 +28,7 @@ _VALID_CONFIG_KEYS = frozenset({
     "min_pattern_count", "deep_pagination_threshold",
     "report_interval_secs", "proxy_cache_size", "proxy_cache_max_bytes", "proxy_cache_max_entry_bytes", "batch_cache_size",
     "batch_cache_ttl_secs", "pool_size", "pool_timeout_secs",
-    "pool_mode", "mgmt_idle_timeout", "fallback", "read_after_write_secs",
+    "pool_mode", "mgmt_idle_timeout", "fallback", "session_upstream", "read_after_write_secs",
     "n1_threshold", "n1_window_ms", "n1_cross_threshold",
     "tls_cert", "tls_key", "tls_client_ca",
     "disable_btree_indexes",
