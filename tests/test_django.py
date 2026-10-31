@@ -304,6 +304,7 @@ class TestOptionForwarding:
         "disable_proxy_cache": True,
         "disable_sqloptimize": True,
         "disable_auto_indexes": True,
+        "shared": False,
     }
 
     def test_option_table_covers_core_signature(self):

@@ -94,6 +94,12 @@ If you'd rather hand-place a license PEM (e.g., for fully offline hosts), `licen
 
 Trial customers don't need anything — Gold Lapel registers an anonymous trial automatically on first run.
 
+## gunicorn, uwsgi and other multi-process servers: one shared proxy
+
+Each worker of a multi-process server would otherwise run its own proxy: its own cache, its own Postgres connections. In a gunicorn or uwsgi worker, `start()` instead shares one proxy with every process on the machine started with the same configuration: the first worker starts it, and the rest find it and attach. Pass `shared=True` for the same anywhere else (Celery's prefork pool, a fleet of scripts), or `shared=False` to keep one per process.
+
+`stop()` lets go of a shared proxy rather than stopping it; it exits by itself once no process has held it for 15 minutes (`GOLDLAPEL_IDLE_EXIT_SECS`). A change to the options, the `GOLDLAPEL_*` environment, `goldlapel.toml`, `.env` or the binary starts a new one, and the old one idles out. Its files (owner-only, with its output in `<key>.log`) are in `$TMPDIR/goldlapel-<uid>/`.
+
 ## Dashboard
 
 Gold Lapel exposes a live dashboard at `gl.dashboard_url`:

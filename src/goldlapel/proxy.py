@@ -1,4 +1,5 @@
 import atexit
+import json
 import os
 import platform
 import queue
@@ -7,6 +8,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import struct
 import sys
 import threading
 import time
@@ -538,6 +540,35 @@ def _set_pdeathsig():
             pass
 
 
+# Holds a shared proxy (`goldlapel ... --shared`): answered "H", then kept
+# open; the proxy stays while any process holds it.
+_HOLD_REQUEST = struct.pack("!II", 8, (1234 << 16) | 7932)
+
+
+def _shared_by_default():
+    """A worker of a multi-process server (gunicorn, uwsgi) shares one proxy
+    per machine with its siblings: one cache, one set of connections. Any
+    other process runs its own."""
+    return "gunicorn" in sys.modules or "uwsgi" in sys.modules
+
+
+def _hold(port):
+    """A socket holding the shared proxy on `port`, or None if it's leaving."""
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    except OSError:
+        return None
+    try:
+        sock.sendall(_HOLD_REQUEST)
+        if sock.recv(1) == b"H":
+            sock.settimeout(None)
+            return sock
+    except OSError:
+        pass
+    sock.close()
+    return None
+
+
 def _spawn_loop(requests):
     while True:
         cmd, kwargs, result, done = requests.get()
@@ -606,9 +637,12 @@ class GoldLapel:
         disable_proxy_cache=False,
         disable_sqloptimize=False,
         disable_auto_indexes=False,
+        shared=None,
         **unknown,
     ):
         _reject_unknown_options(unknown)
+        if shared not in (None, True, False):
+            raise TypeError("shared must be True, False or None")
         self._upstream = upstream
         # Without an explicit proxy_port, start() assigns the first free
         # pair; 7932 is the answer when nothing else holds it.
@@ -662,6 +696,13 @@ class GoldLapel:
         self._config = config
 
         self._extra_args = extra_args or []
+        # Shared with every process on this machine started the same way
+        # (see _attach_shared), rather than this process's own.
+        self._shared = _shared_by_default() if shared is None else shared
+        self._hold = None
+        # Whether start() announces the proxy: a shared one only by the
+        # process that started it.
+        self._announce = True
         self._process = None
         self._proxy_url = None
         self._conn = None
@@ -767,11 +808,10 @@ class GoldLapel:
             self._conn = driver.connect(self._proxy_url)
 
     def _command(self, binary):
-        cmd = [
-            binary,
-            "--upstream", self._upstream,
-            "--proxy-port", str(self._proxy_port),
-        ]
+        cmd = [binary, "--upstream", self._upstream]
+        # A shared proxy picks its own port unless one is given
+        if not (self._shared and not self._proxy_port_explicit):
+            cmd += ["--proxy-port", str(self._proxy_port)]
         # Top-level options (promoted out of the config map) emit their own
         # CLI flags before the tuning-knob config map. Each is suppressed
         # when the user hasn't set it, so the Rust binary applies its own
@@ -831,6 +871,8 @@ class GoldLapel:
         # Validate everything that can be validated before claiming anything.
         binary = _find_binary()
         self._command(binary)
+        if self._shared:
+            return self._attach_shared(binary)
         self._claim_ports()
         try:
             cmd = self._command(binary)
@@ -839,28 +881,7 @@ class GoldLapel:
                 port for port in (self._proxy_port, self._dashboard_port)
                 if port and not _port_free(port)
             ]
-
-            env = os.environ.copy()
-            # GOLDLAPEL_CLIENT env var is only set when the user hasn't opted in
-            # via the top-level `client` kwarg (which emits --client and takes
-            # precedence over the env var).
-            if self._client is None:
-                env.setdefault("GOLDLAPEL_CLIENT", "python")
-            # Pass api_key to the binary as an env var rather than CLI flag so
-            # it doesn't show up in `ps` output (credentials hygiene). The
-            # Rust binary reads `GOLDLAPEL_API_KEY` at startup and uses it
-            # to fetch + auto-renew the license from HQ.
-            if self._api_key is not None:
-                env["GOLDLAPEL_API_KEY"] = self._api_key
-            # Provision a session-scoped dashboard token so the wrapper can call
-            # /api/ddl/* without depending on ~/.goldlapel/dashboard-token. Pre-set
-            # env wins (user may already have a token they want to use).
-            if "GOLDLAPEL_DASHBOARD_TOKEN" in env and env["GOLDLAPEL_DASHBOARD_TOKEN"]:
-                self._dashboard_token = env["GOLDLAPEL_DASHBOARD_TOKEN"]
-            else:
-                import secrets
-                self._dashboard_token = secrets.token_hex(32)
-                env["GOLDLAPEL_DASHBOARD_TOKEN"] = self._dashboard_token
+            env = self._proxy_env()
             popen_kwargs = dict(
                 env=env,
                 stdout=subprocess.DEVNULL,
@@ -880,6 +901,72 @@ class GoldLapel:
             self._kill_process()
             self._release_ports()
             raise
+
+    def _proxy_env(self):
+        """The proxy's environment; provisions this instance's dashboard token."""
+        env = os.environ.copy()
+        # GOLDLAPEL_CLIENT env var is only set when the user hasn't opted in
+        # via the top-level `client` kwarg (which emits --client and takes
+        # precedence over the env var).
+        if self._client is None:
+            env.setdefault("GOLDLAPEL_CLIENT", "python")
+        # Pass api_key to the binary as an env var rather than CLI flag so
+        # it doesn't show up in `ps` output (credentials hygiene). The
+        # Rust binary reads `GOLDLAPEL_API_KEY` at startup and uses it
+        # to fetch + auto-renew the license from HQ.
+        if self._api_key is not None:
+            env["GOLDLAPEL_API_KEY"] = self._api_key
+        # Provision a session-scoped dashboard token so the wrapper can call
+        # /api/ddl/* without depending on ~/.goldlapel/dashboard-token. Pre-set
+        # env wins (user may already have a token they want to use).
+        if "GOLDLAPEL_DASHBOARD_TOKEN" in env and env["GOLDLAPEL_DASHBOARD_TOKEN"]:
+            self._dashboard_token = env["GOLDLAPEL_DASHBOARD_TOKEN"]
+        else:
+            import secrets
+            self._dashboard_token = secrets.token_hex(32)
+            env["GOLDLAPEL_DASHBOARD_TOKEN"] = self._dashboard_token
+        return env
+
+    def _attach_shared(self, binary):
+        """Use the proxy every process on this machine started with this
+        configuration shares, starting it if none has (the binary's
+        `--shared` finds or starts it and says where it is), and hold it
+        with a socket until stop(). It outlives this process, and exits once
+        nothing has held it for 15 minutes (GOLDLAPEL_IDLE_EXIT_SECS)."""
+        cmd = self._command(binary) + ["--shared"]
+        env = self._proxy_env()
+        deadline = time.monotonic() + _STARTUP_TIMEOUT
+        while True:
+            result = subprocess.run(
+                cmd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                text=True, timeout=_STARTUP_TIMEOUT + 5,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    result.stderr.strip()
+                    or f"Gold Lapel exited with status {result.returncode}"
+                )
+            info = json.loads(result.stdout.splitlines()[0])
+            # Refused only by a proxy that's leaving: ask again
+            hold = _hold(info["proxy_port"])
+            if hold is not None:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Gold Lapel's shared proxy on port {info['proxy_port']} "
+                    f"didn't take a hold within {_STARTUP_TIMEOUT}s."
+                )
+            time.sleep(0.05)
+        self._hold = hold
+        self._proxy_port = info["proxy_port"]
+        self._dashboard_port = info["dashboard_port"]
+        self._dashboard_token = info["dashboard_token"]
+        self._announce = info["started"]
+        self._proxy_url = _make_proxy_url(
+            self._upstream, self._proxy_port,
+            client_tls=_client_tls(self._config, self._extra_args),
+        )
+        self._holders = 1
 
     def _wait_ready(self, busy):
         """Return once the proxy answers on its port and is still alive;
@@ -913,6 +1000,10 @@ class GoldLapel:
         )
 
     def _kill_process(self):
+        # A shared proxy isn't this process's to stop: let go of it
+        hold, self._hold = self._hold, None
+        if hold is not None:
+            hold.close()
         process, self._process, self._proxy_url = self._process, None, None
         if process is not None and process.poll() is None:
             try:
@@ -930,7 +1021,7 @@ class GoldLapel:
         # pollutes app output, CI logs, and anything that captures stdout
         # (pytest -s, subprocess piping). Suppressed entirely when the caller
         # passes `silent=True`.
-        if self._silent:
+        if self._silent or not self._announce:
             return
         if self._dashboard_port:
             banner = (
@@ -985,7 +1076,7 @@ class GoldLapel:
 
     @property
     def dashboard_url(self):
-        if self._dashboard_port and self._process and self._process.poll() is None:
+        if self._dashboard_port and self.running:
             return f"http://127.0.0.1:{self._dashboard_port}"
         return None
 
@@ -1008,6 +1099,17 @@ class GoldLapel:
 
     @property
     def running(self):
+        if self._hold is not None:
+            # A shared proxy runs while it holds the socket open
+            self._hold.setblocking(False)
+            try:
+                return self._hold.recv(1, socket.MSG_PEEK) != b""
+            except BlockingIOError:
+                return True
+            except OSError:
+                return False
+            finally:
+                self._hold.setblocking(True)
         return self._process is not None and self._process.poll() is None
 
     # -- Document store: gl.documents.<verb>(...). See goldlapel/documents.py.
@@ -1165,6 +1267,7 @@ def start(
     disable_proxy_cache=False,
     disable_sqloptimize=False,
     disable_auto_indexes=False,
+    shared=None,
     **unknown,
 ):
     """Factory: spawn a Gold Lapel proxy in front of `upstream` and return a
@@ -1201,6 +1304,11 @@ def start(
         Default False.
     - disable_auto_indexes: skip automatic index creation (--disable-auto-indexes).
         Default False.
+    - shared: share one proxy with every process on this machine started with
+        the same configuration, instead of running one for this process.
+        Default None: on in a worker of a multi-process server (gunicorn,
+        uwsgi), off otherwise. A shared proxy outlives this process: stop()
+        lets go of it, and it exits once unused for 15 minutes.
 
     Promoted top-level concepts are rejected inside the `config` dict.
 
@@ -1244,6 +1352,7 @@ def start(
         disable_proxy_cache=disable_proxy_cache,
         disable_sqloptimize=disable_sqloptimize,
         disable_auto_indexes=disable_auto_indexes,
+        shared=shared,
     )
     return inst
 

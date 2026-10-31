@@ -34,7 +34,7 @@ _START_OPTIONS = (
     "proxy_port", "dashboard_port", "log_level", "mode", "license",
     "api_key", "client", "config_file", "config", "extra_args", "silent",
     "mesh", "mesh_tag", "disable_proxy_cache", "disable_sqloptimize",
-    "disable_auto_indexes",
+    "disable_auto_indexes", "shared",
 )
 
 

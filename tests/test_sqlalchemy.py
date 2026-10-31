@@ -354,6 +354,7 @@ _ALL_START_OPTIONS = {
     "disable_proxy_cache": True,
     "disable_sqloptimize": True,
     "disable_auto_indexes": True,
+    "shared": False,
 }
 
 

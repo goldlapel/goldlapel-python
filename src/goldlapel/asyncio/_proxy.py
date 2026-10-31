@@ -99,6 +99,7 @@ class AsyncGoldLapel:
         disable_proxy_cache=False,
         disable_sqloptimize=False,
         disable_auto_indexes=False,
+        shared=None,
         **unknown,
     ):
         _reject_unknown_options(unknown)
@@ -122,6 +123,7 @@ class AsyncGoldLapel:
             disable_proxy_cache=disable_proxy_cache,
             disable_sqloptimize=disable_sqloptimize,
             disable_auto_indexes=disable_auto_indexes,
+            shared=shared,
         ))
 
     @classmethod
@@ -486,6 +488,7 @@ def start(
     disable_proxy_cache=False,
     disable_sqloptimize=False,
     disable_auto_indexes=False,
+    shared=None,
     **unknown,
 ):
     """Factory: spawn a Gold Lapel proxy and return an AsyncGoldLapel instance.
@@ -531,4 +534,5 @@ def start(
         disable_proxy_cache=disable_proxy_cache,
         disable_sqloptimize=disable_sqloptimize,
         disable_auto_indexes=disable_auto_indexes,
+        shared=shared,
     )

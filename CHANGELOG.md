@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added — one shared proxy for multi-process servers
+
+- **`shared`.** In a gunicorn or uwsgi worker, `start()` shares one proxy
+  with every process on the machine started with the same configuration,
+  instead of one per worker (one cache instead of one per worker, and one
+  set of Postgres connections). `shared=True` turns it on anywhere,
+  `shared=False` off. `stop()` lets go of a shared proxy, which exits once
+  unused for 15 minutes. Django, SQLAlchemy and `goldlapel.asyncio` take
+  the same option.
+
 ### Fixed — proxies that start, share and stop cleanly
 
 - **Busy ports.** Auto-assigned ports now skip any pair that something else
