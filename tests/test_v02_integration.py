@@ -153,6 +153,9 @@ class TestPortsAgainstRealProxy:
         import socket
         first = proxy_mod._pick_proxy_port(None, {})
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # As a server binds (and as _port_free probes): an earlier test's
+        # connections in TIME_WAIT on this port don't make it busy.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("0.0.0.0", first))
         sock.listen()
         try:
