@@ -1094,169 +1094,239 @@ def explain_score(conn, table, column, query, id_column, id_value, lang='english
 
 _FIELD_PART_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
-_COMPARISON_OPS = {
-    "$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<=",
-    "$eq": "=", "$ne": "!=",
-}
-_SUPPORTED_FILTER_OPS = set(_COMPARISON_OPS) | {"$in", "$nin", "$exists", "$regex", "$elemMatch", "$text"}
-_LOGICAL_OPS = {"$or", "$and", "$not"}
-_UPDATE_OPS = {"$set", "$unset", "$inc", "$mul", "$rename", "$push", "$pull", "$addToSet"}
+# Filters follow MongoDB's query semantics, compiled to SQL/JSON path
+# predicates on `data` (`data @? '$.a.b ? (@ > 5)'`): a path through arrays
+# searches their elements, comparisons only match values of the same type
+# (numbers with numbers, strings by code point), and GIN indexes on `data`
+# serve the equalities. Known differences from MongoDB: an array nested in
+# an array is searched too (MongoDB searches one level), objects compare
+# without regard to key order, and an object or array value is compared at
+# its path without searching arrays along the way.
+_COMPARISONS = {"$eq": "==", "$ne": "!=", "$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}
+_REGEX_FLAGS = set("imsx")
+
+
+def _path_parts(key):
+    parts = key.split(".")
+    for part in parts:
+        if not _FIELD_PART_RE.match(part):
+            raise ValueError(f"Invalid field key: {key}")
+    return parts
 
 
 def _field_path(key):
-    parts = key.split(".")
-    for part in parts:
-        if not _FIELD_PART_RE.match(part):
-            raise ValueError(f"Invalid filter key: {key}")
-    if len(parts) == 1:
-        return f"data->>'{parts[0]}'"
-    arrow_chain = "data"
-    for part in parts[:-1]:
-        arrow_chain += f"->'{part}'"
-    arrow_chain += f"->>'{parts[-1]}'"
-    return arrow_chain
+    """A field's value as text (`data->'a'->>'b'`)."""
+    parts = _path_parts(key)
+    return "data" + "".join(f"->'{p}'" for p in parts[:-1]) + f"->>'{parts[-1]}'"
 
 
-def _expand_dot_keys(d):
-    result = {}
-    for key, value in d.items():
-        parts = key.split('.')
-        current = result
-        for part in parts[:-1]:
-            if part not in current:
-                current[part] = {}
-            current = current[part]
-        current[parts[-1]] = value
-    return result
+def _text_path(key):
+    """A field's path as a text-array literal (`'{a,b}'`), for `#>`."""
+    return "'{" + ",".join(_path_parts(key)) + "}'"
 
 
-def _field_path_json(key):
-    parts = key.split(".")
-    for part in parts:
-        if not _FIELD_PART_RE.match(part):
-            raise ValueError(f"Invalid field key: {key}")
-    chain = "data"
-    for part in parts:
-        chain += f"->'{part}'"
-    return chain
+def _jsonpath(key):
+    """A field's SQL/JSON path (`$."a"."b"`)."""
+    return "$" + "".join(f'."{p}"' for p in _path_parts(key))
 
 
-def _jsonb_path(key):
-    parts = key.split(".")
-    for part in parts:
-        if not _FIELD_PART_RE.match(part):
-            raise ValueError(f"Invalid field key: {key}")
-    return "{" + ",".join(parts) + "}"
+def _is_scalar(value):
+    return value is None or isinstance(value, (bool, int, float, str))
 
 
-def _to_jsonb_expr(value):
-    if isinstance(value, bool):
-        return "to_jsonb(%s::boolean)", value
-    elif isinstance(value, (int, float)):
-        return "to_jsonb(%s::numeric)", value
-    elif isinstance(value, str):
-        return "to_jsonb(%s::text)", value
-    else:
-        return "%s::jsonb", json.dumps(value)
+def _jsonpath_literal(value):
+    """A scalar spelled as an SQL/JSON path literal: as JSON spells it."""
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        raise ValueError(f"Can't compare with {value}")
+    return json.dumps(value)
 
 
-def _build_update(update):
-    if not any(k.startswith("$") for k in update):
-        return "data || %s::jsonb", [json.dumps(update)]
+def _matches(path, condition):
+    """`data` has a value at `path` (or, through arrays, an element) meeting
+    `condition`, an SQL/JSON path predicate on `@`."""
+    return "data @? %s::text::jsonpath", [f"{path} ? ({condition})"]
 
-    expr = "data"
-    params = []
 
-    if "$set" in update:
-        expr = f"({expr} || %s::jsonb)"
-        params.append(json.dumps(update["$set"]))
+def _equals(key, value):
+    """MongoDB equality: the value at `key` equals `value`, or is an array
+    with an element that does. Null also matches a missing field."""
+    path = _jsonpath(key)
+    if value is None:
+        return "(NOT data @? %s::text::jsonpath OR data @? %s::text::jsonpath)", [path, f"{path} ? (@ == null)"]
+    if _is_scalar(value):
+        return _matches(path, f"@ == {_jsonpath_literal(value)}")
+    if not isinstance(value, (dict, list)):
+        raise ValueError(f"Can't compare with {type(value).__name__}: {value!r}")
+    at, as_json = f"data #> {_text_path(key)}", json.dumps(value)
+    return (
+        f"({at} = %s::jsonb OR EXISTS (SELECT 1 FROM jsonb_array_elements("
+        f"CASE WHEN jsonb_typeof({at}) = 'array' THEN {at} END) AS e WHERE e = %s::jsonb))",
+        [as_json, as_json],
+    )
 
-    if "$unset" in update:
-        for field in update["$unset"]:
-            parts = field.split(".")
-            for part in parts:
-                if not _FIELD_PART_RE.match(part):
-                    raise ValueError(f"Invalid field key: {field}")
-            if len(parts) == 1:
-                expr = f"({expr} - %s)"
-                params.append(field)
+
+def _any_of(key, values):
+    """`$in`: equal (`_equals`) to any of `values`."""
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("$in and $nin take a list")
+    if not values:
+        return "FALSE", []
+    scalars = [v for v in values if _is_scalar(v) and v is not None]
+    clauses, params = [], []
+    if scalars:
+        sql, p = _matches(_jsonpath(key), " || ".join(f"@ == {_jsonpath_literal(v)}" for v in scalars))
+        clauses.append(sql)
+        params.extend(p)
+    for value in values:
+        if value is None or not _is_scalar(value):
+            sql, p = _equals(key, value)
+            clauses.append(sql)
+            params.extend(p)
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def _field_clauses(key, ops):
+    """The clauses of one field's operators (`{"$gt": 1, "$lt": 5}`), each
+    met by any element of an array there, as in MongoDB."""
+    clauses, params = [], []
+
+    def add(sql, p):
+        clauses.append(sql)
+        params.extend(p)
+
+    path = _jsonpath(key)
+    for op, operand in ops.items():
+        if op == "$eq":
+            add(*_equals(key, operand))
+        elif op == "$ne":
+            sql, p = _equals(key, operand)
+            add(f"NOT {sql}", p)
+        elif op in _COMPARISONS:
+            if operand is None:
+                # Only null (or missing) is ≤ or ≥ null; nothing's < or >
+                add(*(_equals(key, None) if op in ("$gte", "$lte") else ("FALSE", [])))
+            elif _is_scalar(operand):
+                add(*_matches(path, f"@ {_COMPARISONS[op]} {_jsonpath_literal(operand)}"))
             else:
-                path = "{" + ",".join(parts) + "}"
-                expr = f"({expr} #- %s::text[])"
-                params.append(path)
-
-    if "$inc" in update:
-        for field, amount in update["$inc"].items():
-            jp = _jsonb_path(field)
-            fp = _field_path(field)
-            expr = f"jsonb_set({expr}, %s::text[], to_jsonb(COALESCE(({fp})::numeric, 0) + %s))"
-            params.extend([jp, amount])
-
-    if "$mul" in update:
-        for field, factor in update["$mul"].items():
-            jp = _jsonb_path(field)
-            fp = _field_path(field)
-            expr = f"jsonb_set({expr}, %s::text[], to_jsonb(COALESCE(({fp})::numeric, 0) * %s))"
-            params.extend([jp, factor])
-
-    if "$rename" in update:
-        for old_name, new_name in update["$rename"].items():
-            for part in old_name.split("."):
-                if not _FIELD_PART_RE.match(part):
-                    raise ValueError(f"Invalid field key: {old_name}")
-            for part in new_name.split("."):
-                if not _FIELD_PART_RE.match(part):
-                    raise ValueError(f"Invalid field key: {new_name}")
-            old_json = _field_path_json(old_name)
-            new_jp = _jsonb_path(new_name)
-            if "." in old_name:
-                old_path = "{" + ",".join(old_name.split(".")) + "}"
-                expr = f"jsonb_set(({expr} #- %s::text[]), %s::text[], {old_json})"
-                params.extend([old_path, new_jp])
+                raise ValueError(f"{op} takes a number, string or boolean: {operand!r}")
+        elif op == "$in":
+            add(*_any_of(key, operand))
+        elif op == "$nin":
+            sql, p = _any_of(key, operand)
+            add(f"NOT {sql}", p)
+        elif op == "$all":
+            if not isinstance(operand, (list, tuple)) or not operand:
+                add("FALSE", [])
             else:
-                expr = f"jsonb_set(({expr} - %s), %s::text[], {old_json})"
-                params.extend([old_name, new_jp])
+                for value in operand:
+                    add(*_equals(key, value))
+        elif op == "$exists":
+            sql = "data @? %s::text::jsonpath"
+            add(sql if operand else f"NOT {sql}", [path])
+        elif op == "$size":
+            if isinstance(operand, bool) or not isinstance(operand, int):
+                raise ValueError("$size takes a whole number")
+            at = f"data #> {_text_path(key)}"
+            add(f"(jsonb_typeof({at}) = 'array' AND jsonb_array_length({at}) = {operand})", [])
+        elif op == "$regex":
+            add(*_matches(path, _regex_condition("@", operand, ops.get("$options", ""))))
+        elif op == "$options":
+            if "$regex" not in ops:
+                raise ValueError("$options needs $regex")
+        elif op == "$not":
+            if not isinstance(operand, dict) or not operand or not all(k.startswith("$") for k in operand):
+                raise ValueError("$not takes operators, e.g. {'$not': {'$gt': 5}}")
+            sql, p = _field_clauses(key, operand)
+            add(f"NOT ({sql})", p)
+        elif op == "$elemMatch":
+            if not isinstance(operand, dict) or not operand:
+                raise ValueError("$elemMatch takes a filter")
+            at = f"data #> {_text_path(key)}"
+            sql, p = _matches(f"{path}[*]", _element_condition(operand))
+            add(f"(jsonb_typeof({at}) = 'array' AND {sql})", p)
+        elif op == "$text":
+            if not isinstance(operand, dict) or "$search" not in operand:
+                raise ValueError("$text requires {$search: 'query'}")
+            lang = operand.get("$language", "english")
+            add(f"to_tsvector(%s, {_field_path(key)}) @@ plainto_tsquery(%s, %s)", [lang, lang, operand["$search"]])
+        else:
+            raise ValueError(f"Unsupported filter operator: {op}")
+    return " AND ".join(clauses), params
 
-    if "$push" in update:
-        for field, value in update["$push"].items():
-            jp = _jsonb_path(field)
-            fj = _field_path_json(field)
-            val_expr, val_param = _to_jsonb_expr(value)
-            expr = f"jsonb_set({expr}, %s::text[], COALESCE({fj}, '[]'::jsonb) || {val_expr})"
-            params.extend([jp, val_param])
 
-    if "$pull" in update:
-        for field, value in update["$pull"].items():
-            jp = _jsonb_path(field)
-            fj = _field_path_json(field)
-            val_expr, val_param = _to_jsonb_expr(value)
-            expr = (
-                f"jsonb_set({expr}, %s::text[], "
-                f"COALESCE((SELECT jsonb_agg(elem) FROM jsonb_array_elements({fj}) AS elem "
-                f"WHERE elem != {val_expr}), '[]'::jsonb))"
-            )
-            params.extend([jp, val_param])
+def _regex_condition(target, pattern, options):
+    if not isinstance(pattern, str):
+        raise ValueError("$regex takes a string")
+    if not isinstance(options, str) or set(options) - _REGEX_FLAGS:
+        raise ValueError("$options takes any of i, m, s, x")
+    flags = f' flag "{options}"' if options else ""
+    return f"{target} like_regex {json.dumps(pattern)}{flags}"
 
-    if "$addToSet" in update:
-        for field, value in update["$addToSet"].items():
-            jp = _jsonb_path(field)
-            fj = _field_path_json(field)
-            val_expr, val_param = _to_jsonb_expr(value)
-            expr = (
-                f"jsonb_set({expr}, %s::text[], "
-                f"CASE WHEN COALESCE({fj}, '[]'::jsonb) @> {val_expr} "
-                f"THEN {fj} "
-                f"ELSE COALESCE({fj}, '[]'::jsonb) || {val_expr} END)"
-            )
-            params.extend([jp, val_param, val_param])
 
-    return expr, params
+def _element_condition(filter_dict):
+    """An `$elemMatch` filter as an SQL/JSON path predicate on an array
+    element `@`: operators (`{"$gt": 1}`) apply to the element, fields
+    (`{"qty": {"$gt": 1}}`) to its own fields."""
+    if all(k.startswith("$") for k in filter_dict):
+        return _value_condition("@", filter_dict)
+    if any(k.startswith("$") for k in filter_dict):
+        raise ValueError("$elemMatch takes operators or fields, not both")
+    parts = []
+    for key, value in filter_dict.items():
+        target = "@" + "".join(f'."{p}"' for p in _path_parts(key))
+        if isinstance(value, dict) and value and all(k.startswith("$") for k in value):
+            parts.append(_value_condition(target, value))
+        elif _is_scalar(value):
+            parts.append(_value_condition(target, {"$eq": value}))
+        else:
+            raise ValueError("$elemMatch compares fields with numbers, strings, booleans or null")
+    return " && ".join(f"({p})" for p in parts)
+
+
+def _value_condition(target, ops):
+    """Scalar operators as one SQL/JSON path predicate on `target`."""
+    parts = []
+    for op, operand in ops.items():
+        if op in _COMPARISONS:
+            if not _is_scalar(operand):
+                raise ValueError(f"{op} takes a number, string, boolean or null here: {operand!r}")
+            parts.append(f"{target} {_COMPARISONS[op]} {_jsonpath_literal(operand)}")
+        elif op in ("$in", "$nin"):
+            if not isinstance(operand, (list, tuple)) or not all(_is_scalar(v) for v in operand):
+                raise ValueError(f"{op} takes a list of numbers, strings, booleans or null here")
+            any_of = " || ".join(f"{target} == {_jsonpath_literal(v)}" for v in operand) or "1 == 2"
+            parts.append(f"({any_of})" if op == "$in" else f"!({any_of})")
+        elif op == "$exists":
+            parts.append(f"exists({target})" if operand else f"!(exists({target}))")
+        elif op == "$regex":
+            parts.append(_regex_condition(target, operand, ops.get("$options", "")))
+        elif op == "$options":
+            continue
+        else:
+            raise ValueError(f"Unsupported operator here: {op}")
+    return " && ".join(f"({p})" for p in parts) or "1 == 1"
+
+
+def _id_clause(value):
+    """`_id`, the document's own column (a uuid)."""
+    if not isinstance(value, dict):
+        return "_id = %s::text::uuid", [str(value)]
+    clauses, params = [], []
+    for op, operand in value.items():
+        if op in ("$eq", "$ne"):
+            clauses.append("_id = %s::text::uuid" if op == "$eq" else "_id <> %s::text::uuid")
+            params.append(str(operand))
+        elif op in ("$in", "$nin"):
+            clauses.append("_id = ANY(%s::text[]::uuid[])" if op == "$in" else "NOT (_id = ANY(%s::text[]::uuid[]))")
+            params.append([str(v) for v in operand])
+        else:
+            raise ValueError(f"Unsupported operator on _id: {op}")
+    return " AND ".join(clauses), params
 
 
 def _build_filter(filter_dict):
     if not filter_dict:
         return "", []
-    containment = {}
     clauses = []
     params = []
     for key, value in filter_dict.items():
@@ -1266,98 +1336,195 @@ def _build_filter(filter_dict):
             lang = value.get("$language", "english")
             clauses.append("to_tsvector(%s, data::text) @@ plainto_tsquery(%s, %s)")
             params.extend([lang, lang, value["$search"]])
-        elif key in _LOGICAL_OPS:
-            if key == "$not":
-                if not isinstance(value, dict):
-                    raise ValueError("$not value must be a filter object")
-                sub_clause, sub_params = _build_filter(value)
-                if sub_clause:
-                    clauses.append(f"NOT ({sub_clause})")
-                    params.extend(sub_params)
-            else:
-                if not isinstance(value, list) or len(value) == 0:
-                    raise ValueError(f"{key} value must be a non-empty array")
-                joiner = " OR " if key == "$or" else " AND "
-                sub_clauses = []
-                for sub_filter in value:
-                    sc, sp = _build_filter(sub_filter)
-                    if sc:
-                        sub_clauses.append(sc)
-                        params.extend(sp)
-                if sub_clauses:
-                    clauses.append("(" + joiner.join(sub_clauses) + ")")
+        elif key == "$not":
+            if not isinstance(value, dict):
+                raise ValueError("$not value must be a filter object")
+            sub_clause, sub_params = _build_filter(value)
+            if sub_clause:
+                clauses.append(f"NOT ({sub_clause})")
+                params.extend(sub_params)
+        elif key in ("$and", "$or", "$nor"):
+            if not isinstance(value, list) or len(value) == 0:
+                raise ValueError(f"{key} value must be a non-empty array")
+            sub_clauses = []
+            for sub_filter in value:
+                sc, sp = _build_filter(sub_filter)
+                sub_clauses.append(sc or "TRUE")
+                params.extend(sp)
+            joined = (" AND " if key == "$and" else " OR ").join(f"({c})" for c in sub_clauses)
+            clauses.append(f"NOT ({joined})" if key == "$nor" else f"({joined})")
+        elif key.startswith("$"):
+            raise ValueError(f"Unsupported filter operator: {key}")
+        elif key == "_id":
+            sql, p = _id_clause(value)
+            clauses.append(sql)
+            params.extend(p)
+        elif isinstance(value, dict) and value and all(k.startswith("$") for k in value):
+            sql, p = _field_clauses(key, value)
+            clauses.append(sql)
+            params.extend(p)
         elif isinstance(value, dict) and any(k.startswith("$") for k in value):
-            field_expr = _field_path(key)
-            for op, operand in value.items():
-                if op in _COMPARISON_OPS:
-                    sql_op = _COMPARISON_OPS[op]
-                    if isinstance(operand, (int, float)):
-                        clauses.append(f"({field_expr})::numeric {sql_op} %s")
-                        params.append(operand)
-                    else:
-                        clauses.append(f"{field_expr} {sql_op} %s")
-                        params.append(str(operand))
-                elif op == "$in":
-                    placeholders = ", ".join(["%s"] * len(operand))
-                    clauses.append(f"{field_expr} IN ({placeholders})")
-                    params.extend(str(v) for v in operand)
-                elif op == "$nin":
-                    placeholders = ", ".join(["%s"] * len(operand))
-                    clauses.append(f"{field_expr} NOT IN ({placeholders})")
-                    params.extend(str(v) for v in operand)
-                elif op == "$exists":
-                    parts = key.split(".")
-                    top_key = parts[0]
-                    if operand:
-                        clauses.append("data ? %s")
-                    else:
-                        clauses.append("NOT (data ? %s)")
-                    params.append(top_key)
-                elif op == "$regex":
-                    clauses.append(f"{field_expr} ~ %s")
-                    params.append(operand)
-                elif op == "$elemMatch":
-                    if not isinstance(operand, dict):
-                        raise ValueError("$elemMatch value must be an object")
-                    field_json = _field_path_json(key)
-                    elem_clauses = []
-                    for sub_op, sub_val in operand.items():
-                        if sub_op in _COMPARISON_OPS:
-                            sql_op = _COMPARISON_OPS[sub_op]
-                            if isinstance(sub_val, (int, float)):
-                                elem_clauses.append(f"(elem#>>'{{}}')::numeric {sql_op} %s")
-                                params.append(sub_val)
-                            else:
-                                elem_clauses.append(f"elem#>>'{{}}' {sql_op} %s")
-                                params.append(str(sub_val))
-                        elif sub_op == "$regex":
-                            elem_clauses.append(f"elem#>>'{{}}' ~ %s")
-                            params.append(sub_val)
-                        else:
-                            raise ValueError(f"Unsupported $elemMatch operator: {sub_op}")
-                    if elem_clauses:
-                        clauses.append(
-                            f"EXISTS (SELECT 1 FROM jsonb_array_elements({field_json}) AS elem "
-                            f"WHERE {' AND '.join(elem_clauses)})"
-                        )
-                elif op == "$text":
-                    if not isinstance(operand, dict) or "$search" not in operand:
-                        raise ValueError("$text requires {$search: 'query'}")
-                    lang = operand.get("$language", "english")
-                    clauses.append(f"to_tsvector(%s, {field_expr}) @@ plainto_tsquery(%s, %s)")
-                    params.extend([lang, lang, operand["$search"]])
-                else:
-                    raise ValueError(f"Unsupported filter operator: {op}")
+            raise ValueError(f"The filter on {key} mixes operators with fields")
         else:
-            containment[key] = value
-    all_clauses = []
-    all_params = []
-    if containment:
-        all_clauses.append("data @> %s::jsonb")
-        all_params.append(json.dumps(_expand_dot_keys(containment)))
-    all_clauses.extend(clauses)
-    all_params.extend(params)
-    return " AND ".join(all_clauses), all_params
+            sql, p = _equals(key, value)
+            clauses.append(sql)
+            params.extend(p)
+    return " AND ".join(clauses), params
+
+
+def _sort_keys(value):
+    """The sort keys of a JSON value, in MongoDB's order: null (or missing),
+    numbers (by value), strings (by code point), objects, arrays, booleans."""
+    return [
+        f"(CASE jsonb_typeof({value}) WHEN 'number' THEN 1 WHEN 'string' THEN 2 WHEN 'object' THEN 3 "
+        f"WHEN 'array' THEN 4 WHEN 'boolean' THEN 5 ELSE 0 END)",
+        f"(CASE WHEN jsonb_typeof({value}) = 'number' THEN ({value})::numeric END)",
+        f"(CASE WHEN jsonb_typeof({value}) = 'string' THEN {value} #>> '{{}}' END) COLLATE \"C\"",
+        f"({value})",
+    ]
+
+
+def _build_sort(sort):
+    """ORDER BY terms for a `{field: 1 | -1}` sort on `data`."""
+    terms = []
+    for key, direction in sort.items():
+        if direction not in (1, -1) or isinstance(direction, bool):
+            raise ValueError(f"Sort direction for {key} must be 1 or -1")
+        order = "ASC" if direction == 1 else "DESC"
+        keys = ["_id"] if key == "_id" else _sort_keys(f"data #> {_text_path(key)}")
+        terms.extend(f"{k} {order}" for k in keys)
+    return ", ".join(terms)
+
+
+def _set_at(expr, key, value):
+    """`expr` with `value` (SQL, never NULL) at `key`, making any parent
+    that's missing (or not an object) an object."""
+    parts = _path_parts(key)
+    for i in range(len(parts) - 1, 0, -1):
+        parent = f"{expr} #> '{{{','.join(parts[:i])}}}'"
+        obj = f"CASE WHEN jsonb_typeof({parent}) = 'object' THEN {parent} ELSE '{{}}'::jsonb END"
+        value = f"jsonb_set({obj}, '{{{parts[i]}}}', {value})"
+    return f"jsonb_set({expr}, '{{{parts[0]}}}', {value})"
+
+
+def _number(op, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{op} takes a number: {value!r}")
+    return json.dumps(value)
+
+
+def _items(op, value):
+    """`$push` / `$addToSet`'s values: one, or `{"$each": [...]}`."""
+    if isinstance(value, dict) and any(k.startswith("$") for k in value):
+        if set(value) != {"$each"} or not isinstance(value["$each"], (list, tuple)):
+            raise ValueError(f"{op} takes a value or {{'$each': [...]}}")
+        return list(value["$each"])
+    return [value]
+
+
+def _array_at(expr, key):
+    """The array at `key` (an empty one if it's missing); an error if
+    something else is there, as in MongoDB."""
+    at = f"{expr} #> {_text_path(key)}"
+    return f"(CASE WHEN jsonb_array_length(COALESCE({at}, '[]'::jsonb)) >= 0 THEN COALESCE({at}, '[]'::jsonb) END)"
+
+
+def _update_step(e, op, key, value):
+    """One field's update by `op`, as SQL computing the new document from
+    the document so far, `e`."""
+    at = f"{e} #> {_text_path(key)}"
+    if op == "$set":
+        return _set_at(e, key, "%s::jsonb"), [json.dumps(value)]
+    if op == "$unset":
+        return f"({e} #- {_text_path(key)})", []
+    if op in ("$inc", "$mul"):
+        sign = "+" if op == "$inc" else "*"
+        return _set_at(e, key, f"to_jsonb(COALESCE(({at})::numeric, 0) {sign} %s::text::numeric)"), [_number(op, value)]
+    if op == "$rename":
+        if not isinstance(value, str):
+            raise ValueError("$rename takes the new field name")
+        return f"(CASE WHEN {at} IS NULL THEN {e} ELSE {_set_at(f'({e} #- {_text_path(key)})', value, at)} END)", []
+    if op == "$push":
+        return _set_at(e, key, f"({_array_at(e, key)} || %s::jsonb)"), [json.dumps(_items(op, value))]
+    if op == "$addToSet":
+        array = _array_at(e, key)
+        added = (
+            f"({array} || COALESCE((SELECT jsonb_agg(v ORDER BY o) FROM (SELECT DISTINCT ON (v) v, o "
+            f"FROM jsonb_array_elements(%s::jsonb) WITH ORDINALITY AS t(v, o) ORDER BY v, o) AS d "
+            f"WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements({array}) AS x WHERE x = d.v)), '[]'::jsonb))"
+        )
+        return _set_at(e, key, added), [json.dumps(_items(op, value))]
+    if op == "$pull":
+        # A condition is a query on each element, as `$elemMatch`'s is
+        if isinstance(value, dict) and value:
+            match, params = "x @? %s::text::jsonpath", [f"$ ? ({_element_condition(value)})"]
+        else:
+            match, params = "x = %s::jsonb", [json.dumps(value)]
+        kept = (
+            f"COALESCE((SELECT jsonb_agg(x ORDER BY o) FROM jsonb_array_elements({at}) WITH ORDINALITY AS t(x, o) "
+            f"WHERE NOT ({match})), '[]'::jsonb)"
+        )
+        return f"(CASE WHEN {at} IS NULL THEN {e} ELSE {_set_at(e, key, kept)} END)", params
+    raise ValueError(f"Unsupported update operator: {op}")
+
+
+def _build_update(update):
+    """The new `data` for a MongoDB-style update: operators (`$set`, `$inc`,
+    …) applied in order, or, with none, a replacement document."""
+    if not isinstance(update, dict) or not update:
+        raise ValueError("An update needs operators ($set, …) or a replacement document")
+    operators = [k for k in update if k.startswith("$")]
+    if not operators:
+        return "%s::jsonb", [json.dumps(update)]
+    if len(operators) != len(update):
+        raise ValueError("An update has operators ($set, …) or is a replacement document, not both")
+    # Each step reads the one before as `e<n>`: no step's SQL repeats another's
+    steps, params = [], []
+    for op, fields in update.items():
+        if not isinstance(fields, dict):
+            raise ValueError(f"{op} takes {{field: value}}")
+        for key, value in fields.items():
+            sql, p = _update_step(f"e{len(steps)}", op, key, value)
+            steps.append(sql)
+            params.extend(p)
+    chain = "".join(f" CROSS JOIN LATERAL (SELECT {sql} AS e{i + 1}) AS s{i + 1}" for i, sql in enumerate(steps))
+    return f"(SELECT e{len(steps)} FROM (SELECT data AS e0) AS s0{chain})", params
+
+
+def _doc_index_name(table, suffix):
+    """Build a deterministic index name from a (possibly schema-qualified)
+    table reference and a suffix (a field's dotted path is spelled with
+    `__`). Postgres keeps 63 bytes of a name: a longer one ends in a hash."""
+    bare = table.rsplit(".", 1)[-1]
+    name = f"idx_{bare}_{suffix.replace('.', '__')}"
+    if len(name) > 63:
+        name = name[:50] + "_" + hashlib.sha1(name.encode()).hexdigest()[:12]
+    return name
+
+
+def _doc_index_sql(table, keys=None):
+    """`doc_create_index`'s statements: with no keys, a GIN index on `data`
+    (which serves the filters' equalities); with keys, one per key in the
+    order `_build_sort` sorts it."""
+    if keys is None:
+        return [f"CREATE INDEX IF NOT EXISTS {_doc_index_name(table, 'gin')} ON {table} USING GIN (data)"]
+    statements = []
+    for key in keys:
+        columns = ", ".join(_sort_keys(f"data #> {_text_path(key)}"))
+        statements.append(f"CREATE INDEX IF NOT EXISTS {_doc_index_name(table, key)} ON {table} ({columns})")
+    return statements
+
+
+def _distinct_sql(table, field, filter):
+    """`doc_distinct`: every distinct value at `field` (an array's elements),
+    as JSON text."""
+    params = [_jsonpath(field) + "[*]"]
+    sql = f"SELECT DISTINCT v::text FROM {table}, jsonb_path_query(data, %s::text::jsonpath) AS v"
+    where_clause, filter_params = _build_filter(filter)
+    if where_clause:
+        sql += " WHERE " + where_clause
+        params.extend(filter_params)
+    return sql, params
 
 
 def _doc_table(patterns):
@@ -1373,14 +1540,6 @@ def _doc_table(patterns):
             "`gl.documents.<verb>(...)` rather than the utils function directly."
         )
     return patterns["tables"]["main"]
-
-
-def _doc_index_name(table, suffix):
-    """Build a deterministic index name from a (possibly schema-qualified)
-    table reference. Strips any `schema.` prefix so the index name doesn't
-    contain a dot — Postgres rejects those without quoting."""
-    bare = table.rsplit(".", 1)[-1]
-    return f"idx_{bare}_{suffix}"
 
 
 def doc_create_collection(conn, collection, unlogged=False, *, patterns=None):
@@ -1447,12 +1606,7 @@ def doc_find(conn, collection, filter=None, sort=None, limit=None, skip=None, *,
         sql += " WHERE " + where_clause
         params.extend(filter_params)
     if sort:
-        order_parts = []
-        for key, direction in sort.items():
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
-                raise ValueError(f"Invalid sort key: {key}")
-            order_parts.append(f"data->>'{key}' {'ASC' if direction == 1 else 'DESC'}")
-        sql += " ORDER BY " + ", ".join(order_parts)
+        sql += " ORDER BY " + _build_sort(sort)
     if limit is not None:
         sql += " LIMIT %s"
         params.append(limit)
@@ -1477,12 +1631,7 @@ def doc_find_cursor(conn, collection, filter=None, sort=None, limit=None, skip=N
         sql += " WHERE " + where_clause
         params.extend(filter_params)
     if sort:
-        order_parts = []
-        for key, direction in sort.items():
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
-                raise ValueError(f"Invalid sort key: {key}")
-            order_parts.append(f"data->>'{key}' {'ASC' if direction == 1 else 'DESC'}")
-        sql += " ORDER BY " + ", ".join(order_parts)
+        sql += " ORDER BY " + _build_sort(sort)
     if limit is not None:
         sql += " LIMIT %s"
         params.append(limit)
@@ -1528,7 +1677,7 @@ def doc_update(conn, collection, filter, update, *, patterns=None):
     cur = conn.cursor()
     where_clause, filter_params = _build_filter(filter)
     update_expr, update_params = _build_update(update)
-    sql = f"UPDATE {table} SET data = {update_expr}"
+    sql = f"UPDATE {table} SET data = {update_expr}, updated_at = NOW()"
     params = list(update_params)
     if where_clause:
         sql += " WHERE " + where_clause
@@ -1552,7 +1701,7 @@ def doc_update_one(conn, collection, filter, update, *, patterns=None):
         cte_where = ""
     sql = (
         f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
-        f"UPDATE {table} SET data = {update_expr} FROM target WHERE {table}._id = target._id"
+        f"UPDATE {table} SET data = {update_expr}, updated_at = NOW() FROM target WHERE {table}._id = target._id"
     )
     params = list(filter_params) + list(update_params)
     cur.execute(sql, tuple(params))
@@ -1625,7 +1774,7 @@ def doc_find_one_and_update(conn, collection, filter, update, *, patterns=None):
         cte_where = ""
     sql = (
         f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
-        f"UPDATE {table} SET data = {update_expr} FROM target "
+        f"UPDATE {table} SET data = {update_expr}, updated_at = NOW() FROM target "
         f"WHERE {table}._id = target._id "
         f"RETURNING {table}._id, {table}.data, {table}.created_at"
     )
@@ -1669,17 +1818,9 @@ def doc_distinct(conn, collection, field, filter=None, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
     cur = conn.cursor()
-    field_expr = _field_path(field)
-    sql = f"SELECT DISTINCT {field_expr} FROM {table}"
-    params = []
-    where_parts = [f"{field_expr} IS NOT NULL"]
-    where_clause, filter_params = _build_filter(filter)
-    if where_clause:
-        where_parts.append(where_clause)
-        params.extend(filter_params)
-    sql += " WHERE " + " AND ".join(where_parts)
+    sql, params = _distinct_sql(table, field, filter)
     cur.execute(sql, tuple(params))
-    result = [row[0] for row in cur.fetchall()]
+    result = [json.loads(row[0]) for row in cur.fetchall()]
     cur.close()
     return result
 
@@ -1688,19 +1829,8 @@ def doc_create_index(conn, collection, keys=None, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
     cur = conn.cursor()
-    if keys is None:
-        idx = _doc_index_name(table, "gin")
-        cur.execute(
-            f"CREATE INDEX IF NOT EXISTS {idx} ON {table} USING GIN (data)"
-        )
-    else:
-        for key in keys:
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
-                raise ValueError(f"Invalid key: {key}")
-            idx = _doc_index_name(table, key)
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS {idx} ON {table} ((data->>'{key}'))"
-            )
+    for statement in _doc_index_sql(table, keys):
+        cur.execute(statement)
     conn.commit()
     cur.close()
 
@@ -1846,6 +1976,51 @@ def _build_group(group, unwind_map=None):
     return select_parts, group_by
 
 
+# The pipeline runs as one query, so its stages must come in that query's
+# order; MongoDB runs them in the order given.
+_STAGE_ORDER = {"$match": 0, "$unwind": 1, "$lookup": 1, "$group": 2, "$project": 3, "$sort": 4, "$skip": 5, "$limit": 6}
+
+
+def _check_pipeline_order(pipeline):
+    """Refuse a pipeline whose stages one query can't run in the order
+    given (a `$match` after `$group`, `$limit` before `$skip`, a stage
+    twice), rather than run them in another order."""
+    last, seen = -1, set()
+    for stage in pipeline:
+        if not isinstance(stage, dict) or len(stage) != 1:
+            raise ValueError(f"Each pipeline stage is one {{'$stage': ...}}: {stage!r}")
+        key = next(iter(stage))
+        rank = _STAGE_ORDER.get(key)
+        if rank is None:
+            raise ValueError(f"Unsupported pipeline stage: {key}")
+        if rank < last or (key in seen and key not in ("$unwind", "$lookup")):
+            order = ", ".join(sorted(_STAGE_ORDER, key=_STAGE_ORDER.get))
+            raise ValueError(f"Pipeline stages run in this order, each once ($unwind and $lookup may repeat): {order}")
+        last = rank
+        seen.add(key)
+
+
+def _unwind(field):
+    """`$unwind`'s alias for `field`'s elements, and the FROM item making them."""
+    alias = "_unwound_" + "__".join(_path_parts(field))
+    return alias, f"jsonb_array_elements_text(data #> {_text_path(field)}) AS {alias}"
+
+
+def _aggregate_sort(sort, on_output):
+    """`$sort`: on the documents, or on a `$group` / `$project`'s output
+    columns."""
+    if not on_output:
+        return _build_sort(sort)
+    terms = []
+    for key, direction in sort.items():
+        if not _FIELD_PART_RE.match(key):
+            raise ValueError(f"Invalid sort key: {key}")
+        if direction not in (1, -1) or isinstance(direction, bool):
+            raise ValueError(f"Sort direction for {key} must be 1 or -1")
+        terms.append(f"{key} {'ASC' if direction == 1 else 'DESC'}")
+    return ", ".join(terms)
+
+
 def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=None):
     """Run a Mongo-style aggregation pipeline.
 
@@ -1857,10 +2032,7 @@ def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=No
     _validate_identifier(collection)
     table = _doc_table(patterns)
     cur = conn.cursor()
-    _SUPPORTED_STAGES = {
-        "$match", "$group", "$sort", "$limit", "$skip",
-        "$project", "$unwind", "$lookup",
-    }
+    _check_pipeline_order(pipeline)
     match_filter = None
     group_stage = None
     sort_stage = None
@@ -1871,8 +2043,6 @@ def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=No
     lookup_stages = []
     for stage in pipeline:
         key = next(iter(stage))
-        if key not in _SUPPORTED_STAGES:
-            raise ValueError(f"Unsupported pipeline stage: {key}")
         if key == "$match":
             match_filter = stage[key]
         elif key == "$group":
@@ -1930,11 +2100,9 @@ def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=No
     unwind_map = {}
     from_extras = []
     for field in unwind_stages:
-        alias = f"_unwound_{field}"
+        alias, element = _unwind(field)
         unwind_map[field] = alias
-        from_extras.append(
-            f"jsonb_array_elements_text(data->'{field}') AS {alias}"
-        )
+        from_extras.append(element)
 
     # Build SELECT
     params = []
@@ -2000,16 +2168,7 @@ def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=No
     if group_by:
         sql += f" GROUP BY {group_by}"
     if sort_stage:
-        order_parts = []
-        for key, direction in sort_stage.items():
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', key):
-                raise ValueError(f"Invalid sort key: {key}")
-            dir_str = "ASC" if direction == 1 else "DESC"
-            if group_stage or project_stage:
-                order_parts.append(f"{key} {dir_str}")
-            else:
-                order_parts.append(f"data->>'{key}' {dir_str}")
-        sql += " ORDER BY " + ", ".join(order_parts)
+        sql += " ORDER BY " + _aggregate_sort(sort_stage, group_stage or project_stage)
     if limit_val is not None:
         sql += " LIMIT %s"
         params.append(limit_val)

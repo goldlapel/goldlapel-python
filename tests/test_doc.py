@@ -41,9 +41,8 @@ from goldlapel.utils import (
     _build_update,
     _build_project,
     _field_path,
-    _field_path_json,
-    _jsonb_path,
-    _expand_dot_keys,
+    _jsonpath,
+    _text_path,
 )
 
 
@@ -269,14 +268,16 @@ class TestDocFind:
         results = doc_find(conn, "users", filter={"status": "active"})
         sql = cur.execute.call_args[0][0]
         params = cur.execute.call_args[0][1]
-        assert "WHERE data @> %s::jsonb" in sql
-        assert params[0] == json.dumps({"status": "active"})
+        assert "WHERE data @? %s::text::jsonpath" in sql
+        assert params[0] == '$."status" ? (@ == "active")'
 
     def test_with_sort(self):
         conn, cur = capture_sql(fetchall_result=[])
         doc_find(conn, "users", sort={"name": 1, "age": -1})
         sql = cur.execute.call_args[0][0]
-        assert "ORDER BY data->>'name' ASC, data->>'age' DESC" in sql
+        assert "ORDER BY (CASE jsonb_typeof(data #> '{name}')" in sql
+        assert "(data #> '{name}') ASC, (CASE jsonb_typeof(data #> '{age}')" in sql
+        assert sql.endswith("(data #> '{age}') DESC")
 
     def test_with_limit_and_skip(self):
         conn, cur = capture_sql(fetchall_result=[])
@@ -291,11 +292,11 @@ class TestDocFind:
         conn, cur = capture_sql(fetchall_result=[])
         doc_find(conn, "users", filter={"active": True}, limit=5, skip=10)
         params = cur.execute.call_args[0][1]
-        assert params == (json.dumps({"active": True}), 5, 10)
+        assert params == ('$."active" ? (@ == true)', 5, 10)
 
     def test_invalid_sort_key_raises(self):
         conn, _ = capture_sql()
-        with pytest.raises(ValueError, match="Invalid sort key"):
+        with pytest.raises(ValueError, match="Invalid field key"):
             doc_find(conn, "users", sort={"name; DROP": 1})
 
     def test_invalid_collection_raises(self):
@@ -336,9 +337,9 @@ class TestDocFindOne:
         doc_find_one(conn, "users", filter={"name": "alice"})
         sql = cur.execute.call_args[0][0]
         params = cur.execute.call_args[0][1]
-        assert "WHERE data @> %s::jsonb" in sql
+        assert "WHERE data @? %s::text::jsonpath" in sql
         assert "LIMIT 1" in sql
-        assert params == (json.dumps({"name": "alice"}),)
+        assert params == ('$."name" ? (@ == "alice")',)
 
     def test_returns_none_when_not_found(self):
         conn, cur = capture_sql(fetchone_result=None)
@@ -361,8 +362,9 @@ class TestDocUpdate:
         result = doc_update(conn, "users", {"status": "old"}, {"status": "new"})
         sql = cur.execute.call_args[0][0]
         params = cur.execute.call_args[0][1]
-        assert "UPDATE users SET data = data || %s::jsonb WHERE data @> %s::jsonb" in sql
-        assert params == (json.dumps({"status": "new"}), json.dumps({"status": "old"}))
+        # No operators: the document is replaced, as by MongoDB's replace_one
+        assert "UPDATE users SET data = %s::jsonb, updated_at = NOW() WHERE data @? %s::text::jsonpath" in sql
+        assert params == (json.dumps({"status": "new"}), '$."status" ? (@ == "old")')
         assert result == 3
 
     def test_returns_rowcount(self):
@@ -392,9 +394,9 @@ class TestDocUpdateOne:
         sql = cur.execute.call_args[0][0]
         params = cur.execute.call_args[0][1]
         assert "WITH target AS" in sql
-        assert "SELECT _id FROM users WHERE data @> %s::jsonb LIMIT 1" in sql
-        assert "UPDATE users SET data = data || %s::jsonb FROM target WHERE users._id = target._id" in sql
-        assert params == (json.dumps({"name": "alice"}), json.dumps({"age": 30}))
+        assert "SELECT _id FROM users WHERE data @? %s::text::jsonpath LIMIT 1" in sql
+        assert "UPDATE users SET data = %s::jsonb, updated_at = NOW() FROM target WHERE users._id = target._id" in sql
+        assert params == ('$."name" ? (@ == "alice")', json.dumps({"age": 30}))
 
     def test_returns_rowcount(self):
         conn, cur = capture_sql(rowcount=1)
@@ -427,8 +429,8 @@ class TestDocDelete:
         result = doc_delete(conn, "users", {"status": "inactive"})
         sql = cur.execute.call_args[0][0]
         params = cur.execute.call_args[0][1]
-        assert "DELETE FROM users WHERE data @> %s::jsonb" in sql
-        assert params == (json.dumps({"status": "inactive"}),)
+        assert "DELETE FROM users WHERE data @? %s::text::jsonpath" in sql
+        assert params == ('$."status" ? (@ == "inactive")',)
 
     def test_returns_rowcount(self):
         conn, cur = capture_sql(rowcount=7)
@@ -457,9 +459,9 @@ class TestDocDeleteOne:
         sql = cur.execute.call_args[0][0]
         params = cur.execute.call_args[0][1]
         assert "WITH target AS" in sql
-        assert "SELECT _id FROM users WHERE data @> %s::jsonb LIMIT 1" in sql
+        assert "SELECT _id FROM users WHERE data @? %s::text::jsonpath LIMIT 1" in sql
         assert "DELETE FROM users USING target WHERE users._id = target._id" in sql
-        assert params == (json.dumps({"name": "alice"}),)
+        assert params == ('$."name" ? (@ == "alice")',)
 
     def test_returns_rowcount(self):
         conn, cur = capture_sql(rowcount=1)
@@ -503,8 +505,8 @@ class TestDocCount:
         sql = cur.execute.call_args[0][0]
         params = cur.execute.call_args[0][1]
         assert "SELECT COUNT(*) FROM users" in sql
-        assert "WHERE data @> %s::jsonb" in sql
-        assert params == (json.dumps({"status": "active"}),)
+        assert "WHERE data @? %s::text::jsonpath" in sql
+        assert params == ('$."status" ? (@ == "active")',)
         assert result == 5
 
     def test_invalid_collection_raises(self):
@@ -528,12 +530,19 @@ class TestDocCreateIndex:
         conn, cur = capture_sql()
         doc_create_index(conn, "users", keys=["name", "email"])
         calls = [c[0][0] for c in cur.execute.call_args_list]
-        assert any("idx_users_name" in c and "(data->>'name')" in c for c in calls)
-        assert any("idx_users_email" in c and "(data->>'email')" in c for c in calls)
+        # In the order a sort on the key uses
+        assert any("idx_users_name" in c and "jsonb_typeof(data #> '{name}')" in c for c in calls)
+        assert any("idx_users_email" in c and "jsonb_typeof(data #> '{email}')" in c for c in calls)
+
+    def test_dotted_key_names_its_index(self):
+        conn, cur = capture_sql()
+        doc_create_index(conn, "users", keys=["addr.city"])
+        sql = cur.execute.call_args[0][0]
+        assert "idx_users_addr__city" in sql and "data #> '{addr,city}'" in sql
 
     def test_invalid_key_raises(self):
         conn, _ = capture_sql()
-        with pytest.raises(ValueError, match="Invalid key"):
+        with pytest.raises(ValueError, match="Invalid field key"):
             doc_create_index(conn, "users", keys=["name; DROP"])
 
     def test_commits(self):
@@ -600,10 +609,10 @@ class TestDocAggregate:
         params = cur.execute.call_args[0][1]
         assert "GROUP BY" in sql
         assert "COUNT(*)" in sql
-        assert "WHERE data @> %s::jsonb" in sql
+        assert "WHERE data @? %s::text::jsonpath" in sql
         assert "ORDER BY count DESC" in sql
         assert "LIMIT %s" in sql
-        assert params[0] == json.dumps({"status": "active"})
+        assert params[0] == '$."status" ? (@ == "active")'
         assert params[1] == 10
         assert result == [{"_id": "electronics", "count": 5}]
 
@@ -639,7 +648,7 @@ class TestDocAggregate:
         ])
         sql = cur.execute.call_args[0][0]
         assert "SELECT _id, data, created_at FROM users" in sql
-        assert "WHERE data @> %s::jsonb" in sql
+        assert "WHERE data @? %s::text::jsonpath" in sql
 
     def test_no_group_sort(self):
         conn, cur = capture_sql(fetchall_result=[])
@@ -649,7 +658,7 @@ class TestDocAggregate:
             {"$limit": 5},
         ])
         sql = cur.execute.call_args[0][0]
-        assert "ORDER BY data->>'name' ASC" in sql
+        assert "ORDER BY (CASE jsonb_typeof(data #> '{name}')" in sql
         assert "LIMIT %s" in sql
 
     def test_group_sort_uses_alias(self):
@@ -870,7 +879,7 @@ class TestUnwindStage:
             {"$unwind": "$tags"},
         ])
         sql = cur.execute.call_args[0][0]
-        assert "jsonb_array_elements_text(data->'tags') AS _unwound_tags" in sql
+        assert "jsonb_array_elements_text(data #> '{tags}') AS _unwound_tags" in sql
 
     def test_unwind_then_group(self):
         conn, cur = capture_sql(
@@ -895,7 +904,7 @@ class TestUnwindStage:
             {"$unwind": {"path": "$tags"}},
         ])
         sql = cur.execute.call_args[0][0]
-        assert "jsonb_array_elements_text(data->'tags') AS _unwound_tags" in sql
+        assert "jsonb_array_elements_text(data #> '{tags}') AS _unwound_tags" in sql
 
     def test_unwind_invalid(self):
         conn, _ = capture_sql()
@@ -961,13 +970,13 @@ class TestFullPipeline:
         sql = cur.execute.call_args[0][0]
         params = cur.execute.call_args[0][1]
         # FROM has the unwind cross join
-        assert "jsonb_array_elements_text(data->'tags')" in sql
+        assert "jsonb_array_elements_text(data #> '{tags}')" in sql
         # GROUP BY uses the unwound alias
         assert "GROUP BY _unwound_tags" in sql
         # SELECT uses the unwound alias
         assert "_unwound_tags AS _id" in sql
         # WHERE from $match
-        assert "WHERE data @> %s::jsonb" in sql
+        assert "WHERE data @? %s::text::jsonpath" in sql
         # ORDER BY + LIMIT
         assert "ORDER BY count DESC" in sql
         assert "LIMIT %s" in sql
@@ -979,74 +988,105 @@ class TestFullPipeline:
 # ---------------------------------------------------------------------------
 
 class TestFilterOperators:
+    """Each operator compiles to an SQL/JSON path predicate on `data`; what
+    they match is tested against Postgres in test_doc_semantics.py."""
+
     def test_gt_numeric(self):
         clause, params = _build_filter({"age": {"$gt": 25}})
-        assert "::numeric" in clause
-        assert ">" in clause
-        assert params == [25]
+        assert clause == "data @? %s::text::jsonpath"
+        assert params == ['$."age" ? (@ > 25)']
 
     def test_lte_string(self):
         clause, params = _build_filter({"name": {"$lte": "M"}})
-        assert "::numeric" not in clause
-        assert "<=" in clause
-        assert params == ["M"]
+        assert params == ['$."name" ? (@ <= "M")']
+
+    def test_bool_is_a_boolean_not_a_number(self):
+        _, params = _build_filter({"active": {"$eq": True}})
+        assert params == ['$."active" ? (@ == true)']
 
     def test_in(self):
         clause, params = _build_filter({"status": {"$in": ["a", "b"]}})
-        assert "IN (%s, %s)" in clause
-        assert params == ["a", "b"]
+        assert params == ['$."status" ? (@ == "a" || @ == "b")']
+
+    def test_in_empty_matches_nothing(self):
+        assert _build_filter({"status": {"$in": []}}) == ("FALSE", [])
+
+    def test_in_with_null_matches_missing(self):
+        clause, params = _build_filter({"status": {"$in": ["a", None]}})
+        assert "NOT data @? %s::text::jsonpath" in clause
+        assert params == ['$."status" ? (@ == "a")', '$."status"', '$."status" ? (@ == null)']
 
     def test_nin(self):
         clause, params = _build_filter({"status": {"$nin": ["x"]}})
-        assert "NOT IN (%s)" in clause
-        assert params == ["x"]
+        assert clause == "NOT (data @? %s::text::jsonpath)"
+        assert params == ['$."status" ? (@ == "x")']
 
     def test_exists_true(self):
         clause, params = _build_filter({"email": {"$exists": True}})
-        assert "data ? %s" in clause
-        assert "NOT" not in clause
-        assert params == ["email"]
+        assert clause == "data @? %s::text::jsonpath"
+        assert params == ['$."email"']
 
-    def test_exists_false(self):
-        clause, params = _build_filter({"email": {"$exists": False}})
-        assert "NOT (data ? %s)" in clause
-        assert params == ["email"]
+    def test_exists_false_follows_the_whole_path(self):
+        clause, params = _build_filter({"addr.city": {"$exists": False}})
+        assert clause == "NOT data @? %s::text::jsonpath"
+        assert params == ['$."addr"."city"']
 
     def test_regex(self):
-        clause, params = _build_filter({"name": {"$regex": "^J"}})
-        assert "~ %s" in clause
-        assert params == ["^J"]
+        _, params = _build_filter({"name": {"$regex": "^J"}})
+        assert params == ['$."name" ? (@ like_regex "^J")']
+
+    def test_regex_options(self):
+        _, params = _build_filter({"name": {"$regex": "^j\\d", "$options": "i"}})
+        assert params == ['$."name" ? (@ like_regex "^j\\\\d" flag "i")']
 
     def test_eq_ne(self):
         clause, params = _build_filter({"x": {"$eq": "a"}, "y": {"$ne": "b"}})
-        assert "= %s" in clause
-        assert "!= %s" in clause
-        assert "a" in params
-        assert "b" in params
+        assert clause == "data @? %s::text::jsonpath AND NOT data @? %s::text::jsonpath"
+        assert params == ['$."x" ? (@ == "a")', '$."y" ? (@ == "b")']
+
+    def test_eq_null_matches_missing(self):
+        clause, params = _build_filter({"x": None})
+        assert clause == "(NOT data @? %s::text::jsonpath OR data @? %s::text::jsonpath)"
+        assert params == ['$."x"', '$."x" ? (@ == null)']
+
+    def test_object_compares_whole(self):
+        clause, params = _build_filter({"size": {"h": 10}})
+        assert "data #> '{size}' = %s::jsonb" in clause
+        assert params == [json.dumps({"h": 10}), json.dumps({"h": 10})]
 
     def test_mixed(self):
         clause, params = _build_filter({"active": True, "age": {"$gt": 18}})
-        assert "data @> %s::jsonb" in clause
-        assert "::numeric >" in clause
-        assert params[0] == json.dumps({"active": True})
-        assert params[1] == 18
+        assert clause == "data @? %s::text::jsonpath AND data @? %s::text::jsonpath"
+        assert params == ['$."active" ? (@ == true)', '$."age" ? (@ > 18)']
 
     def test_dot_notation(self):
-        clause, params = _build_filter({"addr.city": {"$eq": "NY"}})
-        assert "data->'addr'->>'city'" in clause
-        assert params == ["NY"]
+        _, params = _build_filter({"addr.city": {"$eq": "NY"}})
+        assert params == ['$."addr"."city" ? (@ == "NY")']
 
     def test_range(self):
         clause, params = _build_filter({"age": {"$gte": 18, "$lt": 65}})
-        assert ">=" in clause
-        assert "<" in clause
-        assert 18 in params
-        assert 65 in params
+        assert params == ['$."age" ? (@ >= 18)', '$."age" ? (@ < 65)']
 
-    def test_plain_unchanged(self):
-        clause, params = _build_filter({"status": "active"})
-        assert clause == "data @> %s::jsonb"
-        assert params == [json.dumps({"status": "active"})]
+    def test_size_and_all(self):
+        clause, params = _build_filter({"tags": {"$size": 2, "$all": ["a", "b"]}})
+        assert "jsonb_array_length(data #> '{tags}') = 2" in clause
+        assert params == ['$."tags" ? (@ == "a")', '$."tags" ? (@ == "b")']
+
+    def test_field_not(self):
+        clause, params = _build_filter({"age": {"$not": {"$gt": 5}}})
+        assert clause == "NOT (data @? %s::text::jsonpath)"
+        assert params == ['$."age" ? (@ > 5)']
+
+    def test_id_is_the_column(self):
+        assert _build_filter({"_id": "abc"}) == ("_id = %s::text::uuid", ["abc"])
+
+    def test_mixing_operators_and_fields_raises(self):
+        with pytest.raises(ValueError, match="mixes operators"):
+            _build_filter({"a": {"$gt": 1, "b": 2}})
+
+    def test_options_without_regex_raises(self):
+        with pytest.raises(ValueError, match="needs \\$regex"):
+            _build_filter({"a": {"$options": "i"}})
 
     def test_empty_unchanged(self):
         clause, params = _build_filter(None)
@@ -1054,67 +1094,13 @@ class TestFilterOperators:
         assert params == []
 
     def test_invalid_key(self):
-        with pytest.raises(ValueError, match="Invalid filter key"):
+        with pytest.raises(ValueError, match="Invalid field key"):
             _build_filter({"bad;key": {"$gt": 1}})
 
     def test_unsupported_op(self):
         with pytest.raises(ValueError, match="Unsupported filter operator"):
             _build_filter({"x": {"$foo": 1}})
 
-
-# ---------------------------------------------------------------------------
-# Dot notation expansion in plain containment filters
-# ---------------------------------------------------------------------------
-
-class TestDotNotationExpansion:
-    def test_dot_single_level(self):
-        result = _expand_dot_keys({"addr.city": "NY"})
-        assert result == {"addr": {"city": "NY"}}
-
-    def test_dot_deep_nesting(self):
-        result = _expand_dot_keys({"a.b.c": 1})
-        assert result == {"a": {"b": {"c": 1}}}
-
-    def test_dot_mixed_with_plain(self):
-        result = _expand_dot_keys({"status": "active", "addr.city": "NY"})
-        assert result == {"status": "active", "addr": {"city": "NY"}}
-
-    def test_dot_merge_siblings(self):
-        result = _expand_dot_keys({"a.b": 1, "a.c": 2})
-        assert result == {"a": {"b": 1, "c": 2}}
-
-    def test_no_dots_unchanged(self):
-        result = _expand_dot_keys({"status": "active"})
-        assert result == {"status": "active"}
-
-    def test_dot_with_operators(self):
-        clause, params = _build_filter({"addr.city": "NY", "age": {"$gt": 25}})
-        assert "data @> %s::jsonb" in clause
-        containment_json = params[0]
-        assert json.loads(containment_json) == {"addr": {"city": "NY"}}
-        assert "::numeric >" in clause
-        assert 25 in params
-
-    def test_dot_in_doc_find(self):
-        conn, cur = capture_sql(fetchall_result=[])
-        doc_find(conn, "users", filter={"addr.city": "NY"})
-        sql = cur.execute.call_args[0][0]
-        params = cur.execute.call_args[0][1]
-        assert "WHERE data @> %s::jsonb" in sql
-        assert json.loads(params[0]) == {"addr": {"city": "NY"}}
-
-    def test_dot_in_doc_count(self):
-        conn, cur = capture_sql(fetchone_result=(3,))
-        doc_count(conn, "users", filter={"addr.city": "NY"})
-        sql = cur.execute.call_args[0][0]
-        params = cur.execute.call_args[0][1]
-        assert "WHERE data @> %s::jsonb" in sql
-        assert json.loads(params[0]) == {"addr": {"city": "NY"}}
-
-
-# ---------------------------------------------------------------------------
-# 14. Change streams (doc_watch / doc_unwatch)
-# ---------------------------------------------------------------------------
 
 class TestDocWatch:
     def test_watch_creates_trigger(self):
@@ -1283,27 +1269,30 @@ class TestLogicalOperators:
         clause, params = _build_filter({"$or": [{"status": "active"}, {"status": "inactive"}]})
         assert "OR" in clause
         assert clause.startswith("(")
-        assert params == [json.dumps({"status": "active"}), json.dumps({"status": "inactive"})]
+        assert params == ['$."status" ? (@ == "active")', '$."status" ? (@ == "inactive")']
 
     def test_and_explicit(self):
         clause, params = _build_filter({"$and": [{"age": {"$gt": 18}}, {"age": {"$lt": 65}}]})
         assert "AND" in clause
         assert clause.startswith("(")
-        assert params == [18, 65]
+        assert params == ['$."age" ? (@ > 18)', '$."age" ? (@ < 65)']
 
     def test_not(self):
         clause, params = _build_filter({"$not": {"status": "active"}})
         assert clause.startswith("NOT (")
-        assert params == [json.dumps({"status": "active"})]
+        assert params == ['$."status" ? (@ == "active")']
+
+    def test_nor(self):
+        clause, params = _build_filter({"$nor": [{"a": 1}, {"b": 2}]})
+        assert clause == "NOT ((data @? %s::text::jsonpath) OR (data @? %s::text::jsonpath))"
+        assert params == ['$."a" ? (@ == 1)', '$."b" ? (@ == 2)']
 
     def test_or_with_operators(self):
         clause, params = _build_filter({
             "$or": [{"status": "active"}, {"age": {"$gt": 25}}]
         })
         assert "OR" in clause
-        assert len(params) == 2
-        assert params[0] == json.dumps({"status": "active"})
-        assert params[1] == 25
+        assert params == ['$."status" ? (@ == "active")', '$."age" ? (@ > 25)']
 
     def test_nested_or_and(self):
         clause, params = _build_filter({
@@ -1356,69 +1345,62 @@ class TestLogicalOperators:
 # ---------------------------------------------------------------------------
 
 class TestFieldUpdateOperators:
-    def test_plain_update_fallback(self):
+    """Each operator is a step reading the document so far (`e<n>`); what
+    they do is tested against Postgres in test_doc_semantics.py."""
+
+    def test_no_operators_replaces(self):
         expr, params = _build_update({"name": "new"})
-        assert expr == "data || %s::jsonb"
+        assert expr == "%s::jsonb"
         assert params == [json.dumps({"name": "new"})]
 
     def test_set(self):
         expr, params = _build_update({"$set": {"name": "new", "age": 30}})
-        assert "|| %s::jsonb" in expr
-        assert params == [json.dumps({"name": "new", "age": 30})]
+        assert expr == (
+            "(SELECT e2 FROM (SELECT data AS e0) AS s0"
+            " CROSS JOIN LATERAL (SELECT jsonb_set(e0, '{name}', %s::jsonb) AS e1) AS s1"
+            " CROSS JOIN LATERAL (SELECT jsonb_set(e1, '{age}', %s::jsonb) AS e2) AS s2)"
+        )
+        assert params == ['"new"', "30"]
+
+    def test_set_nested_makes_parents(self):
+        expr, _ = _build_update({"$set": {"a.b": 1}})
+        assert "CASE WHEN jsonb_typeof(e0 #> '{a}') = 'object' THEN e0 #> '{a}' ELSE '{}'::jsonb END" in expr
 
     def test_inc(self):
         expr, params = _build_update({"$inc": {"count": 1}})
-        assert "jsonb_set" in expr
-        assert "COALESCE" in expr
-        assert "+ %s" in expr
-        assert params == ["{count}", 1]
+        assert "to_jsonb(COALESCE((e0 #> '{count}')::numeric, 0) + %s::text::numeric)" in expr
+        assert params == ["1"]
 
-    def test_inc_nested(self):
-        expr, params = _build_update({"$inc": {"stats.views": 5}})
-        assert "{stats,views}" in str(params)
-        assert "data->'stats'->>'views'" in expr
-
-    def test_unset_top_level(self):
-        expr, params = _build_update({"$unset": {"old_field": ""}})
-        assert "- %s" in expr
-        assert params == ["old_field"]
+    def test_inc_takes_a_number(self):
+        for amount in ["1", True, None]:
+            with pytest.raises(ValueError, match="takes a number"):
+                _build_update({"$inc": {"count": amount}})
 
     def test_unset_nested(self):
         expr, params = _build_update({"$unset": {"nested.field": ""}})
-        assert "#- %s::text[]" in expr
-        assert params == ["{nested,field}"]
+        assert "(e0 #- '{nested,field}')" in expr
+        assert params == []
 
     def test_mul(self):
         expr, params = _build_update({"$mul": {"price": 1.1}})
-        assert "jsonb_set" in expr
-        assert "* %s" in expr
-        assert params == ["{price}", 1.1]
+        assert "* %s::text::numeric" in expr
+        assert params == ["1.1"]
 
-    def test_rename(self):
-        expr, params = _build_update({"$rename": {"old_name": "new_name"}})
-        assert "jsonb_set" in expr
-        assert "- %s" in expr
-        assert params == ["old_name", "{new_name}"]
+    def test_rename_of_a_missing_field_is_a_no_op(self):
+        expr, _ = _build_update({"$rename": {"old_name": "new_name"}})
+        assert "CASE WHEN e0 #> '{old_name}' IS NULL THEN e0 ELSE" in expr
 
-    def test_combined_set_inc_unset(self):
-        expr, params = _build_update({
-            "$set": {"name": "new"},
-            "$inc": {"count": 1},
-            "$unset": {"temp": ""},
-        })
-        assert "|| %s::jsonb" in expr
-        assert "- %s" in expr
-        assert "jsonb_set" in expr
-        assert params[0] == json.dumps({"name": "new"})
-        assert "temp" in params
-        assert 1 in params
+    def test_steps_build_on_each_other(self):
+        expr, params = _build_update({"$set": {"name": "new"}, "$inc": {"count": 1}, "$unset": {"temp": ""}})
+        assert "jsonb_set(e0, '{name}'" in expr and "(e1 #> '{count}')" in expr and "(e2 #- '{temp}')" in expr
+        assert params == ['"new"', "1"]
 
     def test_set_in_doc_update(self):
         conn, cur = capture_sql(rowcount=1)
         doc_update(conn, "users", {"status": "old"}, {"$set": {"status": "new"}})
         sql = cur.execute.call_args[0][0]
-        assert "|| %s::jsonb" in sql
-        assert "UPDATE users SET data =" in sql
+        assert "UPDATE users SET data = (SELECT e1 FROM (SELECT data AS e0)" in sql
+        assert "updated_at = NOW()" in sql
 
     def test_inc_in_doc_update_one(self):
         conn, cur = capture_sql(rowcount=1)
@@ -1431,35 +1413,51 @@ class TestFieldUpdateOperators:
         with pytest.raises(ValueError, match="Invalid field key"):
             _build_update({"$inc": {"bad;field": 1}})
 
+    def test_operators_and_fields_together_raise(self):
+        with pytest.raises(ValueError, match="not both"):
+            _build_update({"$set": {"a": 1}, "b": 2})
+
+    def test_unknown_operator_raises(self):
+        with pytest.raises(ValueError, match="Unsupported update operator"):
+            _build_update({"$min": {"a": 1}})
+
 
 # ---------------------------------------------------------------------------
 # 20. Array update operators ($push, $pull, $addToSet)
 # ---------------------------------------------------------------------------
 
 class TestArrayUpdateOperators:
-    def test_push_string(self):
+    def test_push_one(self):
         expr, params = _build_update({"$push": {"tags": "new_tag"}})
-        assert "jsonb_set" in expr
-        assert "COALESCE" in expr
-        assert "to_jsonb(%s::text)" in expr
-        assert params == ["{tags}", "new_tag"]
+        assert "jsonb_array_length(COALESCE(e0 #> '{tags}', '[]'::jsonb))" in expr
+        assert params == [json.dumps(["new_tag"])]
 
-    def test_push_number(self):
-        expr, params = _build_update({"$push": {"scores": 99}})
-        assert "to_jsonb(%s::numeric)" in expr
-        assert params == ["{scores}", 99]
+    def test_push_a_list_is_one_element(self):
+        _, params = _build_update({"$push": {"tags": ["a", "b"]}})
+        assert params == [json.dumps([["a", "b"]])]
 
-    def test_pull(self):
+    def test_push_each(self):
+        _, params = _build_update({"$push": {"tags": {"$each": ["a", "b"]}}})
+        assert params == [json.dumps(["a", "b"])]
+
+    def test_push_other_modifiers_raise(self):
+        with pytest.raises(ValueError, match="\\$each"):
+            _build_update({"$push": {"tags": {"$each": [1], "$slice": 2}}})
+
+    def test_pull_value(self):
         expr, params = _build_update({"$pull": {"tags": "old_tag"}})
-        assert "jsonb_agg(elem)" in expr
-        assert "WHERE elem !=" in expr
-        assert params == ["{tags}", "old_tag"]
+        assert "WHERE NOT (x = %s::jsonb)" in expr
+        assert params == ['"old_tag"']
 
-    def test_addToSet(self):
+    def test_pull_condition(self):
+        expr, params = _build_update({"$pull": {"scores": {"$gte": 6}}})
+        assert "WHERE NOT (x @? %s::text::jsonpath)" in expr
+        assert params == ["$ ? ((@ >= 6))"]
+
+    def test_add_to_set_compares_exactly(self):
         expr, params = _build_update({"$addToSet": {"tags": "maybe"}})
-        assert "CASE WHEN" in expr
-        assert "@>" in expr
-        assert params == ["{tags}", "maybe", "maybe"]
+        assert "WHERE x = d.v" in expr
+        assert params == [json.dumps(["maybe"])]
 
     def test_push_in_doc_update(self):
         conn, cur = capture_sql(rowcount=1)
@@ -1467,14 +1465,6 @@ class TestArrayUpdateOperators:
         sql = cur.execute.call_args[0][0]
         assert "jsonb_set" in sql
         assert "COALESCE" in sql
-
-    def test_combined_set_push(self):
-        expr, params = _build_update({
-            "$set": {"name": "new"},
-            "$push": {"tags": "added"},
-        })
-        assert "|| %s::jsonb" in expr
-        assert "jsonb_set" in expr
 
 
 # ---------------------------------------------------------------------------
@@ -1511,7 +1501,7 @@ class TestDocFindOneAndUpdate:
             conn, "users", {"name": "alice"}, {"status": "updated"}
         )
         sql = cur.execute.call_args[0][0]
-        assert "|| %s::jsonb" in sql
+        assert "SET data = %s::jsonb, updated_at = NOW()" in sql
         assert "RETURNING" in sql
 
     def test_commits(self):
@@ -1564,39 +1554,30 @@ class TestDocFindOneAndDelete:
 
 class TestDocDistinct:
     def test_basic_distinct(self):
-        conn, cur = capture_sql(fetchall_result=[("active",), ("inactive",)])
+        conn, cur = capture_sql(fetchall_result=[('"active"',), ("3",)])
         result = doc_distinct(conn, "users", "status")
         sql = cur.execute.call_args[0][0]
-        assert "SELECT DISTINCT" in sql
-        assert "data->>'status'" in sql
-        assert "IS NOT NULL" in sql
-        assert result == ["active", "inactive"]
+        params = cur.execute.call_args[0][1]
+        assert sql == "SELECT DISTINCT v::text FROM users, jsonb_path_query(data, %s::text::jsonpath) AS v"
+        # An array's elements, each value as its type
+        assert params == ('$."status"[*]',)
+        assert result == ["active", 3]
 
     def test_dot_notation(self):
-        conn, cur = capture_sql(fetchall_result=[("NYC",), ("LA",)])
-        result = doc_distinct(conn, "users", "address.city")
-        sql = cur.execute.call_args[0][0]
-        assert "data->'address'->>'city'" in sql
-        assert result == ["NYC", "LA"]
+        conn, cur = capture_sql(fetchall_result=[])
+        doc_distinct(conn, "users", "address.city")
+        assert cur.execute.call_args[0][1] == ('$."address"."city"[*]',)
 
     def test_with_filter(self):
-        conn, cur = capture_sql(fetchall_result=[("active",)])
-        result = doc_distinct(conn, "users", "status", filter={"age": {"$gt": 25}})
-        sql = cur.execute.call_args[0][0]
-        assert "SELECT DISTINCT" in sql
-        assert "IS NOT NULL" in sql
-        assert "(data->>'age')::numeric > %s" in sql
-
-    def test_no_filter(self):
         conn, cur = capture_sql(fetchall_result=[])
-        doc_distinct(conn, "users", "status")
+        doc_distinct(conn, "users", "status", filter={"age": {"$gt": 25}})
         sql = cur.execute.call_args[0][0]
-        assert "SELECT DISTINCT" in sql
-        assert "IS NOT NULL" in sql
+        assert sql.endswith(" WHERE data @? %s::text::jsonpath")
+        assert cur.execute.call_args[0][1] == ('$."status"[*]', '$."age" ? (@ > 25)')
 
     def test_invalid_field_raises(self):
         conn, _ = capture_sql()
-        with pytest.raises(ValueError, match="Invalid filter key"):
+        with pytest.raises(ValueError, match="Invalid field key"):
             doc_distinct(conn, "users", "bad;field")
 
     def test_invalid_collection_raises(self):
@@ -1610,25 +1591,22 @@ class TestDocDistinct:
 # ---------------------------------------------------------------------------
 
 class TestHelperFunctions:
-    def test_field_path_json_single(self):
-        assert _field_path_json("name") == "data->'name'"
+    def test_jsonpath_single(self):
+        assert _jsonpath("name") == '$."name"'
 
-    def test_field_path_json_nested(self):
-        assert _field_path_json("addr.city") == "data->'addr'->'city'"
+    def test_jsonpath_nested(self):
+        assert _jsonpath("addr.city") == '$."addr"."city"'
 
-    def test_field_path_json_invalid_raises(self):
+    def test_jsonpath_invalid_raises(self):
         with pytest.raises(ValueError, match="Invalid field key"):
-            _field_path_json("bad;key")
+            _jsonpath("bad;key")
 
-    def test_jsonb_path_single(self):
-        assert _jsonb_path("name") == "{name}"
+    def test_text_path_nested(self):
+        assert _text_path("addr.city") == "'{addr,city}'"
 
-    def test_jsonb_path_nested(self):
-        assert _jsonb_path("addr.city") == "{addr,city}"
-
-    def test_jsonb_path_invalid_raises(self):
+    def test_text_path_invalid_raises(self):
         with pytest.raises(ValueError, match="Invalid field key"):
-            _jsonb_path("bad;key")
+            _text_path("bad'key")
 
 
 # ---------------------------------------------------------------------------
@@ -1638,39 +1616,30 @@ class TestHelperFunctions:
 class TestElemMatch:
     def test_numeric_range(self):
         clause, params = _build_filter({"scores": {"$elemMatch": {"$gt": 80, "$lt": 90}}})
-        assert "EXISTS" in clause
-        assert "jsonb_array_elements" in clause
-        assert "elem#>>'{}'" in clause
-        assert "::numeric" in clause
-        assert 80 in params
-        assert 90 in params
+        assert clause == "(jsonb_typeof(data #> '{scores}') = 'array' AND data @? %s::text::jsonpath)"
+        # One element meets both
+        assert params == ['$."scores"[*] ? ((@ > 80) && (@ < 90))']
 
     def test_string_regex(self):
-        clause, params = _build_filter({"tags": {"$elemMatch": {"$regex": "^py"}}})
-        assert "EXISTS" in clause
-        assert "elem#>>'{}' ~ %s" in clause
-        assert params == ["^py"]
+        _, params = _build_filter({"tags": {"$elemMatch": {"$regex": "^py"}}})
+        assert params == ['$."tags"[*] ? ((@ like_regex "^py"))']
 
-    def test_single_condition(self):
-        clause, params = _build_filter({"scores": {"$elemMatch": {"$eq": 100}}})
-        assert "EXISTS" in clause
-        assert "elem#>>'{}'" in clause
-        assert params == [100]
+    def test_fields_of_elements(self):
+        _, params = _build_filter({"items": {"$elemMatch": {"sku": "p", "n": {"$gt": 5}}}})
+        assert params == ['$."items"[*] ? (((@."sku" == "p")) && ((@."n" > 5)))']
 
     def test_invalid_operand_raises(self):
-        with pytest.raises(ValueError, match="must be an object"):
+        with pytest.raises(ValueError, match="takes a filter"):
             _build_filter({"scores": {"$elemMatch": [1, 2]}})
 
     def test_unsupported_sub_op_raises(self):
-        with pytest.raises(ValueError, match="Unsupported \\$elemMatch"):
+        with pytest.raises(ValueError, match="Unsupported operator here"):
             _build_filter({"scores": {"$elemMatch": {"$foo": 1}}})
 
     def test_in_doc_find(self):
         conn, cur = capture_sql(fetchall_result=[])
         doc_find(conn, "users", filter={"scores": {"$elemMatch": {"$gt": 80}}})
-        sql = cur.execute.call_args[0][0]
-        assert "EXISTS" in sql
-        assert "jsonb_array_elements" in sql
+        assert "jsonb_typeof(data #> '{scores}') = 'array'" in cur.execute.call_args[0][0]
 
 
 # ---------------------------------------------------------------------------

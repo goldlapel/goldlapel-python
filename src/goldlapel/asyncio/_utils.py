@@ -49,10 +49,17 @@ from goldlapel.utils import (
     _validate_identifier,
     _build_filter,
     _build_update,
+    _build_sort,
     _field_path,
     _FIELD_PART_RE,
     _build_project,
     _build_group,
+    _doc_index_name,
+    _doc_index_sql,
+    _distinct_sql,
+    _check_pipeline_order,
+    _unwind,
+    _aggregate_sort,
 )
 
 
@@ -928,11 +935,6 @@ def _doc_table(patterns):
     return patterns["tables"]["main"]
 
 
-def _doc_index_name(table, suffix):
-    bare = table.rsplit(".", 1)[-1]
-    return f"idx_{bare}_{suffix}"
-
-
 async def doc_create_collection(conn, collection, unlogged=False, *, patterns=None):
     _validate_identifier(collection)
     if patterns is None:
@@ -976,12 +978,7 @@ def _build_doc_find_sql(table, filter=None, sort=None, limit=None, skip=None):
         sql += " WHERE " + where_clause
         params.extend(filter_params)
     if sort:
-        order_parts = []
-        for key, direction in sort.items():
-            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_.]*$", key):
-                raise ValueError(f"Invalid sort key: {key}")
-            order_parts.append(f"data->>'{key}' {'ASC' if direction == 1 else 'DESC'}")
-        sql += " ORDER BY " + ", ".join(order_parts)
+        sql += " ORDER BY " + _build_sort(sort)
     if limit is not None:
         sql += " LIMIT %s"
         params.append(limit)
@@ -1040,7 +1037,7 @@ async def doc_update(conn, collection, filter, update, *, patterns=None):
     table = _doc_table(patterns)
     where_clause, filter_params = _build_filter(filter)
     update_expr, update_params = _build_update(update)
-    sql = f"UPDATE {table} SET data = {update_expr}"
+    sql = f"UPDATE {table} SET data = {update_expr}, updated_at = NOW()"
     params = list(update_params)
     if where_clause:
         sql += " WHERE " + where_clause
@@ -1057,7 +1054,7 @@ async def doc_update_one(conn, collection, filter, update, *, patterns=None):
     cte_where = " WHERE " + where_clause if where_clause else ""
     sql = (
         f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
-        f"UPDATE {table} SET data = {update_expr} FROM target WHERE {table}._id = target._id"
+        f"UPDATE {table} SET data = {update_expr}, updated_at = NOW() FROM target WHERE {table}._id = target._id"
     )
     params = list(filter_params) + list(update_params)
     status = await _execute(conn, sql, tuple(params))
@@ -1110,7 +1107,7 @@ async def doc_find_one_and_update(conn, collection, filter, update, *, patterns=
     cte_where = " WHERE " + where_clause if where_clause else ""
     sql = (
         f"WITH target AS (SELECT _id FROM {table}{cte_where} LIMIT 1) "
-        f"UPDATE {table} SET data = {update_expr} FROM target "
+        f"UPDATE {table} SET data = {update_expr}, updated_at = NOW() FROM target "
         f"WHERE {table}._id = target._id "
         f"RETURNING {table}._id, {table}.data, {table}.created_at"
     )
@@ -1137,38 +1134,16 @@ async def doc_find_one_and_delete(conn, collection, filter, *, patterns=None):
 async def doc_distinct(conn, collection, field, filter=None, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    field_expr = _field_path(field)
-    sql = f"SELECT DISTINCT {field_expr} FROM {table}"
-    params = []
-    where_parts = [f"{field_expr} IS NOT NULL"]
-    where_clause, filter_params = _build_filter(filter)
-    if where_clause:
-        where_parts.append(where_clause)
-        params.extend(filter_params)
-    sql += " WHERE " + " AND ".join(where_parts)
+    sql, params = _distinct_sql(table, field, filter)
     rows = await _fetch(conn, sql, tuple(params))
-    return [r[0] for r in rows]
+    return [json.loads(r[0]) for r in rows]
 
 
 async def doc_create_index(conn, collection, keys=None, *, patterns=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    if keys is None:
-        idx = _doc_index_name(table, "gin")
-        await _execute(
-            conn,
-            f"CREATE INDEX IF NOT EXISTS {idx} ON {table} USING GIN (data)",
-        )
-    else:
-        for key in keys:
-            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_.]*$", key):
-                raise ValueError(f"Invalid key: {key}")
-            idx = _doc_index_name(table, key)
-            await _execute(
-                conn,
-                f"CREATE INDEX IF NOT EXISTS {idx} "
-                f"ON {table} ((data->>'{key}'))",
-            )
+    for statement in _doc_index_sql(table, keys):
+        await _execute(conn, statement)
 
 
 # -- Aggregation pipeline ---------------------------------------------------
@@ -1176,10 +1151,7 @@ async def doc_create_index(conn, collection, keys=None, *, patterns=None):
 async def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tables=None):
     _validate_identifier(collection)
     table = _doc_table(patterns)
-    _SUPPORTED_STAGES = {
-        "$match", "$group", "$sort", "$limit", "$skip",
-        "$project", "$unwind", "$lookup",
-    }
+    _check_pipeline_order(pipeline)
     match_filter = None
     group_stage = None
     sort_stage = None
@@ -1190,8 +1162,6 @@ async def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tab
     lookup_stages = []
     for stage in pipeline:
         key = next(iter(stage))
-        if key not in _SUPPORTED_STAGES:
-            raise ValueError(f"Unsupported pipeline stage: {key}")
         if key == "$match":
             match_filter = stage[key]
         elif key == "$group":
@@ -1244,9 +1214,9 @@ async def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tab
     unwind_map = {}
     from_extras = []
     for field in unwind_stages:
-        alias = f"_unwound_{field}"
+        alias, element = _unwind(field)
         unwind_map[field] = alias
-        from_extras.append(f"jsonb_array_elements_text(data->'{field}') AS {alias}")
+        from_extras.append(element)
 
     params = []
     group_by = None
@@ -1301,16 +1271,7 @@ async def doc_aggregate(conn, collection, pipeline, *, patterns=None, lookup_tab
     if group_by:
         sql += f" GROUP BY {group_by}"
     if sort_stage:
-        order_parts = []
-        for key, direction in sort_stage.items():
-            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_.]*$", key):
-                raise ValueError(f"Invalid sort key: {key}")
-            dir_str = "ASC" if direction == 1 else "DESC"
-            if group_stage or project_stage:
-                order_parts.append(f"{key} {dir_str}")
-            else:
-                order_parts.append(f"data->>'{key}' {dir_str}")
-        sql += " ORDER BY " + ", ".join(order_parts)
+        sql += " ORDER BY " + _aggregate_sort(sort_stage, group_stage or project_stage)
     if limit_val is not None:
         sql += " LIMIT %s"
         params.append(limit_val)
