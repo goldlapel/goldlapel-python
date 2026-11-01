@@ -1382,7 +1382,8 @@ async def doc_watch(url, collection, callback, blocking=True, *, channel, listen
         payloads.put_nowait(payload)
 
     async def _consume():
-        # In order; a large event's parts (sent together) joined
+        # In order; a large event's parts (sent together) joined; over after
+        # an invalidate
         parts = {}
         while True:
             message = json.loads(await payloads.get())
@@ -1394,12 +1395,18 @@ async def doc_watch(url, collection, callback, blocking=True, *, channel, listen
                 message = json.loads("".join(parts.pop(message["seq"])))
             message.pop("seq", None)
             callback(message)
+            if message.get("operationType") == "invalidate":
+                return
+
+    async def _consume_then_close():
+        await _consume()
+        await listen_conn.close()
 
     await listen_conn.add_listener(channel, _cb)
     if listening is not None:
         await listening()
     if not blocking:
-        task = asyncio.ensure_future(_consume())
+        task = asyncio.ensure_future(_consume_then_close())
         _watchers.add(task)
         task.add_done_callback(_watchers.discard)
         listen_conn.add_termination_listener(lambda _c: task.cancel())

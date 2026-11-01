@@ -2241,7 +2241,8 @@ def _notifications(listen_conn):
 
 def _watch_events(payloads):
     """A watch channel's notifications as events: a large one comes in
-    parts (sent together, in order), joined here."""
+    parts (sent together, in order), joined here. Ends after an
+    `invalidate`: the stream can't go on."""
     parts = {}
     for payload in payloads:
         message = json.loads(payload)
@@ -2253,16 +2254,22 @@ def _watch_events(payloads):
             message = json.loads("".join(parts.pop(message["seq"])))
         message.pop("seq", None)
         yield message
+        if message.get("operationType") == "invalidate":
+            return
 
 
 def doc_watch(url, collection, callback, blocking=True, *, channel, listening=None, patterns=None):
     """Call `callback` with each change to a collection, like MongoDB's
     change streams: `{"operationType": "insert" | "update" | "delete",
-    "_id": …, "fullDocument": … (None for a delete)}`, in commit order. The
-    proxy reads them from the WAL and sends them on `channel`
-    (`ddl.watch_channel`): no trigger, nothing added to the writers'
-    transactions. `listening` is called once LISTENing: what commits from
-    then on is heard, while connected (at most once each)."""
+    "_id": …, "fullDocument": … (None for a delete)}`. The proxy sends them
+    on `channel` (`ddl.watch_channel`), read from the WAL stream where it
+    carries the collection (in commit order, nothing added to the writers'
+    transactions), otherwise from a change log a row trigger writes (trigger
+    mode, an unlogged collection: in the order the statements ran, exact for
+    each document). `listening` is called once LISTENing: what commits from
+    then on is heard, while connected (at most once each). A stream that
+    can't go on exactly (a TRUNCATE, the WAL stream lost) ends with
+    `{"operationType": "invalidate"}`, as MongoDB's do: watch again to go on."""
     _validate_identifier(collection)
     _doc_table(patterns)  # the collection exists (`_patterns` made it)
     listen_conn = _listen_connection(url)
@@ -2278,6 +2285,9 @@ def doc_watch(url, collection, callback, blocking=True, *, channel, listening=No
             # The connection closed (the proxy stopped): watching ends
             if not listen_conn.closed:
                 raise
+        else:
+            # Invalidated: the stream is over
+            listen_conn.close()
 
     if blocking:
         _listen()

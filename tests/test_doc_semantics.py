@@ -290,16 +290,11 @@ async def test_the_same_through_asyncpg():
         await gl.documents.delete(coll, {})
 
 
-def test_watch_hears_changes_made_anywhere(gl, coll, request):
-    """Each change, in commit order, made through any connection — read by
-    the proxy from WAL. Trigger mode can't watch (as MongoDB's change
-    streams need a replica set)."""
+def test_watch_hears_changes_made_anywhere(gl, coll):
+    """Each change, in order, made through any connection — read by the
+    proxy from the WAL stream, or in trigger mode from its change log."""
     import threading
     import psycopg2
-    if request.node.callspec.params["gl"] == "triggers":
-        with pytest.raises(RuntimeError, match="wal_level"):
-            gl.documents.watch(coll, lambda e: None, blocking=False)
-        return
     events, heard = [], threading.Event()
 
     def on_change(event):
@@ -324,4 +319,22 @@ def test_watch_hears_changes_made_anywhere(gl, coll, request):
     assert events[1]["fullDocument"]["seen"] is True and events[1]["fullDocument"]["big"] == "x" * 9000
     assert events[2]["fullDocument"] is None
     assert len({e["_id"] for e in events}) == 1
+    gl.documents.unwatch(coll)
+
+
+def test_a_truncate_ends_the_watch_with_invalidate(gl, coll):
+    """TRUNCATE empties a collection without a row's change to report: the
+    watcher hears `invalidate` and the watch ends, as MongoDB's do."""
+    import psycopg2
+    events = []
+    watcher = gl.documents.watch(coll, events.append, blocking=False)
+    time.sleep(0.5)
+    gl.documents.insert(coll, {"name": "t"})
+    direct = psycopg2.connect(require_integration_upstream())
+    direct.cursor().execute(f"TRUNCATE _goldlapel.doc_{coll}")
+    direct.commit()
+    direct.close()
+    watcher.join(15)
+    assert not watcher.is_alive(), events
+    assert [e["operationType"] for e in events] == ["insert", "invalidate"]
     gl.documents.unwatch(coll)

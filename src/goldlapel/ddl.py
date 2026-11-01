@@ -191,9 +191,9 @@ def fetch_patterns(owner, family, name, dashboard_port, dashboard_token, options
 def watch_channel(collection, dashboard_port, dashboard_token, unwatch=False, listening=False):
     """Ask the proxy to watch (or stop watching) a document collection's
     changes; the channel to LISTEN on. Once LISTENing, say so
-    (`listening=True`): what commits from then on is sent. Watching needs
-    WAL (`wal_level = logical`), as MongoDB's change streams need a replica
-    set."""
+    (`listening=True`): what commits from then on is sent. From the WAL
+    stream where it carries the collection, otherwise from a change log the
+    proxy keeps with a row trigger."""
     if dashboard_token is None:
         raise RuntimeError("No dashboard token available. Set GOLDLAPEL_DASHBOARD_TOKEN or let GoldLapel spawn the proxy.")
     action = "unwatch" if unwatch else "watch"

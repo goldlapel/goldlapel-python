@@ -1129,6 +1129,21 @@ class TestDocWatch:
             {"operationType": "update", "_id": "a", "fullDocument": {"text": "x" * 20}},
         ]
 
+    def test_invalidate_ends_the_watch(self, monkeypatch):
+        listen_conn = MagicMock()
+        listen_conn.closed = False
+        payloads = [
+            json.dumps({"operationType": "insert", "_id": "a", "fullDocument": {}, "seq": 0}),
+            json.dumps({"operationType": "invalidate", "seq": 1}),
+            json.dumps({"operationType": "insert", "_id": "b", "fullDocument": {}, "seq": 2}),
+        ]
+        monkeypatch.setattr(utils, "_listen_connection", lambda url: listen_conn)
+        monkeypatch.setattr(utils, "_notifications", lambda c: iter(payloads))
+        events = []
+        doc_watch("postgresql://proxy", "events", events.append, blocking=True, channel="c")
+        assert [e["operationType"] for e in events] == ["insert", "invalidate"]
+        listen_conn.close.assert_called_once()
+
     def test_unwatch_drops(self):
         conn, cur = capture_sql()
         doc_unwatch(conn, "events")

@@ -203,7 +203,7 @@ class DocumentsAPI:
 
     def watch(self, collection, callback, blocking=True, *, conn=None):
         """Call `callback` with each change to the collection (see
-        `utils.doc_watch`). Needs WAL (`wal_level = logical`)."""
+        `utils.doc_watch`)."""
         from goldlapel import utils as _u
         patterns = self._patterns(collection)
         gl = self._gl
