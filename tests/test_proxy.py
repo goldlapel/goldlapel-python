@@ -344,6 +344,11 @@ class TestConfigToArgs:
     def test_boolean_false(self):
         assert _config_to_args({"disable_pool": False}) == []
 
+    def test_proxy_cache_freshness(self):
+        # How fresh cached reads must be about writes made elsewhere.
+        assert _config_to_args({"proxy_cache_freshness": "50ms"}) == ["--proxy-cache-freshness", "50ms"]
+        assert _config_to_args({"proxy_cache_async_writers": True}) == ["--proxy-cache-async-writers"]
+
     def test_list_value(self):
         result = _config_to_args({"replica": ["url1", "url2"]})
         assert result == ["--replica", "url1", "--replica", "url2"]
