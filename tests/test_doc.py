@@ -40,7 +40,6 @@ from goldlapel.utils import (
     _build_filter,
     _build_update,
     _build_project,
-    _field_path,
     _jsonpath,
     _text_path,
 )
@@ -1651,20 +1650,26 @@ class TestTextFilter:
         clause, params = _build_filter({"$text": {"$search": "hello world"}})
         assert "to_tsvector" in clause
         assert "plainto_tsquery" in clause
-        assert "data::text" in clause
-        assert params == ["english", "english", "hello world"]
+        # The configuration is in the SQL, so GL's index on it serves the query
+        assert "to_tsvector('english', data::text) @@ plainto_tsquery('english', %s)" in clause
+        assert params == ["hello world"]
 
     def test_field_level(self):
         clause, params = _build_filter({"content": {"$text": {"$search": "hello"}}})
         assert "to_tsvector" in clause
         assert "plainto_tsquery" in clause
-        assert "data->>'content'" in clause
-        assert params == ["english", "english", "hello"]
+        assert "to_tsvector('english', data->>'content')" in clause
+        assert params == ["hello"]
 
     def test_custom_language(self):
         clause, params = _build_filter({"$text": {"$search": "bonjour", "$language": "french"}})
         assert "to_tsvector" in clause
-        assert params == ["french", "french", "bonjour"]
+        assert "to_tsvector('french', data::text)" in clause
+        assert params == ["bonjour"]
+
+    def test_bad_language_raises(self):
+        with pytest.raises(ValueError, match="text search configuration"):
+            _build_filter({"$text": {"$search": "x", "$language": "english'); --"}})
 
     def test_missing_search_raises(self):
         with pytest.raises(ValueError, match="\\$text requires"):

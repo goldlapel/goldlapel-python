@@ -57,7 +57,8 @@ class TestSearch:
         assert "ts_rank" in sql
         assert "FROM articles" in sql
         assert "ORDER BY _score DESC" in sql
-        assert params == ("english", "english", "hello", "english", "english", "hello", 50)
+        assert "to_tsvector('english', coalesce(title, '')) @@ plainto_tsquery('english', %s)" in sql
+        assert params == ("hello", "hello", 50)
         assert len(results) == 1
         assert results[0]["_score"] == 0.5
 
@@ -75,8 +76,8 @@ class TestSearch:
     def test_custom_lang_and_limit(self):
         conn, cur = capture_sql()
         search(conn, "articles", "title", "hola", limit=10, lang="spanish")
-        params = cur.execute.call_args[0][1]
-        assert params[0] == "spanish"
+        sql, params = cur.execute.call_args[0]
+        assert "to_tsvector('spanish'" in sql
         assert params[-1] == 10
 
     def test_highlight(self):
@@ -99,7 +100,7 @@ class TestSearch:
         search(conn, "articles", ["title", "body"], "test", highlight=True)
         sql = cur.execute.call_args[0][0]
         # ts_headline should use the first column (title), not body
-        assert "ts_headline(%s, title, plainto_tsquery" in sql
+        assert "ts_headline('english', title, plainto_tsquery" in sql
 
     def test_returns_list_of_dicts(self):
         conn, cur = capture_sql(
@@ -137,15 +138,23 @@ class TestSearchFuzzy:
         params = cur.execute.call_args[0][1]
         assert "similarity(name, %s)" in sql
         assert "FROM users" in sql
-        assert params == ("jon", "jon", 0.3, 50)
+        # The threshold is in the SQL, so the proxy serves it from a trigram index
+        assert "similarity(name, %s) > 0.3" in sql
+        assert params == ("jon", "jon", 50)
         assert results[0]["_score"] == 0.7
+
+    def test_threshold_out_of_range_raises(self):
+        conn, _ = capture_sql()
+        with pytest.raises(ValueError, match="between 0 and 1"):
+            search_fuzzy(conn, "users", "name", "jon", threshold=2)
 
     def test_custom_threshold_and_limit(self):
         conn, cur = capture_sql()
         search_fuzzy(conn, "users", "name", "jon", limit=5, threshold=0.5)
         # Second execute call is the main query
-        params = cur.execute.call_args[0][1]
-        assert params == ("jon", "jon", 0.5, 5)
+        sql, params = cur.execute.call_args[0]
+        assert "> 0.5" in sql
+        assert params == ("jon", "jon", 5)
 
     def test_invalid_identifier_raises(self):
         conn, _ = capture_sql()
@@ -285,8 +294,8 @@ class TestFacets:
         params = cur.execute.call_args[0][1]
         assert "to_tsvector" in sql
         assert "plainto_tsquery" in sql
-        assert "coalesce(title, '')" in sql
-        assert params == ("english", "english", "laptop", 50)
+        assert "to_tsvector('english', coalesce(title, ''))" in sql
+        assert params == ("laptop", 50)
 
     def test_with_query_filter_multi_column(self):
         conn, cur = capture_sql(
@@ -314,8 +323,8 @@ class TestFacets:
             fetchall_result=[],
         )
         facets(conn, "products", "category", query="laptop", query_column="title", lang="spanish")
-        params = cur.execute.call_args[0][1]
-        assert params[0] == "spanish"
+        sql, params = cur.execute.call_args[0]
+        assert "to_tsvector('spanish'" in sql
 
 
 # ---------------------------------------------------------------------------

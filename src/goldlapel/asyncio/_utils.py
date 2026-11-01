@@ -58,6 +58,8 @@ from goldlapel.utils import (
     _doc_index_sql,
     _distinct_sql,
     _check_pipeline_order,
+    _ts_config,
+    _threshold,
     _unwind,
     _aggregate_sort,
 )
@@ -717,25 +719,26 @@ async def search(conn, table, column, query, limit=50, lang="english", highlight
     for col in columns:
         _validate_identifier(col)
     tsvec = " || ' ' || ".join(f"coalesce({col}, '')" for col in columns)
+    cfg = _ts_config(lang)
     if highlight:
         hl_col = columns[0]
         rows = await _fetch(conn, f"""
             SELECT *,
-                ts_rank(to_tsvector(%s, {tsvec}), plainto_tsquery(%s, %s)) AS _score,
-                ts_headline(%s, {hl_col}, plainto_tsquery(%s, %s),
+                ts_rank(to_tsvector({cfg}, {tsvec}), plainto_tsquery({cfg}, %s)) AS _score,
+                ts_headline({cfg}, {hl_col}, plainto_tsquery({cfg}, %s),
                     'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15') AS _highlight
             FROM {table}
-            WHERE to_tsvector(%s, {tsvec}) @@ plainto_tsquery(%s, %s)
+            WHERE to_tsvector({cfg}, {tsvec}) @@ plainto_tsquery({cfg}, %s)
             ORDER BY _score DESC LIMIT %s
-        """, (lang, lang, query, lang, lang, query, lang, lang, query, limit))
+        """, (query, query, query, limit))
     else:
         rows = await _fetch(conn, f"""
             SELECT *,
-                ts_rank(to_tsvector(%s, {tsvec}), plainto_tsquery(%s, %s)) AS _score
+                ts_rank(to_tsvector({cfg}, {tsvec}), plainto_tsquery({cfg}, %s)) AS _score
             FROM {table}
-            WHERE to_tsvector(%s, {tsvec}) @@ plainto_tsquery(%s, %s)
+            WHERE to_tsvector({cfg}, {tsvec}) @@ plainto_tsquery({cfg}, %s)
             ORDER BY _score DESC LIMIT %s
-        """, (lang, lang, query, lang, lang, query, limit))
+        """, (query, query, limit))
     return _rows_to_dicts(rows)
 
 
@@ -745,9 +748,9 @@ async def search_fuzzy(conn, table, column, query, limit=50, threshold=0.3):
     rows = await _fetch(conn, f"""
         SELECT *, similarity({column}, %s) AS _score
         FROM {table}
-        WHERE similarity({column}, %s) > %s
+        WHERE similarity({column}, %s) > {_threshold(threshold)}
         ORDER BY _score DESC LIMIT %s
-    """, (query, query, float(threshold), limit))
+    """, (query, query, limit))
     return _rows_to_dicts(rows)
 
 
@@ -799,13 +802,14 @@ async def facets(conn, table, column, limit=50, query=None, query_column=None, l
         for qc in query_columns:
             _validate_identifier(qc)
         tsvec = " || ' ' || ".join(f"coalesce({qc}, '')" for qc in query_columns)
+        cfg = _ts_config(lang)
         rows = await _fetch(conn, f"""
             SELECT {column} AS value, COUNT(*) AS count
             FROM {table}
-            WHERE to_tsvector(%s, {tsvec}) @@ plainto_tsquery(%s, %s)
+            WHERE to_tsvector({cfg}, {tsvec}) @@ plainto_tsquery({cfg}, %s)
             GROUP BY {column}
             ORDER BY count DESC, {column} LIMIT %s
-        """, (lang, lang, query, limit))
+        """, (query, limit))
     else:
         rows = await _fetch(conn, f"""
             SELECT {column} AS value, COUNT(*) AS count

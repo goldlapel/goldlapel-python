@@ -818,6 +818,17 @@ def stream_claim(conn, stream, group, consumer, min_idle_ms=60000, *, patterns=N
     return messages
 
 
+_TS_CONFIG_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
+
+
+def _ts_config(lang):
+    """A text search configuration, as a literal in the SQL: an index on
+    `to_tsvector('<config>', …)` serves only a query that names it so."""
+    if not isinstance(lang, str) or not _TS_CONFIG_RE.match(lang):
+        raise ValueError(f"Invalid text search configuration: {lang!r}")
+    return f"'{lang}'"
+
+
 def search(conn, table, column, query, limit=50, lang='english', highlight=False):
     """Full-text search with ranking. Like Elasticsearch match query."""
     _validate_identifier(table)
@@ -829,29 +840,39 @@ def search(conn, table, column, query, limit=50, lang='english', highlight=False
         _validate_identifier(col)
     cur = conn.cursor()
     tsvec = " || ' ' || ".join(f"coalesce({col}, '')" for col in columns)
+    cfg = _ts_config(lang)
     if highlight:
         hl_col = columns[0]
         cur.execute(f"""
             SELECT *,
-                ts_rank(to_tsvector(%s, {tsvec}), plainto_tsquery(%s, %s)) AS _score,
-                ts_headline(%s, {hl_col}, plainto_tsquery(%s, %s),
+                ts_rank(to_tsvector({cfg}, {tsvec}), plainto_tsquery({cfg}, %s)) AS _score,
+                ts_headline({cfg}, {hl_col}, plainto_tsquery({cfg}, %s),
                     'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15') AS _highlight
             FROM {table}
-            WHERE to_tsvector(%s, {tsvec}) @@ plainto_tsquery(%s, %s)
+            WHERE to_tsvector({cfg}, {tsvec}) @@ plainto_tsquery({cfg}, %s)
             ORDER BY _score DESC LIMIT %s
-        """, (lang, lang, query, lang, lang, query, lang, lang, query, limit))
+        """, (query, query, query, limit))
     else:
         cur.execute(f"""
             SELECT *,
-                ts_rank(to_tsvector(%s, {tsvec}), plainto_tsquery(%s, %s)) AS _score
+                ts_rank(to_tsvector({cfg}, {tsvec}), plainto_tsquery({cfg}, %s)) AS _score
             FROM {table}
-            WHERE to_tsvector(%s, {tsvec}) @@ plainto_tsquery(%s, %s)
+            WHERE to_tsvector({cfg}, {tsvec}) @@ plainto_tsquery({cfg}, %s)
             ORDER BY _score DESC LIMIT %s
-        """, (lang, lang, query, lang, lang, query, limit))
+        """, (query, query, limit))
     cols = [desc[0] for desc in cur.description]
     results = [dict(zip(cols, row)) for row in cur.fetchall()]
     cur.close()
     return results
+
+
+def _threshold(threshold):
+    """A similarity threshold, as a literal in the SQL: the proxy then serves
+    `similarity(col, q) > t` from a trigram index (as `col % q AND …`)."""
+    t = float(threshold)
+    if not 0 <= t <= 1:
+        raise ValueError(f"A similarity threshold is between 0 and 1: {threshold!r}")
+    return repr(t)
 
 
 def search_fuzzy(conn, table, column, query, limit=50, threshold=0.3):
@@ -862,9 +883,9 @@ def search_fuzzy(conn, table, column, query, limit=50, threshold=0.3):
     cur.execute(f"""
         SELECT *, similarity({column}, %s) AS _score
         FROM {table}
-        WHERE similarity({column}, %s) > %s
+        WHERE similarity({column}, %s) > {_threshold(threshold)}
         ORDER BY _score DESC LIMIT %s
-    """, (query, query, float(threshold), limit))
+    """, (query, query, limit))
     cols = [desc[0] for desc in cur.description]
     results = [dict(zip(cols, row)) for row in cur.fetchall()]
     cur.close()
@@ -936,13 +957,14 @@ def facets(conn, table, column, limit=50, query=None, query_column=None, lang='e
         for qc in query_columns:
             _validate_identifier(qc)
         tsvec = " || ' ' || ".join(f"coalesce({qc}, '')" for qc in query_columns)
+        cfg = _ts_config(lang)
         cur.execute(f"""
             SELECT {column} AS value, COUNT(*) AS count
             FROM {table}
-            WHERE to_tsvector(%s, {tsvec}) @@ plainto_tsquery(%s, %s)
+            WHERE to_tsvector({cfg}, {tsvec}) @@ plainto_tsquery({cfg}, %s)
             GROUP BY {column}
             ORDER BY count DESC, {column} LIMIT %s
-        """, (lang, lang, query, limit))
+        """, (query, limit))
     else:
         cur.execute(f"""
             SELECT {column} AS value, COUNT(*) AS count
@@ -1247,8 +1269,8 @@ def _field_clauses(key, ops):
         elif op == "$text":
             if not isinstance(operand, dict) or "$search" not in operand:
                 raise ValueError("$text requires {$search: 'query'}")
-            lang = operand.get("$language", "english")
-            add(f"to_tsvector(%s, {_field_path(key)}) @@ plainto_tsquery(%s, %s)", [lang, lang, operand["$search"]])
+            cfg = _ts_config(operand.get("$language", "english"))
+            add(f"to_tsvector({cfg}, {_field_path(key)}) @@ plainto_tsquery({cfg}, %s)", [operand["$search"]])
         else:
             raise ValueError(f"Unsupported filter operator: {op}")
     return " AND ".join(clauses), params
@@ -1333,9 +1355,9 @@ def _build_filter(filter_dict):
         if key == "$text":
             if not isinstance(value, dict) or "$search" not in value:
                 raise ValueError("$text requires {$search: 'query'}")
-            lang = value.get("$language", "english")
-            clauses.append("to_tsvector(%s, data::text) @@ plainto_tsquery(%s, %s)")
-            params.extend([lang, lang, value["$search"]])
+            cfg = _ts_config(value.get("$language", "english"))
+            clauses.append(f"to_tsvector({cfg}, data::text) @@ plainto_tsquery({cfg}, %s)")
+            params.append(value["$search"])
         elif key == "$not":
             if not isinstance(value, dict):
                 raise ValueError("$not value must be a filter object")
