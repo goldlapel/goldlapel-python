@@ -202,19 +202,24 @@ class DocumentsAPI:
     # -- Watch / TTL / capped ------------------------------------------------
 
     def watch(self, collection, callback, blocking=True, *, conn=None):
+        """Call `callback` with each change to the collection (see
+        `utils.doc_watch`). Needs WAL (`wal_level = logical`)."""
         from goldlapel import utils as _u
         patterns = self._patterns(collection)
+        gl = self._gl
+        port, token = gl._dashboard_port, gl._dashboard_token or _ddl.token_from_env_or_file()
+        channel = _ddl.watch_channel(collection, port, token)
         return _u.doc_watch(
-            self._gl._effective_conn(conn), collection, callback,
-            blocking=blocking, patterns=patterns,
+            gl.url, collection, callback, blocking=blocking, channel=channel, patterns=patterns,
+            listening=lambda: _ddl.watch_channel(collection, port, token, listening=True),
         )
 
     def unwatch(self, collection, *, conn=None):
         from goldlapel import utils as _u
-        patterns = self._patterns(collection)
-        return _u.doc_unwatch(
-            self._gl._effective_conn(conn), collection, patterns=patterns,
-        )
+        gl = self._gl
+        _ddl.watch_channel(collection, gl._dashboard_port, gl._dashboard_token or _ddl.token_from_env_or_file(), unwatch=True)
+        # And any trigger an older version installed
+        _u.doc_unwatch(gl._effective_conn(conn), collection, patterns=self._patterns(collection))
 
     def create_ttl_index(self, collection, expire_after_seconds, field="created_at", *, conn=None):
         from goldlapel import utils as _u

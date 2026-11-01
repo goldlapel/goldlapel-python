@@ -188,6 +188,23 @@ def fetch_patterns(owner, family, name, dashboard_port, dashboard_token, options
     return entry
 
 
+def watch_channel(collection, dashboard_port, dashboard_token, unwatch=False, listening=False):
+    """Ask the proxy to watch (or stop watching) a document collection's
+    changes; the channel to LISTEN on. Once LISTENing, say so
+    (`listening=True`): what commits from then on is sent. Watching needs
+    WAL (`wal_level = logical`), as MongoDB's change streams need a replica
+    set."""
+    if dashboard_token is None:
+        raise RuntimeError("No dashboard token available. Set GOLDLAPEL_DASHBOARD_TOKEN or let GoldLapel spawn the proxy.")
+    action = "unwatch" if unwatch else "watch"
+    body = {"name": collection, "listening": True} if listening else {"name": collection}
+    status, resp = _post(f"http://127.0.0.1:{dashboard_port}/api/ddl/doc_store/{action}", dashboard_token, body)
+    if status != 200:
+        detail = resp.get("detail") if isinstance(resp, dict) else resp
+        raise RuntimeError(f"Gold Lapel can't {action} {collection!r}: {detail}")
+    return resp.get("channel")
+
+
 def invalidate(owner):
     """Clear all cached patterns for `owner` — used on `gl.stop()`."""
     try:

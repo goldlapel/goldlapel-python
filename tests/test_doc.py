@@ -1102,60 +1102,32 @@ class TestFilterOperators:
 
 
 class TestDocWatch:
-    def test_watch_creates_trigger(self):
-        conn, cur = capture_sql()
-        with pytest.raises(Exception):
-            # _make_listen_connection will fail on the mock, but trigger SQL is already executed
-            doc_watch(conn, "events", lambda e: None)
-        calls = [c[0][0] for c in cur.execute.call_args_list]
-        assert any("CREATE OR REPLACE FUNCTION _gl_watch_events()" in c for c in calls)
-        assert any("pg_notify" in c for c in calls)
-        # Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
-        # Avoids the race where a DROP + CREATE pair could have two concurrent
-        # doc_watch calls replace each other's triggers mid-flight.
-        assert any("CREATE OR REPLACE TRIGGER _gl_watch_events_trigger" in c for c in calls)
-        # Guard against the racy DROP + CREATE pair regressing.
-        assert not any(
-            "DROP TRIGGER IF EXISTS _gl_watch_events_trigger" in c for c in calls
-        )
+    """Watching is the proxy's: tested end to end in test_doc_semantics.py."""
 
     @pytest.fixture
     def mock_listen(self, monkeypatch):
         import goldlapel.utils as utils_mod
-        mock_listen_conn = MagicMock()
-        mock_listen_conn.notifies = []
-        mock_listen_conn.poll = MagicMock()
-        mock_listen_cur = MagicMock()
-        mock_listen_conn.cursor.return_value = mock_listen_cur
-        mock_listen_conn.commit = MagicMock()
-        monkeypatch.setattr(utils_mod, "_make_listen_connection", lambda c: mock_listen_conn)
-        return mock_listen_conn, mock_listen_cur
+        listen_conn = MagicMock()
+        listen_conn.closed = False
+        event = json.dumps({"operationType": "update", "_id": "a", "fullDocument": {"text": "x" * 20}, "seq": 1})
+        payloads = [
+            json.dumps({"operationType": "insert", "_id": "a", "fullDocument": {"n": 1}, "seq": 0}),
+            # A large event, in parts
+            json.dumps({"seq": 1, "part": 0, "parts": 2, "chunk": event[:30]}),
+            json.dumps({"seq": 1, "part": 1, "parts": 2, "chunk": event[30:]}),
+        ]
+        monkeypatch.setattr(utils_mod, "_listen_connection", lambda url: listen_conn)
+        monkeypatch.setattr(utils_mod, "_notifications", lambda c: iter(payloads))
+        return listen_conn
 
-    def test_watch_listens(self, mock_listen):
-        mock_listen_conn, mock_listen_cur = mock_listen
-        conn, cur = capture_sql()
-        # select.select will raise StopIteration via side_effect to break the loop
-        import select as select_mod
-        original_select = select_mod.select
-
-        call_count = [0]
-        def fake_select(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] > 1:
-                raise KeyboardInterrupt()
-            return ([], [], [])
-
-        import goldlapel.utils as utils_mod
-        old_select = select_mod.select
-        select_mod.select = fake_select
-        try:
-            with pytest.raises(KeyboardInterrupt):
-                doc_watch(conn, "events", lambda e: None, blocking=True)
-        finally:
-            select_mod.select = old_select
-        # Verify LISTEN was called on the listen connection
-        listen_calls = [c[0][0] for c in mock_listen_cur.execute.call_args_list]
-        assert any("LISTEN _gl_changes_events" in c for c in listen_calls)
+    def test_watch_listens_on_the_proxys_channel_and_joins_parts(self, mock_listen):
+        events = []
+        doc_watch("postgresql://proxy", "events", events.append, blocking=True, channel="_gl_changes_events_abc")
+        assert mock_listen.cursor().execute.call_args_list[0][0][0] == 'LISTEN "_gl_changes_events_abc"'
+        assert events == [
+            {"operationType": "insert", "_id": "a", "fullDocument": {"n": 1}},
+            {"operationType": "update", "_id": "a", "fullDocument": {"text": "x" * 20}},
+        ]
 
     def test_unwatch_drops(self):
         conn, cur = capture_sql()
@@ -1246,7 +1218,7 @@ class TestOperationalIdentifierValidation:
     def test_invalid_collection_rejected(self):
         conn, _ = capture_sql()
         with pytest.raises(ValueError, match="Invalid identifier"):
-            doc_watch(conn, "bad; name", lambda e: None)
+            doc_watch("postgresql://proxy", "bad; name", lambda e: None, channel="x")
         with pytest.raises(ValueError, match="Invalid identifier"):
             doc_unwatch(conn, "bad; name")
         with pytest.raises(ValueError, match="Invalid identifier"):

@@ -2213,56 +2213,71 @@ def _make_listen_connection(conn):
     return listen_conn
 
 
-def doc_watch(conn, collection, callback, blocking=True, *, patterns=None):
-    """Watch a collection for changes via triggers + pg_notify. Like MongoDB change streams."""
+def _listen_connection(url):
+    """An autocommit connection to the proxy at `url` for LISTEN, with the
+    driver installed (psycopg 3, else psycopg2)."""
+    try:
+        import psycopg
+        return psycopg.connect(url, autocommit=True)
+    except ImportError:
+        import psycopg2
+        listen_conn = psycopg2.connect(url)
+        listen_conn.set_isolation_level(0)
+        return listen_conn
+
+
+def _notifications(listen_conn):
+    """Each notification's payload, as it arrives."""
+    if hasattr(listen_conn, "notifies") and callable(listen_conn.notifies):
+        for notify in listen_conn.notifies():
+            yield notify.payload
+        return
+    while True:
+        if select.select([listen_conn], [], [], 5.0) != ([], [], []):
+            listen_conn.poll()
+            while listen_conn.notifies:
+                yield listen_conn.notifies.pop(0).payload
+
+
+def _watch_events(payloads):
+    """A watch channel's notifications as events: a large one comes in
+    parts (sent together, in order), joined here."""
+    parts = {}
+    for payload in payloads:
+        message = json.loads(payload)
+        if "parts" in message:
+            got = parts.setdefault(message["seq"], [])
+            got.append(message["chunk"])
+            if len(got) < message["parts"]:
+                continue
+            message = json.loads("".join(parts.pop(message["seq"])))
+        message.pop("seq", None)
+        yield message
+
+
+def doc_watch(url, collection, callback, blocking=True, *, channel, listening=None, patterns=None):
+    """Call `callback` with each change to a collection, like MongoDB's
+    change streams: `{"operationType": "insert" | "update" | "delete",
+    "_id": …, "fullDocument": … (None for a delete)}`, in commit order. The
+    proxy reads them from the WAL and sends them on `channel`
+    (`ddl.watch_channel`): no trigger, nothing added to the writers'
+    transactions. `listening` is called once LISTENing: what commits from
+    then on is heard, while connected (at most once each)."""
     _validate_identifier(collection)
-    table = _doc_table(patterns)
-    cur = conn.cursor()
-
-    # Trigger / function / channel names are keyed off the user's collection
-    # name (validated identifier — safe to interpolate). The trigger fires on
-    # the canonical proxy table.
-    cur.execute(f"""
-        CREATE OR REPLACE FUNCTION _gl_watch_{collection}() RETURNS TRIGGER AS $$
-        BEGIN
-            PERFORM pg_notify('_gl_changes_{collection}', json_build_object(
-                'operationType', lower(TG_OP),
-                '_id', COALESCE(NEW._id, OLD._id)::text,
-                'fullDocument', CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE NEW.data END
-            )::text);
-            RETURN COALESCE(NEW, OLD);
-        END;
-        $$ LANGUAGE plpgsql
-    """)
-
-    # CREATE OR REPLACE TRIGGER (Postgres 14+) is atomic — no window where
-    # the trigger is missing between drop and create, and a redefinition
-    # cleanly replaces the old one instead of being silently swallowed by
-    # `EXCEPTION WHEN duplicate_object`. GL targets PG14+ across the
-    # product, so this is safe and matches the Go wrapper.
-    cur.execute(f"""
-        CREATE OR REPLACE TRIGGER _gl_watch_{collection}_trigger
-            AFTER INSERT OR UPDATE OR DELETE ON {table}
-            FOR EACH ROW EXECUTE FUNCTION _gl_watch_{collection}()
-    """)
-    conn.commit()
-    cur.close()
-
-    channel = f"_gl_changes_{collection}"
+    _doc_table(patterns)  # the collection exists (`_patterns` made it)
+    listen_conn = _listen_connection(url)
+    listen_conn.cursor().execute(f'LISTEN "{channel}"')
+    if listening is not None:
+        listening()
 
     def _listen():
-        listen_conn = _make_listen_connection(conn)
-        lcur = listen_conn.cursor()
-        lcur.execute(f"LISTEN {channel}")
-        listen_conn.commit()
-        lcur.close()
-        while True:
-            if select.select([listen_conn], [], [], 5.0) != ([], [], []):
-                listen_conn.poll()
-                while listen_conn.notifies:
-                    notify = listen_conn.notifies.pop(0)
-                    event = json.loads(notify.payload)
-                    callback(event)
+        try:
+            for event in _watch_events(_notifications(listen_conn)):
+                callback(event)
+        except Exception:
+            # The connection closed (the proxy stopped): watching ends
+            if not listen_conn.closed:
+                raise
 
     if blocking:
         _listen()
@@ -2273,7 +2288,8 @@ def doc_watch(conn, collection, callback, blocking=True, *, patterns=None):
 
 
 def doc_unwatch(conn, collection, *, patterns=None):
-    """Remove change stream trigger from a collection."""
+    """Remove the change-stream trigger and function versions before 0.2
+    put on a collection (watching is now the proxy's: `doc_watch`)."""
     _validate_identifier(collection)
     table = _doc_table(patterns)
     cur = conn.cursor()
@@ -2307,8 +2323,8 @@ def doc_create_ttl_index(conn, collection, expire_after_seconds, field="created_
         $$ LANGUAGE plpgsql
     """)
 
-    # CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and redefinable.
-    # See doc_watch for rationale.
+    # CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and redefinable, with
+    # no moment without the trigger.
     cur.execute(f"""
         CREATE OR REPLACE TRIGGER _gl_ttl_{collection}_trigger
             BEFORE INSERT ON {table}
@@ -2365,8 +2381,8 @@ def doc_create_capped(conn, collection, max_documents, *, patterns=None):
         $$ LANGUAGE plpgsql
     """)
 
-    # CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and redefinable.
-    # See doc_watch for rationale.
+    # CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and redefinable, with
+    # no moment without the trigger.
     cur.execute(f"""
         CREATE OR REPLACE TRIGGER _gl_cap_{collection}_trigger
             AFTER INSERT ON {table}

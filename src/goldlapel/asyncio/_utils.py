@@ -1361,61 +1361,58 @@ def _decode_doc_rows(rows):
     return [_decode_doc_row(r) for r in rows]
 
 
-async def doc_watch(conn, collection, callback, blocking=True, *, patterns=None):
-    """Watch a collection for changes via triggers + pg_notify.
+# Listeners' consumers, held so they run until their connection closes.
+_watchers = set()
 
-    Async version uses asyncpg's add_listener on a fresh connection.
-    Callback is invoked as callback(event_dict) — same signature as sync.
-    """
+
+async def doc_watch(url, collection, callback, blocking=True, *, channel, listening=None, patterns=None):
+    """Call `callback` with each change to a collection, as the sync
+    `utils.doc_watch` does, on an asyncpg connection to the proxy at `url`
+    (`listening` awaited once LISTENing). Not blocking: returns that
+    connection (close it to stop)."""
     import asyncio
+    import asyncpg
 
     _validate_identifier(collection)
-    table = _doc_table(patterns)
-    await _execute(conn, f"""
-        CREATE OR REPLACE FUNCTION _gl_watch_{collection}() RETURNS TRIGGER AS $$
-        BEGIN
-            PERFORM pg_notify('_gl_changes_{collection}', json_build_object(
-                'operationType', lower(TG_OP),
-                '_id', COALESCE(NEW._id, OLD._id)::text,
-                'fullDocument', CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE NEW.data END
-            )::text);
-            RETURN COALESCE(NEW, OLD);
-        END;
-        $$ LANGUAGE plpgsql
-    """)
-    # CREATE OR REPLACE TRIGGER (Postgres 14+) is atomic — no window where
-    # the trigger is missing, and a redefinition cleanly replaces the old
-    # one instead of being swallowed by `EXCEPTION WHEN duplicate_object`.
-    # GL targets PG14+, so this is safe and matches the Go wrapper.
-    await _execute(conn, f"""
-        CREATE OR REPLACE TRIGGER _gl_watch_{collection}_trigger
-            AFTER INSERT OR UPDATE OR DELETE ON {table}
-            FOR EACH ROW EXECUTE FUNCTION _gl_watch_{collection}()
-    """)
-
-    channel = f"_gl_changes_{collection}"
-    dsn = _dsn_for_listen(conn)
-
-    import asyncpg
-    listen_conn = await asyncpg.connect(dsn)
+    _doc_table(patterns)  # the collection exists (`_patterns` made it)
+    listen_conn = await asyncpg.connect(url)
+    payloads = asyncio.Queue()
 
     def _cb(_c, _pid, _chan, payload):
-        event = json.loads(payload)
-        callback(event)
+        payloads.put_nowait(payload)
+
+    async def _consume():
+        # In order; a large event's parts (sent together) joined
+        parts = {}
+        while True:
+            message = json.loads(await payloads.get())
+            if "parts" in message:
+                got = parts.setdefault(message["seq"], [])
+                got.append(message["chunk"])
+                if len(got) < message["parts"]:
+                    continue
+                message = json.loads("".join(parts.pop(message["seq"])))
+            message.pop("seq", None)
+            callback(message)
 
     await listen_conn.add_listener(channel, _cb)
-
+    if listening is not None:
+        await listening()
     if not blocking:
+        task = asyncio.ensure_future(_consume())
+        _watchers.add(task)
+        task.add_done_callback(_watchers.discard)
+        listen_conn.add_termination_listener(lambda _c: task.cancel())
         return listen_conn
-
     try:
-        await asyncio.Event().wait()
+        await _consume()
     finally:
         await listen_conn.remove_listener(channel, _cb)
         await listen_conn.close()
 
 
 async def doc_unwatch(conn, collection, *, patterns=None):
+    """Remove the trigger and function versions before 0.2 used to watch."""
     _validate_identifier(collection)
     table = _doc_table(patterns)
     await _execute(conn, f"DROP TRIGGER IF EXISTS _gl_watch_{collection}_trigger ON {table}")

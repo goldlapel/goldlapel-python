@@ -151,15 +151,29 @@ class AsyncDocumentsAPI:
 
     # -- Watch / TTL / capped ------------------------------------------------
 
+    async def _watch_channel(self, collection, unwatch=False, listening=False):
+        gl = self._gl
+        token = gl._sync._dashboard_token or _ddl.token_from_env_or_file()
+        port = gl._sync._dashboard_port
+        loop = _asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: _ddl.watch_channel(collection, port, token, unwatch=unwatch, listening=listening),
+        )
+
     async def watch(self, collection, callback, blocking=True, *, conn=None):
+        """Call `callback` with each change to the collection (see
+        `goldlapel.utils.doc_watch`). Needs WAL (`wal_level = logical`)."""
         patterns = await self._patterns(collection)
+        channel = await self._watch_channel(collection)
         return await autils.doc_watch(
-            self._gl._effective_conn(conn), collection, callback,
-            blocking=blocking, patterns=patterns,
+            self._gl.url, collection, callback, blocking=blocking, channel=channel, patterns=patterns,
+            listening=lambda: self._watch_channel(collection, listening=True),
         )
 
     async def unwatch(self, collection, *, conn=None):
         patterns = await self._patterns(collection)
+        await self._watch_channel(collection, unwatch=True)
+        # And any trigger an older version installed
         return await autils.doc_unwatch(
             self._gl._effective_conn(conn), collection, patterns=patterns,
         )

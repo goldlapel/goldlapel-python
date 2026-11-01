@@ -273,4 +273,55 @@ async def test_the_same_through_asyncpg():
         await gl.documents.update_one(coll, {"name": "c"}, {"$pull": {"items": {"n": {"$gt": 5}}}})
         assert (await gl.documents.find_one(coll, {"name": "c"}))["data"]["items"] == [{"sku": "p", "n": 2}]
         await gl.documents.create_index(coll, ["size.h"])
+        # Watching, as the sync API does
+        import asyncio
+        events = []
+        listener = await gl.documents.watch(coll, events.append, blocking=False)
+        await gl.documents.insert(coll, {"name": "w", "big": "y" * 9000})
+        await gl.documents.delete(coll, {"name": "w"})
+        for _ in range(150):
+            if len(events) >= 2:
+                break
+            await asyncio.sleep(0.1)
+        assert [e["operationType"] for e in events] == ["insert", "delete"], events
+        assert events[0]["fullDocument"]["big"] == "y" * 9000
+        await listener.close()
+        await gl.documents.unwatch(coll)
         await gl.documents.delete(coll, {})
+
+
+def test_watch_hears_changes_made_anywhere(gl, coll, request):
+    """Each change, in commit order, made through any connection — read by
+    the proxy from WAL. Trigger mode can't watch (as MongoDB's change
+    streams need a replica set)."""
+    import threading
+    import psycopg2
+    if request.node.callspec.params["gl"] == "triggers":
+        with pytest.raises(RuntimeError, match="wal_level"):
+            gl.documents.watch(coll, lambda e: None, blocking=False)
+        return
+    events, heard = [], threading.Event()
+
+    def on_change(event):
+        events.append(event)
+        if len(events) == 3:
+            heard.set()
+
+    gl.documents.watch(coll, on_change, blocking=False)
+    time.sleep(0.5)
+    gl.documents.insert(coll, {"name": "f", "big": "x" * 9000})
+    direct = psycopg2.connect(require_integration_upstream())
+    cur = direct.cursor()
+    cur.execute(f"UPDATE _goldlapel.doc_{coll} SET data = data || '{{\"seen\": true}}' WHERE data->>'name' = 'f'")
+    cur.execute(f"DELETE FROM _goldlapel.doc_{coll} WHERE data->>'name' = 'f'")
+    direct.commit()
+    direct.close()
+    assert heard.wait(15), events
+    assert [e["operationType"] for e in events] == ["insert", "update", "delete"]
+    # Larger than a notification: sent in parts, joined
+    assert events[0]["fullDocument"]["big"] == "x" * 9000
+    # The document as that update left it, though deleted since
+    assert events[1]["fullDocument"]["seen"] is True and events[1]["fullDocument"]["big"] == "x" * 9000
+    assert events[2]["fullDocument"] is None
+    assert len({e["_id"] for e in events}) == 1
+    gl.documents.unwatch(coll)
