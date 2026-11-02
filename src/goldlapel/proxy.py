@@ -29,7 +29,7 @@ _STARTUP_POLL_INTERVAL = 0.05
 _VALID_CONFIG_KEYS = frozenset({
     "min_pattern_count", "deep_pagination_threshold",
     "report_interval_secs", "proxy_cache_size", "proxy_cache_max_bytes", "proxy_cache_max_entry_bytes",
-    "proxy_cache_freshness", "proxy_cache_async_writers", "batch_cache_size",
+    "proxy_cache_freshness", "proxy_cache_async_writers", "proxy_only", "batch_cache_size",
     "batch_cache_ttl_secs", "pool_size", "pool_timeout_secs",
     "pool_mode", "mgmt_idle_timeout", "fallback", "session_upstream", "read_after_write_secs",
     "n1_threshold", "n1_window_ms", "n1_cross_threshold",
@@ -43,7 +43,7 @@ _VALID_CONFIG_KEYS = frozenset({
 })
 
 _BOOLEAN_KEYS = frozenset({
-    "proxy_cache_async_writers",
+    "proxy_cache_async_writers", "proxy_only",
     "disable_btree_indexes",
     "disable_trigram_indexes", "disable_expression_indexes",
     "disable_partial_indexes", "disable_rewrite_prepared_cache",

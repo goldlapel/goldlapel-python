@@ -349,6 +349,11 @@ class TestConfigToArgs:
         assert _config_to_args({"proxy_cache_freshness": "50ms"}) == ["--proxy-cache-freshness", "50ms"]
         assert _config_to_args({"proxy_cache_async_writers": True}) == ["--proxy-cache-async-writers"]
 
+    def test_proxy_only(self):
+        # Every write goes through this proxy: cached reads wait for nothing.
+        assert _config_to_args({"proxy_only": True}) == ["--proxy-only"]
+        assert _config_to_args({"proxy_only": False}) == []
+
     def test_list_value(self):
         result = _config_to_args({"replica": ["url1", "url2"]})
         assert result == ["--replica", "url1", "--replica", "url2"]
